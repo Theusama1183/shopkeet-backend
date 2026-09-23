@@ -1,0 +1,7 @@
+.env
+.development.env
+.approve.env
+tmp/
+*.exe
+!shopkeet-agents-package/**
+.DS_Store

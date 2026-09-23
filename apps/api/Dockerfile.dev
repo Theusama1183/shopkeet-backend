@@ -1,0 +1,14 @@
+FROM golang:1.27-alpine AS dev
+
+WORKDIR /app
+
+# Air for hot reload during development.
+RUN go install github.com/air-verse/air@latest
+
+COPY go.mod go.sum* ./
+RUN go mod download
+
+COPY . .
+
+EXPOSE 3001
+CMD ["air", "-c", ".air.toml"]

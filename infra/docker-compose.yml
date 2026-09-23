@@ -1,0 +1,54 @@
+# Shopkeet dev stack — backend only for now.
+# `web` (Next.js) service is intentionally absent until the frontend phase
+# starts (per founder instruction: backend-first). docker-compose.dev.yml
+# will carry exta extras if needed later.
+
+services:
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3001:3001"
+    volumes:
+      - ../apps/api:/app
+    environment:
+      - DATABASE_URL=postgres://shopkeet:shopkeet@postgres:5432/shopkeet?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - PORT=3001
+      - JWT_SECRET=dev-secret-not-for-prod
+      - APP_BASE_DOMAIN=shopkeet.dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=shopkeet
+      - POSTGRES_PASSWORD=shopkeet
+      - POSTGRES_DB=shopkeet
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopkeet -d shopkeet"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  postgres_data:

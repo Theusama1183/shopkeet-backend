@@ -1,0 +1,1 @@
+-- Nothing to roll back for the initial migration.

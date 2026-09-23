@@ -1,0 +1,3 @@
+-- Initial empty migration. Wires golang-migrate up; schemas arrive per phase
+-- (0002_tenants_auth in Phase 1, ...). See docs/schema.sql as the single source
+-- of truth for table definitions.
