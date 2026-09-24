@@ -1,0 +1,19 @@
+DROP POLICY IF EXISTS tenant_isolation ON product_images;
+DROP POLICY IF EXISTS tenant_isolation ON product_categories;
+DROP POLICY IF EXISTS tenant_isolation ON products;
+DROP POLICY IF EXISTS tenant_isolation ON categories;
+
+ALTER TABLE product_images NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE product_categories NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE products NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE categories NO FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE product_images DISABLE ROW LEVEL SECURITY;
+ALTER TABLE product_categories DISABLE ROW LEVEL SECURITY;
+ALTER TABLE products DISABLE ROW LEVEL SECURITY;
+ALTER TABLE categories DISABLE ROW LEVEL SECURITY;
+
+DROP TABLE IF EXISTS product_images;
+DROP TABLE IF EXISTS product_categories;
+DROP TABLE IF EXISTS products;
+DROP TABLE IF EXISTS categories;

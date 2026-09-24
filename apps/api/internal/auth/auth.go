@@ -187,6 +187,85 @@ func TenantMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 	}
 }
 
+// publicTenantMW opens the RLS-scoped request transaction for a public
+// storefront request. Tenant resolution happens in Next.js middleware from the
+// hostname (docs/03-architecture.md §2) and is passed here as X-Tenant-ID;
+// this middleware validates the id and SET LOCALs app.current_tenant on the
+// request transaction exactly like TenantMW, but without requiring a JWT.
+// Public storefront endpoints mount this. Public-or-admin endpoints mount
+// PublicOrAdminMW instead.
+func publicTenantMW(pool *pgxpool.Pool) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		tid := c.Get("X-Tenant-ID")
+		if tid == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing X-Tenant-ID header"})
+		}
+
+		ctx := c.Context()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return fiber.ErrInternalServerError
+		}
+		defer tx.Rollback(ctx)
+
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			return fiber.ErrInternalServerError
+		}
+
+		c.Locals("tx", tx)
+		c.Locals("tenant_id", tid)
+		c.Locals("admin", false)
+		if err := c.Next(); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+}
+
+// PublicTenantMW is publicTenantMW as an exported constructor (storefront-only
+// routes).
+func PublicTenantMW(pool *pgxpool.Pool) fiber.Handler { return publicTenantMW(pool) }
+
+// PublicOrAdminMW serves routes that are public (active-only listings) but
+// also admin-visible (e.g. GET /products/:id — draft/archived included for the
+// merchant, active-only for shoppers). It resolves the tenant either from a
+// valid Bearer JWT (admin view) or from X-Tenant-ID (public view) and stores
+// whether admin in c.Locals("admin").
+func PublicOrAdminMW(pool *pgxpool.Pool, secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		h := c.Get("Authorization")
+		if strings.HasPrefix(h, "Bearer ") {
+			claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
+			if err != nil {
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid token"})
+			}
+
+			ctx := c.Context()
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				return fiber.ErrInternalServerError
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx,
+				"SELECT set_config('app.current_tenant', $1, true)", claims.TenantID); err != nil {
+				return fiber.ErrInternalServerError
+			}
+			c.Locals("tx", tx)
+			c.Locals("tenant_id", claims.TenantID)
+			c.Locals("user_id", claims.UserID)
+			c.Locals("role", claims.Role)
+			c.Locals("admin", true)
+
+			if err := c.Next(); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
+		return publicTenantMW(pool)(c)
+	}
+}
+
 // RegisterRoutes mounts the Phase 1 auth surface onto an existing router that
 // already carries the /api/v1 prefix (so later phases can share the group):
 //

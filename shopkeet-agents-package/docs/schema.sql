@@ -79,6 +79,7 @@ CREATE TABLE categories (
   UNIQUE (tenant_id, slug)
 );
 ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE categories FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON categories
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 
@@ -102,6 +103,7 @@ CREATE TABLE products (
 );
 CREATE INDEX products_search_idx ON products USING GIN (search_vector);
 ALTER TABLE products ENABLE ROW LEVEL SECURITY;
+ALTER TABLE products FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON products
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 
@@ -112,6 +114,7 @@ CREATE TABLE product_categories (
   PRIMARY KEY (product_id, category_id)
 );
 ALTER TABLE product_categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE product_categories FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON product_categories
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 
@@ -124,6 +127,7 @@ CREATE TABLE product_images (
   UNIQUE (product_id, media_asset_id)
 );
 ALTER TABLE product_images ENABLE ROW LEVEL SECURITY;
+ALTER TABLE product_images FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON product_images
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 

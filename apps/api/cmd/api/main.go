@@ -9,6 +9,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/catalog"
 	"github.com/shopkeet/api/internal/media"
 	"github.com/shopkeet/api/internal/platform/config"
 	"github.com/shopkeet/api/internal/platform/db"
@@ -41,6 +42,11 @@ func main() {
 	// scoped R2 media library behind TenantMW (JWT + SET LOCAL app.current_tenant).
 	v1 := app.Group("/api/v1", logger.New())
 	auth.RegisterRoutes(v1, pool, cfg.JWTSecret)
+
+	// Phase 3 — catalog. Storefront routes resolve the tenant from the
+	// X-Tenant-ID header (Next.js middleware per docs/03-architecture.md §2);
+	// admin routes use the JWT via TenantMW. RLS scopes everything.
+	catalog.RegisterRoutes(v1, pool, cfg.JWTSecret, catalog.New(pool))
 
 	var mediaSvc *media.Service
 	if cfg.R2AccountID != "" {
