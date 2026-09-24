@@ -224,6 +224,7 @@ CREATE TABLE posts (
 );
 CREATE INDEX posts_type_status_idx ON posts (tenant_id, post_type, status);
 ALTER TABLE posts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE posts FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON posts
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 
@@ -242,6 +243,7 @@ CREATE TABLE templates (
   UNIQUE (tenant_id, template_type, scope)
 );
 ALTER TABLE templates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE templates FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON templates
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 
@@ -258,6 +260,7 @@ CREATE TABLE sections (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE sections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sections FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON sections
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 
@@ -270,6 +273,7 @@ CREATE TABLE redirects (
   UNIQUE (tenant_id, from_path)
 );
 ALTER TABLE redirects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE redirects FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON redirects
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 

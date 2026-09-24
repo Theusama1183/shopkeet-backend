@@ -11,6 +11,7 @@ import (
 	"github.com/shopkeet/api/internal/auth"
 	"github.com/shopkeet/api/internal/cart"
 	"github.com/shopkeet/api/internal/catalog"
+	"github.com/shopkeet/api/internal/content"
 	"github.com/shopkeet/api/internal/media"
 	"github.com/shopkeet/api/internal/orders"
 	"github.com/shopkeet/api/internal/payments"
@@ -45,7 +46,14 @@ func main() {
 	// mounts the public signup/login; media.RegisterRoutes adds the tenant-
 	// scoped R2 media library behind TenantMW (JWT + SET LOCAL app.current_tenant).
 	v1 := app.Group("/api/v1", logger.New())
+	// New tenants get their storefront chrome (home page post, the required
+	// templates, header/footer sections) inside the signup transaction.
+	auth.RegisterTenantCreatedHook(content.SeedDefaults)
 	auth.RegisterRoutes(v1, pool, cfg.JWTSecret)
+
+	// Phase 6 — content & page builder. Placeholder JSON feeds the Puck editor;
+	// onPublish saves the Puck layout verbatim through the admin endpoints.
+	content.RegisterRoutes(v1, pool, cfg.JWTSecret, content.New(pool))
 
 	// Phase 3 — catalog. Storefront routes resolve the tenant from the
 	// X-Tenant-ID header (Next.js middleware per docs/03-architecture.md §2);

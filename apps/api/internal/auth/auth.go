@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"time"
@@ -14,6 +15,20 @@ import (
 
 // CustomerSessionCookie is the cookie that carries the guest cart session id.
 const CustomerSessionCookie = "shopkeet_session"
+
+// TenantCreatedHook runs inside the signup transaction, once RLS is scoped to
+// the new tenant, so later phases can seed per-tenant defaults atomically with
+// tenant creation (Phase 6 seeds the storefront chrome via content.SeedDefaults).
+type TenantCreatedHook func(ctx context.Context, tx pgx.Tx, tenantID string) error
+
+var onTenantCreated TenantCreatedHook
+
+// RegisterTenantCreatedHook lets other packages seed per-tenant defaults without
+// auth importing them (they import auth for middleware, so the dependency must
+// point the other way). Safe to call before app startup.
+func RegisterTenantCreatedHook(h TenantCreatedHook) {
+	onTenantCreated = h
+}
 
 // --- helpers -----------------------------------------------------------------
 
@@ -83,6 +98,12 @@ func SignupHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "email belongs to this tenant"})
 			}
 			return fiber.ErrInternalServerError
+		}
+
+		if onTenantCreated != nil {
+			if err := onTenantCreated(c.Context(), tx, tenantID); err != nil {
+				return fiber.ErrInternalServerError
+			}
 		}
 
 		if err := tx.Commit(ctx); err != nil {
