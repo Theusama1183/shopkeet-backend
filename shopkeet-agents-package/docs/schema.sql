@@ -36,6 +36,11 @@ CREATE TABLE merchant_users (
   UNIQUE (tenant_id, email)
 );
 ALTER TABLE merchant_users ENABLE ROW LEVEL SECURITY;
+-- RLS is meaningful only when the app's DB session is NOT a superuser (the
+-- shell can bypass row security entirely, FORCE or not). Phase 1 adds a
+-- dedicated non-superuser role `shopkeet_app` that owns these tables and
+-- which the API connects as; FORCE additionally binds the table owner.
+ALTER TABLE merchant_users FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON merchant_users
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 

@@ -47,7 +47,11 @@ This project is built the way a small software house splits work — full roles 
   - Stack confirmed locally: Go 1.27 + Fiber + pgx (pgxpool) + Redis + golang-migrate (embedded iofs) + Asynq (background queue, Redis-backed — **not** BullMQ: BullMQ is Node-only, spec `02-tech-stack.md` picks Asynq for the Go backend).
   - VPS `~/infra/docker-compose.yml`: postgres:16-alpine + redis:7-alpine, bound to 127.0.0.1 only, fresh named volumes. Local dev connects via SSH tunnel (`-L 5432 -L 6379`). Old payload.json / shopkeet_apps deleted.
   - No frontend (deliberate per user; CI + compose are backend-only).
-- **Phase 1 — Tenants & Auth: NOT STARTED.** Next up: tenants/merchant_users schema + RLS, `POST /auth/signup` + `/auth/login`, JWT middleware + `SET LOCAL app.current_tenant` RLS session, cross-tenant isolation tests.
+- **Phase 1 — Tenants & Auth: DONE** (verified: `go build ./...` ✓, `go vet ./...` ✓, `go test ./...` ✓, `migrations up: done` against VPS Postgres via SSH tunnel, cross-tenant RLS acceptance test passes).
+  - Schema in same migration as table: `tenants`, `merchant_users` + `tenant_isolation` policy (`0002_tenants_auth.*`), `FORCE ROW LEVEL SECURITY`.
+  - RLS gotcha solved: the Postgres `POSTGRES_USER` (`shopkeet`) is a superuser and bypasses RLS silently. `0003_app_role` adds a dedicated **non-superuser** `shopkeet_app` role that owns the tenant tables; the API and tests connect as `shopkeet_app` (`DATABASE_URL=…shopkeet_app`), not `shopkeet`. `0004_default_grants` auto-grants future phase tables to `shopkeet_app`.
+  - Endpoints live: `POST /api/v1/auth/signup`, `POST /api/v1/auth/login` (registered by `auth.RegisterRoutes` in `cmd/api/main.go`). JWT middleware `TenantMW` sets `app.current_tenant` per request.
+  - Acceptance test: `TestTenantRLSIsolation` (skips unless `DATABASE_URL` set; run as `shopkeet_app`).
 
 ## Working agreement for any agent in this repo
 

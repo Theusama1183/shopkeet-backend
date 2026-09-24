@@ -13,7 +13,7 @@ services:
     volumes:
       - ../apps/api:/app
     environment:
-      - DATABASE_URL=postgres://shopkeet:shopkeet@postgres:5432/shopkeet?sslmode=disable
+      - DATABASE_URL=postgres://shopkeet_app:shopkeet_app@postgres:5432/shopkeet?sslmode=disable
       - REDIS_URL=redis://redis:6379
       - PORT=3001
       - JWT_SECRET=dev-secret-not-for-prod

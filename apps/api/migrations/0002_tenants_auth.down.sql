@@ -1,0 +1,5 @@
+DROP POLICY IF EXISTS tenant_isolation ON merchant_users;
+ALTER TABLE merchant_users DISABLE ROW LEVEL SECURITY;
+ALTER TABLE merchant_users NO FORCE ROW LEVEL SECURITY;
+DROP TABLE IF EXISTS merchant_users;
+DROP TABLE IF EXISTS tenants;

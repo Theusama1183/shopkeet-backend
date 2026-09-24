@@ -1,0 +1,199 @@
+package auth
+
+import (
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// --- helpers -----------------------------------------------------------------
+
+// isUniqueViolation reports whether err is a Postgres 23505 (unique_violation),
+// used by signup to return a clean 409 instead of a 500.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// --- signup -------------------------------------------------------------------
+
+// signupRequest is the POST /api/v1/auth/signup body.
+type signupRequest struct {
+	Name      string `json:"name"`
+	Subdomain string `json:"subdomain"`
+	Email     string `json:"email"`
+	Password  string `json:"password"`
+}
+
+// SignupHandler creates a tenant + its owner in one transaction (so the tenant
+// and owner commit atomically), then mints a tenant-scoped JWT.
+func SignupHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		var req signupRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		}
+		if req.Name == "" || req.Subdomain == "" || req.Email == "" || req.Password == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "name, subdomain, email, password required"})
+		}
+
+		hash, err := HashPassword(req.Password)
+		if err != nil {
+			return fiber.ErrInternalServerError
+		}
+
+		ctx := c.Context()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return fiber.ErrInternalServerError
+		}
+		defer tx.Rollback(ctx)
+
+		var tenantID, userID string
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO tenants (name, subdomain)
+			VALUES ($1, $2)
+			RETURNING id`, req.Name, req.Subdomain).Scan(&tenantID); err != nil {
+			if isUniqueViolation(err) {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "subdomain taken"})
+			}
+			return fiber.ErrInternalServerError
+		}
+
+		// Scope the owner insert so hypothetical RLS on merchant_users sees the
+		// new tenant (immune even if policies are added later).
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tenantID); err != nil {
+			return fiber.ErrInternalServerError
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO merchant_users (tenant_id, email, password_hash, role)
+			VALUES ($1, $2, $3, 'owner')
+			RETURNING id`, tenantID, req.Email, hash).Scan(&userID); err != nil {
+			if isUniqueViolation(err) {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "email belongs to this tenant"})
+			}
+			return fiber.ErrInternalServerError
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return fiber.ErrInternalServerError
+		}
+
+		token, err := Sign(secret, tenantID, userID, "owner", 24*time.Hour)
+		if err != nil {
+			return fiber.ErrInternalServerError
+		}
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"token": token,
+			"user":  fiber.Map{"id": userID, "email": req.Email, "role": "owner"},
+			"tenant": fiber.Map{"id": tenantID, "name": req.Name, "subdomain": req.Subdomain},
+			"expires": time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+		})
+	}
+}
+
+// --- login -------------------------------------------------------------------
+
+// loginRequest is the POST /api/v1/auth/login body.
+type loginRequest struct {
+	Subdomain string `json:"subdomain"`
+	Email     string `json:"email"`
+	Password  string `json:"password"`
+}
+
+// LoginHandler verifies subdomain+email+password and returns a tenant JWT.
+func LoginHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		var req loginRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		}
+
+		ctx := c.Context()
+		var tenantID, userID, role, hash string
+		err := pool.QueryRow(ctx, `
+			SELECT t.id, u.id, u.role, u.password_hash
+			FROM tenants t
+			JOIN merchant_users u ON u.tenant_id = t.id
+			WHERE t.subdomain = $1 AND u.email = $2`, req.Subdomain, req.Email).
+			Scan(&tenantID, &userID, &role, &hash)
+		if err == pgx.ErrNoRows {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
+		}
+		if err != nil {
+			return fiber.ErrInternalServerError
+		}
+		if hash == "" || !CheckPassword(req.Password, hash) {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
+		}
+
+		token, err := Sign(secret, tenantID, userID, role, 24*time.Hour)
+		if err != nil {
+			return fiber.ErrInternalServerError
+		}
+		return c.JSON(fiber.Map{
+			"token":   token,
+			"user":    fiber.Map{"id": userID, "email": req.Email, "role": role},
+			"expires": time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+		})
+	}
+}
+
+// --- middleware + routes -------------------------------------------------------
+
+// TenantMW validates a Bearer JWTcase and, on success, opens a real DB
+// transaction with app.current_tenant SET LOCAL so RLS scopes every query to
+// that tenant for the rest of the request. The tx is stored in c.Locals("tx")
+// for handlers to use; TenantMW commits it automatically when the handler
+// chain completes without error.
+func TenantMW(pool *pgxpool.Pool, secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		h := c.Get("Authorization")
+		if !strings.HasPrefix(h, "Bearer ") {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing bearer token"})
+		}
+		claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid token"})
+		}
+
+		ctx := c.Context()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return fiber.ErrInternalServerError
+		}
+		defer tx.Rollback(ctx)
+
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", claims.TenantID); err != nil {
+			return fiber.ErrInternalServerError
+		}
+
+		c.Locals("tx", tx)
+		c.Locals("tenant_id", claims.TenantID)
+		c.Locals("user_id", claims.UserID)
+		c.Locals("role", claims.Role)
+
+		if err := c.Next(); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+}
+
+// RegisterRoutes mounts the Phase 1 auth surface:
+//
+//	POST /api/v1/auth/signup   (public)
+//	POST /api/v1/auth/login    (public)
+func RegisterRoutes(app *fiber.App, pool *pgxpool.Pool, secret string) {
+	g := app.Group("/api/v1", logger.New())
+	g.Post("/auth/signup", SignupHandler(pool, secret))
+	g.Post("/auth/login", LoginHandler(pool, secret))
+}
