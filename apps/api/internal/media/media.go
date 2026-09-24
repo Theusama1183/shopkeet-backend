@@ -11,6 +11,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 // Service wires the media module: handlers read/write RLS-scoped rows through
@@ -59,25 +61,25 @@ type uploadURLRequest struct {
 func (s *Service) UploadURL(c *fiber.Ctx) error {
 	var req uploadURLRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if req.Filename == "" || req.ContentType == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "filename and content_type required"})
+		return httperr.C(fiber.StatusBadRequest, "filename and content_type required")
 	}
 	tenantID, ok := c.Locals("tenant_id").(string)
 	if !ok || tenantID == "" {
-		return fiber.ErrUnauthorized
+		return httperr.Unauthorized("unauthorized", "unauthorized")
 	}
 
 	ext := sanitizeExt(req.Filename)
 	if ext == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "unsupported filename"})
+		return httperr.C(fiber.StatusBadRequest, "unsupported filename")
 	}
 	key := fmt.Sprintf("%s/%s.%s", tenantID, uuid.NewString(), ext)
 
 	uploadURL, err := s.store.PresignPutURL(c.Context(), key, req.ContentType)
 	if err != nil {
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "could not prepare upload"})
+		return httperr.C(fiber.StatusBadGateway, "could not prepare upload")
 	}
 	return c.JSON(fiber.Map{
 		"upload_url": uploadURL,
@@ -98,24 +100,24 @@ type confirmRequest struct {
 func (s *Service) Confirm(c *fiber.Ctx) error {
 	var req confirmRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if req.R2Key == "" || req.ContentType == "" || req.SizeBytes < 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "r2_key, content_type, size_bytes required"})
+		return httperr.C(fiber.StatusBadRequest, "r2_key, content_type, size_bytes required")
 	}
 	tenantID, ok := c.Locals("tenant_id").(string)
 	if !ok || tenantID == "" {
-		return fiber.ErrUnauthorized
+		return httperr.Unauthorized("unauthorized", "unauthorized")
 	}
 	// The key's first path segment must be the tenant — a tenant must never be
 	// able to register a row pointing at another tenant's object key.
 	if !strings.HasPrefix(req.R2Key, tenantID+"/") {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "r2_key must belong to your tenant"})
+		return httperr.C(fiber.StatusForbidden, "r2_key must belong to your tenant")
 	}
 
 	tx, ok := c.Locals("tx").(pgx.Tx)
 	if !ok || tx == nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 
@@ -127,7 +129,7 @@ func (s *Service) Confirm(c *fiber.Ctx) error {
 		tenantID, req.R2Key, s.publicURL+"/"+req.R2Key, req.ContentType, req.SizeBytes, req.AltText,
 	).Scan(&id, &url)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not record asset"})
+		return httperr.C(fiber.StatusInternalServerError, "could not record asset")
 	}
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"id": id, "r2_key": req.R2Key, "url": url,
@@ -171,7 +173,7 @@ func assetJSON(a *assetRow) fiber.Map {
 func (s *Service) List(c *fiber.Ctx) error {
 	tx, ok := c.Locals("tx").(pgx.Tx)
 	if !ok || tx == nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	tenantID, _ := c.Locals("tenant_id").(string)
@@ -182,7 +184,7 @@ func (s *Service) List(c *fiber.Ctx) error {
 		WHERE tenant_id = $1
 		ORDER BY created_at DESC, id DESC`, tenantID)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	defer rows.Close()
 
@@ -190,12 +192,12 @@ func (s *Service) List(c *fiber.Ctx) error {
 	for rows.Next() {
 		var a assetRow
 		if err := rows.Scan(&a.id, &a.r2Key, &a.url, &a.contentType, &a.sizeBytes, &a.altText, &a.createdAt); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		assets = append(assets, assetJSON(&a))
 	}
 	if err := rows.Err(); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(fiber.Map{"assets": assets})
 }
@@ -205,7 +207,7 @@ func (s *Service) List(c *fiber.Ctx) error {
 func (s *Service) Delete(c *fiber.Ctx) error {
 	tx, ok := c.Locals("tx").(pgx.Tx)
 	if !ok || tx == nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	id := c.Params("id")
@@ -216,19 +218,19 @@ func (s *Service) Delete(c *fiber.Ctx) error {
 		"SELECT r2_key FROM media_assets WHERE id = $1 AND tenant_id = $2", id, tenantID).
 		Scan(&key)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "asset not found"})
+		return httperr.C(fiber.StatusNotFound, "asset not found")
 	}
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	// Object first: if R2 succeeds but the row disappears underneath us it's
 	// just an orphan row; failing the object delete aborts before row removal.
 	if err := s.store.Delete(ctx, key); err != nil {
-		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "could not delete object"})
+		return httperr.C(fiber.StatusBadGateway, "could not delete object")
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM media_assets WHERE id = $1", id); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(fiber.Map{"deleted": id})
 }

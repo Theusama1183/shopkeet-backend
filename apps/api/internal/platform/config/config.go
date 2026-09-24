@@ -13,6 +13,10 @@ type Config struct {
 	JWTSecret     string
 	AppBaseDomain string
 
+	// MetricsToken gates GET /metrics (Phase 7). When empty the endpoint is
+	// still served but is only safe behind a network-level proxy rule.
+	MetricsToken string
+
 	// Cloudflare R2 (object storage — Phase 2). R2_PUBLIC_URL is the public
 	// base (r2.dev or custom domain) that media URLs are built from.
 	R2AccountID   string
@@ -30,6 +34,7 @@ func Load() (*Config, error) {
 		Port:          os.Getenv("PORT"),
 		JWTSecret:     os.Getenv("JWT_SECRET"),
 		AppBaseDomain: os.Getenv("APP_BASE_DOMAIN"),
+		MetricsToken:  os.Getenv("METRICS_TOKEN"),
 		R2AccountID:   os.Getenv("R2_ACCOUNT_ID"),
 		R2AccessKeyID: os.Getenv("R2_ACCESS_KEY_ID"),
 		R2SecretKey:   os.Getenv("R2_SECRET_ACCESS_KEY"),

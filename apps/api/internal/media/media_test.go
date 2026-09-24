@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 // fakeStore records presign/delete calls instead of touching real R2.
@@ -82,7 +83,7 @@ func TestMediaRLSIsolation(t *testing.T) {
 	_, aToken := mkTenant("alpha")
 	_, bToken := mkTenant("beta")
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	store := &fakeStore{}
 	svc := New(pool, store, "https://pub.example", time.Minute)
 	RegisterRoutes(app.Group("/api/v1"), pool, secret, svc)

@@ -6,6 +6,8 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 // Service implements the guest cart surface. Handlers read/write through the
@@ -128,11 +130,11 @@ func cartJSON(cp *cartPayload) fiber.Map {
 func (s *Service) GetCart(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	cp, err := loadCart(c, tx, customerSession(c))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(cartJSON(cp))
 }
@@ -150,14 +152,14 @@ type addItemRequest struct {
 func (s *Service) AddItem(c *fiber.Ctx) error {
 	var req addItemRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if req.ProductID == "" || req.Quantity < 1 || req.Quantity > 999 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "product_id and quantity (1-999) required"})
+		return httperr.C(fiber.StatusBadRequest, "product_id and quantity (1-999) required")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	tid, _ := c.Locals("tenant_id").(string)
@@ -168,10 +170,10 @@ func (s *Service) AddItem(c *fiber.Ctx) error {
 	err := tx.QueryRow(ctx,
 		"SELECT (status = 'active') FROM products WHERE id = $1", req.ProductID).Scan(&active)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !active) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "product not found"})
+		return httperr.C(fiber.StatusNotFound, "product not found")
 	}
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	// One cart per session (UNIQUE (tenant_id, customer_session)); merge lines.
@@ -179,12 +181,12 @@ func (s *Service) AddItem(c *fiber.Ctx) error {
 		INSERT INTO carts (tenant_id, customer_session)
 		VALUES ($1, $2)
 		ON CONFLICT (tenant_id, customer_session) DO NOTHING`, tid, session); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	var cartID string
 	if err := tx.QueryRow(ctx,
 		"SELECT id FROM carts WHERE customer_session = $1", session).Scan(&cartID); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO cart_items (tenant_id, cart_id, product_id, quantity)
@@ -192,7 +194,7 @@ func (s *Service) AddItem(c *fiber.Ctx) error {
 		ON CONFLICT (cart_id, product_id)
 		DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity`,
 		tid, cartID, req.ProductID, req.Quantity); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	// Fast-path reservation; never fails the request (checkout is authoritative).
@@ -200,7 +202,7 @@ func (s *Service) AddItem(c *fiber.Ctx) error {
 
 	cp, err := loadCart(c, tx, session)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(cartJSON(cp))
 }
@@ -213,14 +215,14 @@ type quantityRequest struct {
 func (s *Service) UpdateItemQuantity(c *fiber.Ctx) error {
 	var req quantityRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if req.Quantity < 1 || req.Quantity > 999 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "quantity (1-999) required"})
+		return httperr.C(fiber.StatusBadRequest, "quantity (1-999) required")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	tag, err := tx.Exec(c.Context(), `
 		UPDATE cart_items ci SET quantity = $1
@@ -228,14 +230,14 @@ func (s *Service) UpdateItemQuantity(c *fiber.Ctx) error {
 		WHERE ci.id = $2 AND ci.cart_id = c.id AND c.customer_session = $3`,
 		req.Quantity, c.Params("id"), customerSession(c))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if tag.RowsAffected() == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "cart item not found"})
+		return httperr.C(fiber.StatusNotFound, "cart item not found")
 	}
 	cp, err := loadCart(c, tx, customerSession(c))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(cartJSON(cp))
 }
@@ -244,7 +246,7 @@ func (s *Service) UpdateItemQuantity(c *fiber.Ctx) error {
 func (s *Service) RemoveItem(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	tag, err := tx.Exec(c.Context(), `
 		DELETE FROM cart_items ci
@@ -252,14 +254,14 @@ func (s *Service) RemoveItem(c *fiber.Ctx) error {
 		WHERE ci.id = $1 AND ci.cart_id = c.id AND c.customer_session = $2`,
 		c.Params("id"), customerSession(c))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if tag.RowsAffected() == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "cart item not found"})
+		return httperr.C(fiber.StatusNotFound, "cart item not found")
 	}
 	cp, err := loadCart(c, tx, customerSession(c))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(cartJSON(cp))
 }

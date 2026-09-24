@@ -5,7 +5,7 @@ import (
 	"log"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/joho/godotenv"
 
 	"github.com/shopkeet/api/internal/auth"
@@ -18,6 +18,8 @@ import (
 	"github.com/shopkeet/api/internal/platform/config"
 	"github.com/shopkeet/api/internal/platform/db"
 	"github.com/shopkeet/api/internal/platform/events"
+	"github.com/shopkeet/api/internal/platform/httperr"
+	"github.com/shopkeet/api/internal/platform/observe"
 )
 
 func main() {
@@ -36,16 +38,35 @@ func main() {
 	}
 	defer pool.Close()
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
+
+	// Phase 7 — observable by default. Panics -> standard 500 error shape,
+	// every request gets a traceable id + JSON access log, and request volume/
+	// latency land in the Prometheus registry (served at /metrics, token-gated).
+	metrics := observe.NewMetrics(pool)
+	app.Use(recover.New(recover.Config{EnableStackTrace: false}))
+	app.Use(observe.RequestID)
+	app.Use(observe.AccessLog)
+	app.Use(metrics.Middleware)
 
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		return c.Status(200).JSON(fiber.Map{"status": "ok"})
 	})
 
+	// /metrics is always mounted so a firewall/proxy rule alone can expose it
+	// (docs/api-reference.md §Platform marks it Internal). When METRICS_TOKEN is
+	// configured, the endpoint additionally requires Authorization: Bearer.
+	app.Get("/metrics", func(c *fiber.Ctx) error {
+		if cfg.MetricsToken != "" && c.Get("Authorization") != "Bearer "+cfg.MetricsToken {
+			return httperr.Unauthorized("unauthorized", "invalid or missing bearer token")
+		}
+		return metrics.Handler()(c)
+	})
+
 	// Phase 1 & 2 — auth + media share the /api/v1 group. auth.RegisterRoutes
 	// mounts the public signup/login; media.RegisterRoutes adds the tenant-
 	// scoped R2 media library behind TenantMW (JWT + SET LOCAL app.current_tenant).
-	v1 := app.Group("/api/v1", logger.New())
+	v1 := app.Group("/api/v1")
 	// New tenants get their storefront chrome (home page post, the required
 	// templates, header/footer sections) inside the signup transaction.
 	auth.RegisterTenantCreatedHook(content.SeedDefaults)

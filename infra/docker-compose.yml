@@ -1,7 +1,5 @@
-# Shopkeet dev stack — backend only for now.
-# `web` (Next.js) service is intentionally absent until the frontend phase
-# starts (per founder instruction: backend-first). docker-compose.dev.yml
-# will carry exta extras if needed later.
+# Shopkeet dev stack — backend + Phase 7 observability (Prometheus + Grafana).
+# Grafana dashboards are provisioned from infra/grafana/dashboards (idempotent).
 
 services:
   api:
@@ -18,6 +16,7 @@ services:
       - PORT=3001
       - JWT_SECRET=dev-secret-not-for-prod
       - APP_BASE_DOMAIN=shopkeet.dev
+      - METRICS_TOKEN=dev-metrics-token
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,5 +49,30 @@ services:
       timeout: 3s
       retries: 20
 
+  # Phase 7 — /metrics is bearer-token gated; Prometheus scrapes with the
+  # dev token and Grafana renders the provisioned Shopkeet dashboard.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   postgres_data:
+  grafana_data:

@@ -14,6 +14,8 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 func randSuffix4() string {
@@ -108,7 +110,7 @@ func TestCartRLSIsolation(t *testing.T) {
 	p2 := seedProduct(a.id, "p2", 250, 0, "active")  // zero stock — cartable now
 	arch := seedProduct(a.id, "arch", 999, 1, "archived")
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	RegisterRoutes(app.Group("/api/v1"), pool, New(pool, NoopReserver{}))
 
 	type resp struct {

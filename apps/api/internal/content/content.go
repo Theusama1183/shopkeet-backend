@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 // Service is the Phase 6 content surface. Handlers read/write through the
@@ -173,14 +175,14 @@ func validPostStatus(s string) bool {
 func (s *Service) CreatePost(c *fiber.Ctx) error {
 	var req postRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	req.PostType = defaultStr(req.PostType, "page")
 	if req.Route == "" || req.Title == "" || !validRoute(req.Route) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "route and title required (route starts with /)"})
+		return httperr.C(fiber.StatusBadRequest, "route and title required (route starts with /)")
 	}
 	if !validPostStatus(req.Status) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid status"})
+		return httperr.C(fiber.StatusBadRequest, "invalid status")
 	}
 	layout := req.Layout
 	if len(layout) == 0 {
@@ -189,7 +191,7 @@ func (s *Service) CreatePost(c *fiber.Ctx) error {
 	status := defaultStr(req.Status, "draft")
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 
@@ -205,14 +207,14 @@ func (s *Service) CreatePost(c *fiber.Ctx) error {
 			nullableStr(req.MetaTitle), nullableStr(req.MetaDescription), status).Scan(&id)
 	})
 	if isUniqueViolation(err) {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "route already in use"})
+		return httperr.C(fiber.StatusConflict, "route already in use")
 	}
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	p, err := scanPost(tx.QueryRow(ctx, "SELECT "+postCols+" FROM posts WHERE id = $1", id))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.Status(fiber.StatusCreated).JSON(postJSON(p))
 }
@@ -230,13 +232,13 @@ func defaultStr(s, d string) string {
 func (s *Service) GetPosts(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	postType := c.Query("post_type")
 	route := c.Query("route")
 	if postType == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "post_type required"})
+		return httperr.C(fiber.StatusBadRequest, "post_type required")
 	}
 
 	if route != "" {
@@ -244,10 +246,10 @@ func (s *Service) GetPosts(c *fiber.Ctx) error {
 			"SELECT "+postCols+" FROM posts WHERE post_type = $1 AND route = $2 AND status = 'published'",
 			postType, route))
 		if errors.Is(err, pgx.ErrNoRows) {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "post not found"})
+			return httperr.C(fiber.StatusNotFound, "post not found")
 		}
 		if err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		return c.JSON(postJSON(p))
 	}
@@ -256,7 +258,7 @@ func (s *Service) GetPosts(c *fiber.Ctx) error {
 		"SELECT "+postCols+" FROM posts WHERE post_type = $1 AND status = 'published' ORDER BY updated_at DESC",
 		postType)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	defer rows.Close()
 	var posts []fiber.Map
@@ -264,12 +266,12 @@ func (s *Service) GetPosts(c *fiber.Ctx) error {
 		var p postRow
 		if err := rows.Scan(&p.id, &p.postType, &p.route, &p.title, &p.layout,
 			&p.metaTitle, &p.metaDesc, &p.status, &p.published, &p.updated); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		posts = append(posts, postJSON(&p))
 	}
 	if err := rows.Err(); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(fiber.Map{"posts": posts})
 }
@@ -279,17 +281,17 @@ func (s *Service) GetPosts(c *fiber.Ctx) error {
 func (s *Service) UpdatePost(c *fiber.Ctx) error {
 	var req postRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if req.Route != "" && !validRoute(req.Route) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "route must start with /"})
+		return httperr.C(fiber.StatusBadRequest, "route must start with /")
 	}
 	if !validPostStatus(req.Status) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid status"})
+		return httperr.C(fiber.StatusBadRequest, "invalid status")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	id := c.Params("id")
@@ -297,10 +299,10 @@ func (s *Service) UpdatePost(c *fiber.Ctx) error {
 	current, err := scanPost(tx.QueryRow(ctx,
 		"SELECT "+postCols+" FROM posts WHERE id = $1", id))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "post not found"})
+		return httperr.C(fiber.StatusNotFound, "post not found")
 	}
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	var sets []string
@@ -342,9 +344,9 @@ func (s *Service) UpdatePost(c *fiber.Ctx) error {
 		return err
 	}); err != nil {
 		if isUniqueViolation(err) {
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "route already in use"})
+			return httperr.C(fiber.StatusConflict, "route already in use")
 		}
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	// Auto-redirect: route change rewrites any existing redirect for the old
@@ -355,13 +357,13 @@ func (s *Service) UpdatePost(c *fiber.Ctx) error {
 			VALUES ($1, $2, $3)
 			ON CONFLICT (tenant_id, from_path) DO UPDATE SET to_path = EXCLUDED.to_path`,
 			tenantID(c), current.route, req.Route); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 	}
 
 	p, err := scanPost(tx.QueryRow(ctx, "SELECT "+postCols+" FROM posts WHERE id = $1", id))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(postJSON(p))
 }
@@ -370,14 +372,14 @@ func (s *Service) UpdatePost(c *fiber.Ctx) error {
 func (s *Service) DeletePost(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	tag, err := tx.Exec(c.Context(), "DELETE FROM posts WHERE id = $1", c.Params("id"))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if tag.RowsAffected() == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "post not found"})
+		return httperr.C(fiber.StatusNotFound, "post not found")
 	}
 	return c.JSON(fiber.Map{"deleted": c.Params("id")})
 }
@@ -413,7 +415,7 @@ func templateJSON(t *templateRow) fiber.Map {
 func (s *Service) GetTemplate(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	var t templateRow
 	err := tx.QueryRow(c.Context(), `
@@ -423,10 +425,10 @@ func (s *Service) GetTemplate(c *fiber.Ctx) error {
 		c.Params("template_type")).
 		Scan(&t.id, &t.templateType, &t.scope, &t.layout, &t.metaTitle, &t.metaDesc, &t.status, &t.updated)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "template not found"})
+		return httperr.C(fiber.StatusNotFound, "template not found")
 	}
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(templateJSON(&t))
 }
@@ -437,14 +439,14 @@ func (s *Service) GetTemplate(c *fiber.Ctx) error {
 func (s *Service) PutTemplate(c *fiber.Ctx) error {
 	var req postRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if !validPostStatus(req.Status) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid status"})
+		return httperr.C(fiber.StatusBadRequest, "invalid status")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	tt := c.Params("template_type")
@@ -457,7 +459,7 @@ func (s *Service) PutTemplate(c *fiber.Ctx) error {
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		if len(req.Layout) == 0 {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "layout required when creating a template"})
+			return httperr.C(fiber.StatusBadRequest, "layout required when creating a template")
 		}
 		status := defaultStr(req.Status, "published")
 		if err := tx.QueryRow(ctx, `
@@ -467,10 +469,10 @@ func (s *Service) PutTemplate(c *fiber.Ctx) error {
 			RETURNING id`,
 			tid, tt, req.Layout, nullableStr(req.MetaTitle),
 			nullableStr(req.MetaDescription), status).Scan(&id); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 	case err != nil:
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	default:
 		var sets []string
 		var args []any
@@ -493,7 +495,7 @@ func (s *Service) PutTemplate(c *fiber.Ctx) error {
 		if len(sets) > 0 {
 			if _, err := tx.Exec(ctx, fmt.Sprintf("UPDATE templates SET %s WHERE id = $%d",
 				strings.Join(sets, ", "), len(args)+1), append(args, id)...); err != nil {
-				return fiber.ErrInternalServerError
+				return httperr.ErrInternalServerError
 			}
 		}
 	}
@@ -503,7 +505,7 @@ func (s *Service) PutTemplate(c *fiber.Ctx) error {
 		SELECT id, template_type, scope, layout, meta_title, meta_description, status, updated_at
 		FROM templates WHERE id = $1`, id).
 		Scan(&t.id, &t.templateType, &t.scope, &t.layout, &t.metaTitle, &t.metaDesc, &t.status, &t.updated); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(templateJSON(&t))
 }
@@ -548,28 +550,28 @@ func scanSection(row pgx.Row) (*sectionRow, error) {
 func (s *Service) GetSections(c *fiber.Ctx) error {
 	st := c.Query("section_type")
 	if st == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "section_type required"})
+		return httperr.C(fiber.StatusBadRequest, "section_type required")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	rows, err := tx.Query(c.Context(),
 		"SELECT "+sectionCols+" FROM sections WHERE section_type = $1 AND status = 'published' ORDER BY updated_at DESC", st)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	defer rows.Close()
 	var sections []fiber.Map
 	for rows.Next() {
 		var sc sectionRow
 		if err := rows.Scan(&sc.id, &sc.sectionType, &sc.name, &sc.layout, &sc.rules, &sc.status, &sc.updated); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		sections = append(sections, sectionJSON(&sc))
 	}
 	if err := rows.Err(); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(fiber.Map{"sections": sections})
 }
@@ -587,13 +589,13 @@ type sectionRequest struct {
 func (s *Service) CreateSection(c *fiber.Ctx) error {
 	var req sectionRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if req.SectionType == "" || req.Name == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "section_type and name required"})
+		return httperr.C(fiber.StatusBadRequest, "section_type and name required")
 	}
 	if !validPostStatus(req.Status) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid status"})
+		return httperr.C(fiber.StatusBadRequest, "invalid status")
 	}
 	layout := req.Layout
 	if len(layout) == 0 {
@@ -601,7 +603,7 @@ func (s *Service) CreateSection(c *fiber.Ctx) error {
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	var id string
 	if err := tx.QueryRow(c.Context(), `
@@ -610,11 +612,11 @@ func (s *Service) CreateSection(c *fiber.Ctx) error {
 		RETURNING id`,
 		tenantID(c), req.SectionType, req.Name, layout, ruleOrNil(req.PlacementRules),
 		defaultStr(req.Status, "draft")).Scan(&id); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	sc, err := scanSection(tx.QueryRow(c.Context(), "SELECT "+sectionCols+" FROM sections WHERE id = $1", id))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.Status(fiber.StatusCreated).JSON(sectionJSON(sc))
 }
@@ -630,23 +632,23 @@ func ruleOrNil(r json.RawMessage) any {
 func (s *Service) UpdateSection(c *fiber.Ctx) error {
 	var req sectionRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if !validPostStatus(req.Status) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid status"})
+		return httperr.C(fiber.StatusBadRequest, "invalid status")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	id := c.Params("id")
 
 	if _, err := scanSection(tx.QueryRow(ctx,
 		"SELECT "+sectionCols+" FROM sections WHERE id = $1", id)); errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "section not found"})
+		return httperr.C(fiber.StatusNotFound, "section not found")
 	} else if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	var sets []string
@@ -670,12 +672,12 @@ func (s *Service) UpdateSection(c *fiber.Ctx) error {
 	if len(sets) > 0 {
 		if _, err := tx.Exec(ctx, fmt.Sprintf("UPDATE sections SET %s WHERE id = $%d",
 			strings.Join(sets, ", "), len(args)+1), append(args, id)...); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 	}
 	sc, err := scanSection(tx.QueryRow(ctx, "SELECT "+sectionCols+" FROM sections WHERE id = $1", id))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(sectionJSON(sc))
 }
@@ -684,14 +686,14 @@ func (s *Service) UpdateSection(c *fiber.Ctx) error {
 func (s *Service) DeleteSection(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	tag, err := tx.Exec(c.Context(), "DELETE FROM sections WHERE id = $1", c.Params("id"))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if tag.RowsAffected() == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "section not found"})
+		return httperr.C(fiber.StatusNotFound, "section not found")
 	}
 	return c.JSON(fiber.Map{"deleted": c.Params("id")})
 }
@@ -716,24 +718,24 @@ func redirectJSON(r *redirectRow) fiber.Map {
 func (s *Service) ListRedirects(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	rows, err := tx.Query(c.Context(), `
 		SELECT id, from_path, to_path, created_at FROM redirects ORDER BY created_at DESC`)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	defer rows.Close()
 	var redirects []fiber.Map
 	for rows.Next() {
 		var r redirectRow
 		if err := rows.Scan(&r.id, &r.from, &r.to, &r.created); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		redirects = append(redirects, redirectJSON(&r))
 	}
 	if err := rows.Err(); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(fiber.Map{"redirects": redirects})
 }
@@ -747,14 +749,14 @@ func (s *Service) CreateRedirect(c *fiber.Ctx) error {
 		ToPath   string `json:"to_path"`
 	}
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if !validRoute(req.FromPath) || !validRoute(req.ToPath) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "from_path and to_path required (start with /)"})
+		return httperr.C(fiber.StatusBadRequest, "from_path and to_path required (start with /)")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	var id string
 	err := savepoint(c.Context(), tx, func() error {
@@ -764,16 +766,16 @@ func (s *Service) CreateRedirect(c *fiber.Ctx) error {
 			RETURNING id`, tenantID(c), req.FromPath, req.ToPath).Scan(&id)
 	})
 	if isUniqueViolation(err) {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "from_path already mapped"})
+		return httperr.C(fiber.StatusConflict, "from_path already mapped")
 	}
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	var r redirectRow
 	if err := tx.QueryRow(c.Context(), `
 		SELECT id, from_path, to_path, created_at FROM redirects WHERE id = $1`, id).
 		Scan(&r.id, &r.from, &r.to, &r.created); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.Status(fiber.StatusCreated).JSON(redirectJSON(&r))
 }
@@ -782,14 +784,14 @@ func (s *Service) CreateRedirect(c *fiber.Ctx) error {
 func (s *Service) DeleteRedirect(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	tag, err := tx.Exec(c.Context(), "DELETE FROM redirects WHERE id = $1", c.Params("id"))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if tag.RowsAffected() == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "redirect not found"})
+		return httperr.C(fiber.StatusNotFound, "redirect not found")
 	}
 	return c.JSON(fiber.Map{"deleted": c.Params("id")})
 }
@@ -799,21 +801,21 @@ func (s *Service) DeleteRedirect(c *fiber.Ctx) error {
 func (s *Service) LookupRedirect(c *fiber.Ctx) error {
 	path := c.Query("path")
 	if path == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "path query param required"})
+		return httperr.C(fiber.StatusBadRequest, "path query param required")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	var r redirectRow
 	err := tx.QueryRow(c.Context(), `
 		SELECT id, from_path, to_path, created_at FROM redirects WHERE from_path = $1`, path).
 		Scan(&r.id, &r.from, &r.to, &r.created)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "no redirect"})
+		return httperr.C(fiber.StatusNotFound, "no redirect")
 	}
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(fiber.Map{"redirect": redirectJSON(&r)})
 }

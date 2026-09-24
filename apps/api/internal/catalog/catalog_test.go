@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 func randSuffix3() string {
@@ -101,7 +102,7 @@ func TestCatalogRLSIsolation(t *testing.T) {
 	a := mkTenant("alpha")
 	b := mkTenant("beta")
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	RegisterRoutes(app.Group("/api/v1"), pool, secret, New(pool))
 
 	do := func(method, path, token, tenant, body string, want int) *http.Response {

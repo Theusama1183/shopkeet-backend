@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 func randSuffix5() string {
@@ -47,7 +48,7 @@ func TestContentRLSIsolation(t *testing.T) {
 	const secret = "test-secret"
 	sfx := randSuffix5()
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
 	auth.RegisterTenantCreatedHook(SeedDefaults)
 	auth.RegisterRoutes(v1, pool, secret)

@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 // Service is the catalog business surface. Handlers read/write through the
@@ -223,17 +225,17 @@ func validProductStatus(s string) bool {
 func (s *Service) CreateProduct(c *fiber.Ctx) error {
 	var req createProductRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if req.Name == "" || req.Slug == "" || req.PriceCents < 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "name, slug, price_cents required"})
+		return httperr.C(fiber.StatusBadRequest, "name, slug, price_cents required")
 	}
 	status := req.Status
 	if status == "" {
 		status = "draft"
 	}
 	if !validProductStatus(status) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid status"})
+		return httperr.C(fiber.StatusBadRequest, "invalid status")
 	}
 	currency := req.Currency
 	if currency == "" {
@@ -242,7 +244,7 @@ func (s *Service) CreateProduct(c *fiber.Ctx) error {
 	tid := tenantID(c)
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 
@@ -259,9 +261,9 @@ func (s *Service) CreateProduct(c *fiber.Ctx) error {
 		return err
 	}); err != nil {
 		if isUniqueViolation(err) {
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "slug taken"})
+			return httperr.C(fiber.StatusConflict, "slug taken")
 		}
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	// Link categories (validated by existence within RLS scope).
@@ -272,13 +274,13 @@ func (s *Service) CreateProduct(c *fiber.Ctx) error {
 				VALUES ($1,$2,$3)`, tid, id, cid)
 			return err
 		}); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "unknown category id"})
+			return httperr.C(fiber.StatusBadRequest, "unknown category id")
 		}
 	}
 
 	p, err := s.queryProduct(c, tx, "p.id = $1", id)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.Status(fiber.StatusCreated).JSON(productJSON(p))
 }
@@ -295,7 +297,7 @@ func nullableStr(s string) *string {
 func (s *Service) ListProducts(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 
@@ -321,7 +323,7 @@ func (s *Service) ListProducts(c *fiber.Ctx) error {
 		WHERE %s
 		ORDER BY p.created_at DESC, p.id`, strings.Join(conds, " AND ")), args...)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	defer rows.Close()
 
@@ -330,12 +332,12 @@ func (s *Service) ListProducts(c *fiber.Ctx) error {
 		var p productRow
 		if err := rows.Scan(&p.id, &p.name, &p.slug, &p.description, &p.priceCents, &p.currency,
 			&p.inventoryCount, &p.status, &p.metaTitle, &p.metaDescription, &p.createdAt); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		found = append(found, p)
 	}
 	if err := rows.Err(); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	rows.Close()
 
@@ -344,7 +346,7 @@ func (s *Service) ListProducts(c *fiber.Ctx) error {
 	products := make([]fiber.Map, 0, len(found))
 	for i := range found {
 		if err := s.hydrate(c, tx, &found[i]); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		products = append(products, productJSON(&found[i]))
 	}
@@ -355,7 +357,7 @@ func (s *Service) ListProducts(c *fiber.Ctx) error {
 func (s *Service) GetProduct(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	where := "p.id = $1"
 	if !isAdmin(c) {
@@ -363,10 +365,10 @@ func (s *Service) GetProduct(c *fiber.Ctx) error {
 	}
 	p, err := s.queryProduct(c, tx, where, c.Params("id"))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if p == nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "product not found"})
+		return httperr.C(fiber.StatusNotFound, "product not found")
 	}
 	return c.JSON(productJSON(p))
 }
@@ -375,14 +377,14 @@ func (s *Service) GetProduct(c *fiber.Ctx) error {
 func (s *Service) UpdateProduct(c *fiber.Ctx) error {
 	var req createProductRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if req.Status != "" && !validProductStatus(req.Status) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid status"})
+		return httperr.C(fiber.StatusBadRequest, "invalid status")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	id := c.Params("id")
@@ -391,7 +393,7 @@ func (s *Service) UpdateProduct(c *fiber.Ctx) error {
 	// Ensure the product exists under this tenant before patching.
 	if err := tx.QueryRow(ctx,
 		"SELECT true FROM products WHERE id = $1", id).Scan(new(bool)); errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "product not found"})
+		return httperr.C(fiber.StatusNotFound, "product not found")
 	}
 
 	var sets []string
@@ -437,9 +439,9 @@ func (s *Service) UpdateProduct(c *fiber.Ctx) error {
 			return err
 		}); err != nil {
 			if isUniqueViolation(err) {
-				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "slug taken"})
+				return httperr.C(fiber.StatusConflict, "slug taken")
 			}
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 	}
 
@@ -447,7 +449,7 @@ func (s *Service) UpdateProduct(c *fiber.Ctx) error {
 	if req.CategoryIDs != nil {
 		if _, err := tx.Exec(ctx,
 			"DELETE FROM product_categories WHERE product_id = $1", id); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		for _, cid := range req.CategoryIDs {
 			if err := savepoint(ctx, tx, func() error {
@@ -456,17 +458,17 @@ func (s *Service) UpdateProduct(c *fiber.Ctx) error {
 					VALUES ($1,$2,$3)`, tid, id, cid)
 				return err
 			}); err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "unknown category id"})
+				return httperr.C(fiber.StatusBadRequest, "unknown category id")
 			}
 		}
 	}
 
 	p, err := s.queryProduct(c, tx, "p.id = $1", id)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if p == nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "product not found"})
+		return httperr.C(fiber.StatusNotFound, "product not found")
 	}
 	return c.JSON(productJSON(p))
 }
@@ -476,7 +478,7 @@ func (s *Service) UpdateProduct(c *fiber.Ctx) error {
 func (s *Service) DeleteProduct(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	id := c.Params("id")
@@ -484,19 +486,19 @@ func (s *Service) DeleteProduct(c *fiber.Ctx) error {
 	var exists bool
 	err := tx.QueryRow(ctx, "SELECT true FROM products WHERE id = $1", id).Scan(&exists)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "product not found"})
+		return httperr.C(fiber.StatusNotFound, "product not found")
 	}
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM product_images WHERE product_id = $1", id); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM product_categories WHERE product_id = $1", id); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM products WHERE id = $1", id); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(fiber.Map{"deleted": id})
 }
@@ -509,14 +511,14 @@ func (s *Service) AddImage(c *fiber.Ctx) error {
 		SortOrder    int    `json:"sort_order"`
 	}
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if req.MediaAssetID == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "media_asset_id required"})
+		return httperr.C(fiber.StatusBadRequest, "media_asset_id required")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	id := c.Params("id")
@@ -524,11 +526,11 @@ func (s *Service) AddImage(c *fiber.Ctx) error {
 
 	var prodExists bool
 	if err := tx.QueryRow(ctx, "SELECT true FROM products WHERE id = $1", id).Scan(&prodExists); errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "product not found"})
+		return httperr.C(fiber.StatusNotFound, "product not found")
 	}
 	var assetExists bool
 	if err := tx.QueryRow(ctx, "SELECT true FROM media_assets WHERE id = $1", req.MediaAssetID).Scan(&assetExists); errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "media asset not found"})
+		return httperr.C(fiber.StatusNotFound, "media asset not found")
 	}
 
 	if err := savepoint(ctx, tx, func() error {
@@ -538,14 +540,14 @@ func (s *Service) AddImage(c *fiber.Ctx) error {
 		return err
 	}); err != nil {
 		if isUniqueViolation(err) {
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "image already attached"})
+			return httperr.C(fiber.StatusConflict, "image already attached")
 		}
-		return fiber.ErrBadRequest
+		return httperr.BadRequest("bad_request", "bad request")
 	}
 
 	p, err := s.queryProduct(c, tx, "p.id = $1", id)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(productJSON(p))
 }
@@ -554,17 +556,17 @@ func (s *Service) AddImage(c *fiber.Ctx) error {
 func (s *Service) RemoveImage(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	tag, err := tx.Exec(ctx, `
 		DELETE FROM product_images
 		WHERE id = $1 AND product_id = $2`, c.Params("imageId"), c.Params("id"))
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if tag.RowsAffected() == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "image not found"})
+		return httperr.C(fiber.StatusNotFound, "image not found")
 	}
 	return c.JSON(fiber.Map{"deleted": c.Params("imageId")})
 }
@@ -573,25 +575,25 @@ func (s *Service) RemoveImage(c *fiber.Ctx) error {
 func (s *Service) ListCategories(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	rows, err := tx.Query(c.Context(), `
 		SELECT id, name, slug FROM categories
 		ORDER BY name`)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	defer rows.Close()
 	var cats []fiber.Map
 	for rows.Next() {
 		var ct categoryRow
 		if err := rows.Scan(&ct.id, &ct.name, &ct.slug); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		cats = append(cats, fiber.Map{"id": ct.id, "name": ct.name, "slug": ct.slug})
 	}
 	if err := rows.Err(); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(fiber.Map{"categories": cats})
 }

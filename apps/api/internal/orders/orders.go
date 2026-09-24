@@ -10,6 +10,7 @@ import (
 
 	"github.com/shopkeet/api/internal/payments"
 	"github.com/shopkeet/api/internal/platform/events"
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 // Service implements checkout + order management for guest Cash-on-Delivery
@@ -145,22 +146,22 @@ type checkoutRequest struct {
 func (s *Service) Checkout(c *fiber.Ctx) error {
 	var req checkoutRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	if req.CustomerName == "" || req.CustomerPhone == "" || req.ShippingAddress == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "customer_name, customer_phone, shipping_address required"})
+		return httperr.C(fiber.StatusBadRequest, "customer_name, customer_phone, shipping_address required")
 	}
 	if req.PaymentMethod == "" {
 		req.PaymentMethod = "cod"
 	}
 	provider, ok := s.payments.Get(req.PaymentMethod)
 	if !ok {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "unsupported payment method"})
+		return httperr.C(fiber.StatusBadRequest, "unsupported payment method")
 	}
 
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 	tid, _ := c.Locals("tenant_id").(string)
@@ -169,7 +170,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	var cartID string
 	if err := tx.QueryRow(ctx,
 		"SELECT id FROM carts WHERE customer_session = $1", session).Scan(&cartID); errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cart is empty"})
+		return httperr.C(fiber.StatusBadRequest, "cart is empty")
 	}
 
 	// Lock every product in the cart. This is the real guard against
@@ -184,7 +185,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		ORDER BY p.name
 		FOR UPDATE OF p`, cartID)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	type line struct {
 		productID string
@@ -199,30 +200,30 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		var status string
 		if err := rows.Scan(&l.productID, &l.quantity, &l.price, &l.currency, &inventory, &status); err != nil {
 			rows.Close()
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		if status != "active" {
 			rows.Close()
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "a product in your cart is no longer available"})
+			return httperr.C(fiber.StatusConflict, "a product in your cart is no longer available")
 		}
 		if inventory < l.quantity {
 			rows.Close()
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "insufficient stock"})
+			return httperr.C(fiber.StatusConflict, "insufficient stock")
 		}
 		lines = append(lines, l)
 	}
 	if err := rows.Err(); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	rows.Close()
 	if len(lines) == 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cart is empty"})
+		return httperr.C(fiber.StatusBadRequest, "cart is empty")
 	}
 
 	res, err := provider.Process(ctx, payments.ProcessRequest{
 		Method: req.PaymentMethod, AmountCents: 0, Currency: "usd"})
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	total := 0
@@ -239,38 +240,38 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		RETURNING id`,
 		tid, req.CustomerName, req.CustomerPhone, nullableStr(req.CustomerEmail),
 		req.ShippingAddress, req.PaymentMethod, res.PaymentStatus, total, currency).Scan(&orderID); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	for _, l := range lines {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO order_items (tenant_id, order_id, product_id, quantity, unit_price_cents)
 			VALUES ($1, $2, $3, $4, $5)`, tid, orderID, l.productID, l.quantity, l.price); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 	}
 	for _, l := range lines {
 		if _, err := tx.Exec(ctx,
 			"UPDATE products SET inventory_count = inventory_count - $1 WHERE id = $2",
 			l.quantity, l.productID); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 	}
 	if _, err := tx.Exec(ctx,
 		"DELETE FROM cart_items WHERE cart_id = $1", cartID); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if _, err := tx.Exec(ctx,
 		"DELETE FROM carts WHERE id = $1", cartID); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	if err := s.bus.Emit(ctx, events.Event{Name: "order.created", Data: fiber.Map{"order_id": orderID}}); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	order, err := loadOrder(c, tx, "id = $1", orderID)
 	if err != nil || order == nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.Status(fiber.StatusCreated).JSON(orderJSON(order))
 }
@@ -290,11 +291,11 @@ func nullableStr(s string) *string {
 func (s *Service) GetOrder(c *fiber.Ctx) error {
 	phone := c.Query("phone")
 	if phone == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "phone query param required"})
+		return httperr.C(fiber.StatusBadRequest, "phone query param required")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	var order *orderRow
 	var err error
@@ -307,10 +308,10 @@ func (s *Service) GetOrder(c *fiber.Ctx) error {
 			c.Params("id"), phone)
 	}
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	if order == nil {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "order not found"})
+		return httperr.C(fiber.StatusNotFound, "order not found")
 	}
 	return c.JSON(orderJSON(order))
 }
@@ -322,7 +323,7 @@ func (s *Service) GetOrder(c *fiber.Ctx) error {
 func (s *Service) ListOrders(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 
@@ -334,7 +335,7 @@ func (s *Service) ListOrders(c *fiber.Ctx) error {
 	}
 	rows, err := tx.Query(ctx, orderSelect+" WHERE "+where+" ORDER BY created_at DESC, id", args...)
 	if err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	defer rows.Close()
 
@@ -343,12 +344,12 @@ func (s *Service) ListOrders(c *fiber.Ctx) error {
 		var o orderRow
 		if err := rows.Scan(&o.id, &o.customerName, &o.customerPhone, &o.customerEmail, &o.shippingAddress,
 			&o.paymentMethod, &o.paymentStatus, &o.status, &o.totalCents, &o.currency, &o.createdAt); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		found = append(found, o)
 	}
 	if err := rows.Err(); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	rows.Close()
 
@@ -361,18 +362,18 @@ func (s *Service) ListOrders(c *fiber.Ctx) error {
 			SELECT id, product_id, quantity, unit_price_cents
 			FROM order_items WHERE order_id = $1 ORDER BY id`, found[i].id)
 		if err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		for irows.Next() {
 			var it orderItemRow
 			if err := irows.Scan(&it.id, &it.productID, &it.quantity, &it.unitPriceCents); err != nil {
 				irows.Close()
-				return fiber.ErrInternalServerError
+				return httperr.ErrInternalServerError
 			}
 			items = append(items, it)
 		}
 		if err := irows.Err(); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		irows.Close()
 		found[i].items = items
@@ -399,18 +400,18 @@ var nextStatus = map[string]string{
 func (s *Service) UpdateStatus(c *fiber.Ctx) error {
 	var req updateStatusRequest
 	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	tx, ok := txFrom(c)
 	if !ok {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
 
 	var current string
 	if err := tx.QueryRow(ctx,
 		"SELECT status FROM orders WHERE id = $1 FOR UPDATE", c.Params("id")).Scan(&current); errors.Is(err, pgx.ErrNoRows) {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "order not found"})
+		return httperr.C(fiber.StatusNotFound, "order not found")
 	}
 
 	target := req.Status
@@ -418,35 +419,35 @@ func (s *Service) UpdateStatus(c *fiber.Ctx) error {
 	switch target {
 	case "cancelled":
 		if current != "pending" && current != "confirmed" {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid status transition"})
+			return httperr.C(fiber.StatusBadRequest, "invalid status transition")
 		}
 		sets = "status = 'cancelled'"
 	case "confirmed", "shipped", "delivered":
 		if nextStatus[current] != target {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid status transition"})
+			return httperr.C(fiber.StatusBadRequest, "invalid status transition")
 		}
 		sets = "status = '" + target + "'"
 		if target == "delivered" {
 			sets += ", payment_status = 'paid'"
 		}
 	default:
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid status"})
+		return httperr.C(fiber.StatusBadRequest, "invalid status")
 	}
 
 	if _, err := tx.Exec(ctx,
 		"UPDATE orders SET "+sets+" WHERE id = $1", c.Params("id")); err != nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 
 	if target == "delivered" {
 		if err := s.bus.Emit(ctx, events.Event{Name: "order.paid", Data: fiber.Map{"order_id": c.Params("id")}}); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 	}
 
 	order, err := loadOrder(c, tx, "id = $1", c.Params("id"))
 	if err != nil || order == nil {
-		return fiber.ErrInternalServerError
+		return httperr.ErrInternalServerError
 	}
 	return c.JSON(orderJSON(order))
 }

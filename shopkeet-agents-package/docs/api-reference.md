@@ -96,9 +96,11 @@ File bytes never pass through the Go API — the browser uploads directly to R2 
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/healthz` | Public | Liveness check |
-| GET | `/metrics` | Internal | Prometheus scrape endpoint (not exposed publicly) |
+| GET | `/metrics` | Internal | Prometheus scrape endpoint. Mounted always; when `METRICS_TOKEN` is set requires `Authorization: Bearer <token>` (block external exposure at the proxy/firewall too — never reverse-proxy public requests to it) |
 
 ## Error shape (every endpoint)
+
+Every non-2xx response follows one shape. `code` is a stable machine string; when a status is produced generically the code defaults to `invalid_request` (400), `unauthorized` (401), `forbidden` (403), `not_found` (404), `conflict` (409), `upstream_error` (502), `internal_error` (5xx). A panic recovered by middleware renders as `internal_error` (no stack trace leaks).
 
 ```json
 { "error": { "code": "product_not_found", "message": "No product with that id in this store." } }

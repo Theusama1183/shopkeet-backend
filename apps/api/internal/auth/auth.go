@@ -11,6 +11,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 // CustomerSessionCookie is the cookie that carries the guest cart session id.
@@ -55,21 +57,21 @@ func SignupHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		var req signupRequest
 		if err := c.BodyParser(&req); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+			return httperr.C(fiber.StatusBadRequest, "invalid body")
 		}
 		if req.Name == "" || req.Subdomain == "" || req.Email == "" || req.Password == "" {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "name, subdomain, email, password required"})
+			return httperr.C(fiber.StatusBadRequest, "name, subdomain, email, password required")
 		}
 
 		hash, err := HashPassword(req.Password)
 		if err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 
 		ctx := c.Context()
 		tx, err := pool.Begin(ctx)
 		if err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		defer tx.Rollback(ctx)
 
@@ -79,40 +81,40 @@ func SignupHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 			VALUES ($1, $2)
 			RETURNING id`, req.Name, req.Subdomain).Scan(&tenantID); err != nil {
 			if isUniqueViolation(err) {
-				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "subdomain taken"})
+				return httperr.C(fiber.StatusConflict, "subdomain taken")
 			}
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 
 		// Scope the owner insert so hypothetical RLS on merchant_users sees the
 		// new tenant (immune even if policies are added later).
 		if _, err := tx.Exec(ctx,
 			"SELECT set_config('app.current_tenant', $1, true)", tenantID); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO merchant_users (tenant_id, email, password_hash, role)
 			VALUES ($1, $2, $3, 'owner')
 			RETURNING id`, tenantID, req.Email, hash).Scan(&userID); err != nil {
 			if isUniqueViolation(err) {
-				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "email belongs to this tenant"})
+				return httperr.C(fiber.StatusConflict, "email belongs to this tenant")
 			}
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 
 		if onTenantCreated != nil {
 			if err := onTenantCreated(c.Context(), tx, tenantID); err != nil {
-				return fiber.ErrInternalServerError
+				return httperr.ErrInternalServerError
 			}
 		}
 
 		if err := tx.Commit(ctx); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 
 		token, err := Sign(secret, tenantID, userID, "owner", 24*time.Hour)
 		if err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 			"token":   token,
@@ -137,7 +139,7 @@ func LoginHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		var req loginRequest
 		if err := c.BodyParser(&req); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid body"})
+			return httperr.C(fiber.StatusBadRequest, "invalid body")
 		}
 
 		ctx := c.Context()
@@ -149,18 +151,18 @@ func LoginHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 			WHERE t.subdomain = $1 AND u.email = $2`, req.Subdomain, req.Email).
 			Scan(&tenantID, &userID, &role, &hash)
 		if err == pgx.ErrNoRows {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
+			return httperr.C(fiber.StatusUnauthorized, "invalid credentials")
 		}
 		if err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		if hash == "" || !CheckPassword(req.Password, hash) {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid credentials"})
+			return httperr.C(fiber.StatusUnauthorized, "invalid credentials")
 		}
 
 		token, err := Sign(secret, tenantID, userID, role, 24*time.Hour)
 		if err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		return c.JSON(fiber.Map{
 			"token":   token,
@@ -181,23 +183,23 @@ func TenantMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		h := c.Get("Authorization")
 		if !strings.HasPrefix(h, "Bearer ") {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing bearer token"})
+			return httperr.C(fiber.StatusUnauthorized, "missing bearer token")
 		}
 		claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
 		if err != nil {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid token"})
+			return httperr.C(fiber.StatusUnauthorized, "invalid token")
 		}
 
 		ctx := c.Context()
 		tx, err := pool.Begin(ctx)
 		if err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		defer tx.Rollback(ctx)
 
 		if _, err := tx.Exec(ctx,
 			"SELECT set_config('app.current_tenant', $1, true)", claims.TenantID); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 
 		c.Locals("tx", tx)
@@ -223,19 +225,19 @@ func publicTenantMW(pool *pgxpool.Pool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		tid := c.Get("X-Tenant-ID")
 		if tid == "" {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing X-Tenant-ID header"})
+			return httperr.C(fiber.StatusBadRequest, "missing X-Tenant-ID header")
 		}
 
 		ctx := c.Context()
 		tx, err := pool.Begin(ctx)
 		if err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		defer tx.Rollback(ctx)
 
 		if _, err := tx.Exec(ctx,
 			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 
 		c.Locals("tx", tx)
@@ -263,18 +265,18 @@ func PublicOrAdminMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 		if strings.HasPrefix(h, "Bearer ") {
 			claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
 			if err != nil {
-				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid token"})
+				return httperr.C(fiber.StatusUnauthorized, "invalid token")
 			}
 
 			ctx := c.Context()
 			tx, err := pool.Begin(ctx)
 			if err != nil {
-				return fiber.ErrInternalServerError
+				return httperr.ErrInternalServerError
 			}
 			defer tx.Rollback(ctx)
 			if _, err := tx.Exec(ctx,
 				"SELECT set_config('app.current_tenant', $1, true)", claims.TenantID); err != nil {
-				return fiber.ErrInternalServerError
+				return httperr.ErrInternalServerError
 			}
 			c.Locals("tx", tx)
 			c.Locals("tenant_id", claims.TenantID)
@@ -306,7 +308,7 @@ func CustomerMW(pool *pgxpool.Pool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		tid := c.Get("X-Tenant-ID")
 		if tid == "" {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing X-Tenant-ID header"})
+			return httperr.C(fiber.StatusBadRequest, "missing X-Tenant-ID header")
 		}
 
 		session := c.Cookies(CustomerSessionCookie)
@@ -328,12 +330,12 @@ func CustomerMW(pool *pgxpool.Pool) fiber.Handler {
 		ctx := c.Context()
 		tx, err := pool.Begin(ctx)
 		if err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 		defer tx.Rollback(ctx)
 		if _, err := tx.Exec(ctx,
 			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
-			return fiber.ErrInternalServerError
+			return httperr.ErrInternalServerError
 		}
 
 		c.Locals("tx", tx)

@@ -22,6 +22,7 @@ import (
 	"github.com/shopkeet/api/internal/cart"
 	"github.com/shopkeet/api/internal/payments"
 	"github.com/shopkeet/api/internal/platform/events"
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 func randSuffix5() string {
@@ -129,7 +130,7 @@ func TestOrdersRLSIsolation(t *testing.T) {
 		return nil
 	})
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
 	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}))
 	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()))
