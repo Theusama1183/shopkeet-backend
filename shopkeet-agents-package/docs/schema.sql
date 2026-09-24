@@ -179,6 +179,7 @@ CREATE TABLE orders (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE orders FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON orders
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 
@@ -191,6 +192,7 @@ CREATE TABLE order_items (
   unit_price_cents INTEGER NOT NULL
 );
 ALTER TABLE order_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE order_items FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON order_items
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 

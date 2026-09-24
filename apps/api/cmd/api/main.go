@@ -12,8 +12,11 @@ import (
 	"github.com/shopkeet/api/internal/cart"
 	"github.com/shopkeet/api/internal/catalog"
 	"github.com/shopkeet/api/internal/media"
+	"github.com/shopkeet/api/internal/orders"
+	"github.com/shopkeet/api/internal/payments"
 	"github.com/shopkeet/api/internal/platform/config"
 	"github.com/shopkeet/api/internal/platform/db"
+	"github.com/shopkeet/api/internal/platform/events"
 )
 
 func main() {
@@ -64,6 +67,20 @@ func main() {
 		log.Printf("cart unit reservation via Redis at %s", cfg.RedisURL)
 	}
 	cart.RegisterRoutes(v1, pool, cart.New(pool, reserver))
+
+	// Phase 5 — checkout & orders (COD). The payments registry has one provider
+	// (cod); events surface order.created / order.paid for future webhooks.
+	bus := events.NewBus()
+	bus.Subscribe("order.created", func(ctx context.Context, e events.Event) error {
+		log.Printf("event order.created: %+v", e.Data)
+		return nil
+	})
+	bus.Subscribe("order.paid", func(ctx context.Context, e events.Event) error {
+		log.Printf("event order.paid: %+v", e.Data)
+		return nil
+	})
+	orders.RegisterRoutes(v1, pool, cfg.JWTSecret,
+		orders.New(pool, bus, payments.NewRegistry()))
 
 	var mediaSvc *media.Service
 	if cfg.R2AccountID != "" {
