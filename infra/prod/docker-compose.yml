@@ -1,0 +1,112 @@
+# Shopkeet production stack (VPS 13.61.125.59) — docker compose project `infra`,
+# deployed at /home/ubuntu/shopkeet/infra/. Mirrors the live compose exactly;
+# secrets live in api.env (see api.env.example), NEVER committed.
+#
+#   scp infra/prod/{docker-compose.yml,Caddyfile} ubuntu@...:…/infra/
+#   ssh ubuntu@… "cd …/infra && docker compose up -d --build"
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: shopkeet-postgres
+    environment:
+      - POSTGRES_USER=shopkeet
+      - POSTGRES_PASSWORD=shopkeet
+      - POSTGRES_DB=shopkeet
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopkeet -d shopkeet"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: shopkeet-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Shopkeet API — production multi-stage build. Every tenant-scoped query is
+  # bounded by RLS; /metrics is bearer-token gated (METRICS_TOKEN below) and is
+  # additionally blocked at the Caddy edge so it is only reachable internally.
+  api:
+    build:
+      context: /home/ubuntu/shopkeet/apps/api
+      dockerfile: Dockerfile.prod
+    container_name: shopkeet-api
+    env_file:
+      - /home/ubuntu/shopkeet/infra/api.env
+    environment:
+      - DATABASE_URL=postgres://shopkeet_app:shopkeet_app@postgres:5432/shopkeet?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - PORT=3001
+    ports:
+      - "127.0.0.1:3001:3001"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Public edge: TLS termination + reverse proxy for api.shopkeet.com.
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: shopkeet-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /home/ubuntu/shopkeet/infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  # Phase 7 observability. Bound to localhost only — never exposed publicly.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: shopkeet-prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - /home/ubuntu/shopkeet/infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: shopkeet-grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - /home/ubuntu/shopkeet/infra/grafana-provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  grafana_data:
+  caddy_data:
+  caddy_config:

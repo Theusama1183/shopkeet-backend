@@ -1,0 +1,12 @@
+# Shopkeet — public edge. api.shopkeet.com terminates TLS (Let's Encrypt via
+# Caddy auto-HTTPS) and reverse-proxies to the Go API on the compose network.
+# /metrics is deliberately NOT proxied publicly (Observability §Platform) —
+# Prometheus scrapes it directly at api:3001 on the internal network.
+api.shopkeet.com {
+	handle /metrics {
+		respond "Forbidden" 403
+	}
+	handle {
+		reverse_proxy api:3001
+	}
+}

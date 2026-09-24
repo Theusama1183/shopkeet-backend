@@ -2,7 +2,9 @@
 
 Everything the backend shipped (Phase 0 → Phase 7), every endpoint, every table with every field, plus the current live deployment state and the domain-handoff checklist for connecting DNS/TLS.
 
-Status: **v1 backend COMPLETE and DEPLOYED** (Phases 0–7; last commit `777f269`).
+Status: **v1 backend COMPLETE and DEPLOYED** (Phases 0–7; last commit `777f269`, deploy+domain commits `1c07b56`, `03eac4e`).
+
+Public URL: **`https://api.shopkeet.com`** — live, TLS via Let's Encrypt/Caddy. See §1 and §4.
 
 ---
 
@@ -22,28 +24,33 @@ Status: **v1 backend COMPLETE and DEPLOYED** (Phases 0–7; last commit `777f269
 | `shopkeet-postgres` | postgres:16-alpine | `127.0.0.1:5432` | healthy, data persisted (migrations up to `0009`) |
 | `shopkeet-redis` | redis:7-alpine | `127.0.0.1:6379` | healthy |
 | `shopkeet-api` | built from `apps/api/Dockerfile.prod` (static, non-root `shopkeet`) | `127.0.0.1:3001` | healthy (`/healthz` → 200) |
+| `shopkeet-caddy` | caddy:2.8-alpine | **`80`/`443` public** | TLS for `api.shopkeet.com` → `api:3001`; blocks `/metrics` |
 | `shopkeet-prometheus` | prom/prometheus:v2.53.0 | `127.0.0.1:9090` | target `api:3001` UP |
 | `shopkeet-grafana` | grafana/grafana:11.1.0 | `127.0.0.1:3000` | 200 (dashboard "Shopkeet API" provisioned) |
 
-All ports are bound to **localhost on the VPS only** — nothing is publicly reachable yet. `DATABASE_URL`, `REDIS_URL` resolve inside the compose network (`postgres`, `redis`).
+`DATABASE_URL`, `REDIS_URL` resolve inside the compose network (`postgres`, `redis`). Only Caddy's `80/443` are public; Postgres/Redis/API/Prometheus/Grafana all stay **localhost-bound on the VPS**.
 
 ### Deploy secrets (`/home/ubuntu/shopkeet/infra/api.env`)
 
 - `JWT_SECRET` — random 48-hex string
-- `APP_BASE_DOMAIN` — currently `shopkeet.dev` (placeholder; update once the real domain is attached)
+- `APP_BASE_DOMAIN` — `shopkeet.com`
 - `METRICS_TOKEN` — random 24-hex string; required as `Authorization: Bearer <token>` on `/metrics` (used by Prometheus)
 
-### Verified live (smoke test, 2026-09-24)
+Production files are mirrored in the repo at `infra/prod/` (compose + Caddyfile + `api.env.example`).
 
-- `POST /api/v1/auth/signup` → 200, tenant `deploytest` created, owner JWT returned
-- `GET /api/v1/posts?post_type=page&route=/` with `X-Tenant-ID` → seeded **Home** page post (signup seeding hook works in prod)
-- `GET /metrics` with bearer token → `shopkeet_http_requests_total`, latency histogram, and `shopkeet_db_pool_{max,acquired,idle,total}` metrics present
-- Prometheus `up{instance="api:3001"} = 1`; Grafana `/api/health` → 200
+### Verified live (2026-09-24)
 
-### Not configured on the VPS yet
+- `GET https://api.shopkeet.com/healthz` → 200 `{"status":"ok"}` (public, TLS)
+- `POST /api/v1/auth/signup` → 201, tenant `cln0101` created, owner JWT returned (public)
+- `POST /api/v1/auth/login` → 200 with valid JWT (public) — **after the FORCE RLS fix below**; wrong password → 401
+- `GET /api/v1/products` with JWT + `X-Tenant-ID` → 200 `{"products":[]}` (authenticated RLS-scoped call works through the domain)
+- `GET /metrics` → **403 at the Caddy edge** (blocked); Prometheus scrapes `api:3001` on the internal network instead
+- Prometheus + Grafana `/api/health` → 200
+- Earlier smoke (pre-domain): tenant `deploytest`, seeded **Home** page post, `/metrics` bearer + metric exposition all OK
 
-- **Cloudflare R2 (media)**: not set → `/media/*` routes are NOT mounted. Add `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_URL` to `api.env` and recreate the api container to enable.
-- **Domain + TLS**: no public exposure yet. See §Domain/DNS checklist.
+### Bug fixed during connecting the domain — login broke under FORCE RLS
+
+`POST /api/v1/auth/login` 500'd in production (`internal_error`, Postgres `invalid input syntax for type uuid: ""`): the handler ran a pool-level `tenants JOIN merchant_users` lookup while `merchant_users` is `FORCE ROW LEVEL SECURITY`, so the row was invisible (fresh conn → 401) or the pooled connection's stale/empty `app.current_tenant` blew up the policy cast (→ 500). Fix (`internal/auth/auth.go`, commit `03eac4e`): login resolves the tenant by subdomain first (`tenants` is RLS-free by design), then checks credentials on a request transaction pinned to that tenant. Regression guard `internal/auth/auth_test.go::TestLoginUnderRLS` (login had no test before). No schema/API-surface change.
 
 ---
 
@@ -194,21 +201,27 @@ Backend half (Puck editor UI + storefront rendering are the future `apps/web`). 
 
 ---
 
-## 4. Domain/DNS + TLS checklist (for Claude / domain owner)
+## 4. Domain/DNS + TLS — DONE
 
-These steps are **not done yet** — the API is currently localhost-only on the VPS.
+- **Domain**: `shopkeet.com` (Cloudflare zone, active, Free plan). API subdomain: `api.shopkeet.com`.
+- **DNS**: A record `api` → `13.61.125.59`, **DNS-only (orange cloud OFF, TTL 300)** — Cloudflare sitting in front of the API is not needed (edge TLS is Let's Encrypt via Caddy). `shopkeet.com`'s root/www records still point at Squarespace (the future `apps/web` storefront will own those).
+- **TLS**: Caddy 2.8 on the VPS, auto HTTP→HTTPS + Let's Encrypt (cert for `api.shopkeet.com` issued directly to the VPS). Caddyfile (`infra/prod/Caddyfile`) reverse-proxies `api.shopkeet.com` → `api:3001` and returns 403 for `/metrics` (Prometheus scrapes internally).
+- **Security**: AWS security group `sg-068248a6ea640128e` (eu-north-1) already allows 80/443; ufw inactive. Every other service (5432/6379/3001/9090/3000) stays 127.0.0.1-bound.
+- **`APP_BASE_DOMAIN`**: now `shopkeet.com` in `api.env`.
+- Verified: `https://api.shopkeet.com/healthz` → 200; TLS cert CN=`api.shopkeet.com` (Let's Encrypt).
 
-1. **Pick the domain** (e.g. `shopkeet.com`). Decide the API subdomain: `api.<domain>` per `docs/03-architecture.md`.
-2. **Cloudflare DNS**: point the domain's nameservers to Cloudflare (if not already). Add an **A record** for the API host, e.g. `api` → `13.61.125.59`, **orange-cloud OFF initially** (or Full (Strict) SSL mode with proxy ON — `docs/03-architecture.md` says enable TLS via the reverse proxy and set Cloudflare SSL to **Full (Strict)** if orange cloud is on). Also plan `*.` wildcard for merchant subdomains later (same A record to `13.61.125.59`).
-3. **TLS termination on the VPS**: add a **Caddy** (or Traefik) container to `~/shopkeet/infra/docker-compose.yml` publishing `80/443` and reverse-proxying `api.<domain>` → `api:3001`. Caddy auto-issues/renews Let's Encrypt certs (set `APP_BASE_DOMAIN` in `api.env` to the real domain too). Do NOT proxy `/metrics` publicly (it's bearer-token gated; keep it blocked at the firewall/proxy regardless).
-4. **Security group / firewall**: open `80` and `443` to the internet for the VPS only after Caddy is up; everything else (5432, 6379, 3001, 9090, 3000) stays localhost-bound.
-5. Optional: enable **Cloudflare R2 media** by adding the `R2_*` vars to `api.env` and re-running `docker compose up -d` (mounts `/media/*` routes).
+### Remaining / optional
+
+1. Enable **Cloudflare R2 media**: add the `R2_*` vars to `api.env` and re-run `docker compose up -d` (mounts `/media/*` routes).
+2. If you later want the API behind Cloudflare's proxy, flip the `api` record to orange cloud and set the zone SSL mode to **Full (Strict)** (Cloudflare → your VPS serves the Let's Encrypt cert).
+3. `*.shopkeet.com` wildcard + the storefront (`apps/web`) are future work — root/www currently resolve to Squarespace.
 
 ### Redeploying after code changes
 
 ```bash
-# rsync/tar the new apps/api source to /home/ubuntu/shopkeet/apps/api, then:
-cd /home/ubuntu/shopkeet/infra
-docker compose up -d --build
+# The production compose + Caddyfile + api.env.example are versioned in infra/prod/.
+# Ship new apps/api source to /home/ubuntu/shopkeet/apps/api (git archive/tar), then:
+scp infra/prod/{docker-compose.yml,Caddyfile} ubuntu@13.61.125.59:/home/ubuntu/shopkeet/infra/
+ssh ubuntu@13.61.125.59 "cd /home/ubuntu/shopkeet/infra && docker compose up -d --build"
 # migrations are idempotent: docker exec shopkeet-api /usr/local/bin/shopkeet-migrate up
 ```
