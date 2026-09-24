@@ -143,13 +143,37 @@ func LoginHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 		}
 
 		ctx := c.Context()
-		var tenantID, userID, role, hash string
-		err := pool.QueryRow(ctx, `
-			SELECT t.id, u.id, u.role, u.password_hash
-			FROM tenants t
-			JOIN merchant_users u ON u.tenant_id = t.id
-			WHERE t.subdomain = $1 AND u.email = $2`, req.Subdomain, req.Email).
-			Scan(&tenantID, &userID, &role, &hash)
+
+		// Step 1 — resolve the tenant by subdomain. tenants has no RLS (subdomain
+		// lookup is public by design), so this succeeds on a plain pool query
+		// before any tenant scope is established.
+		var tenantID string
+		if err := pool.QueryRow(ctx,
+			`SELECT id FROM tenants WHERE subdomain = $1`, req.Subdomain).Scan(&tenantID); err != nil {
+			if err == pgx.ErrNoRows {
+				return httperr.C(fiber.StatusUnauthorized, "invalid credentials")
+			}
+			return httperr.ErrInternalServerError
+		}
+
+		// Step 2 — verify credentials inside the tenant's RLS scope. merchant_users
+		// is FORCE RLS, so the lookup runs on a request transaction with
+		// app.current_tenant pinned to the tenant resolved above.
+		var userID, role, hash string
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return httperr.ErrInternalServerError
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tenantID); err != nil {
+			return httperr.ErrInternalServerError
+		}
+		err = tx.QueryRow(ctx, `
+			SELECT u.id, u.role, u.password_hash
+			FROM merchant_users u
+			WHERE u.tenant_id = $1 AND u.email = $2`, tenantID, req.Email).
+			Scan(&userID, &role, &hash)
 		if err == pgx.ErrNoRows {
 			return httperr.C(fiber.StatusUnauthorized, "invalid credentials")
 		}

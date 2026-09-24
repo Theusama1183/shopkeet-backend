@@ -91,6 +91,12 @@ This project is built the way a small software house splits work — full roles 
   - **infra/**: `docker-compose.yml` gains `prometheus` (+`prometheus/prometheus.yml`, scrapes `api:3001/metrics` with the dev token) and `grafana` (provisioned datasource + dashboard provider). The dashboard (`infra/grafana/provisioning/dashboards/shopkeet.json`) renders RPS by route, status distribution, p50/p95/p99 latency, 4xx/5xx rate by route, and the DB pool stats.
   - Acceptance tests (`internal/platform/observability_test.go`): `TestErrorShape` — malformed body → 400 `invalid_request`, handler `*E` → 404 `product_not_found`, panic → 500 `internal_error`, all exact `{"error":{code,message}}` shape; `TestMetricsExposition` — token-gated /metrics returns Prometheus text with `shopkeet_http_requests_total{route="/work",status="200"}`, the latency histogram, and `shopkeet_db_pool_max`, and refuses no-token scrapes.
 
+## Deployment (VPS + domain)
+
+- **Live API: `https://api.shopkeet.com`** (Cloudflare DNS A-record `api` → `13.61.125.59` on zone `shopkeet.com`, DNS-only; Caddy on the VPS terminates TLS via Let's Encrypt and reverse-proxies to `api:3001`). Full state + handoff checklist: `SHOPKEET-BUILD-DEPLOY.md` at the repo root.
+- VPS compose: `~/shopkeet/infra/docker-compose.yml` — `postgres`/`redis` (127.0.0.1-bound, data preserved from initial setup), `api` (Dockerfile.prod, `APP_BASE_DOMAIN=shopkeet.com`), `caddy` (80/443 public; **blocks `/metrics`** — Prometheus scrapes `api:3001` on the compose network instead), `prometheus` (:9090), `grafana` (:3000) — both observability services localhost-only.
+- **Login was broken by FORCE RLS in production (500 `internal_error` / `invalid input syntax for type uuid: ""`)** and was untested: the original `LoginHandler` ran a pool-level `tenants JOIN merchant_users` lookup outside any RLS scope. Fix (`internal/auth/auth.go`): resolve `tenants` by subdomain first (tenants is RLS-free by design), then verify credentials on a request transaction with `set_config('app.current_tenant', tenantID, true)` pinned to that tenant. Regression guard: `internal/auth/auth_test.go::TestLoginUnderRLS` (correct login + wrong password/unknown subdomain/unknown email/cross-tenant/empty subdomain all covered).
+
 ## Working agreement for any agent in this repo
 
 - Don't start the next phase until the current one's acceptance criteria pass with an automated test, not just a manual check.
