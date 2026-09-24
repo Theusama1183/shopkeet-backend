@@ -9,6 +9,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/cart"
 	"github.com/shopkeet/api/internal/catalog"
 	"github.com/shopkeet/api/internal/media"
 	"github.com/shopkeet/api/internal/platform/config"
@@ -47,6 +48,22 @@ func main() {
 	// X-Tenant-ID header (Next.js middleware per docs/03-architecture.md §2);
 	// admin routes use the JWT via TenantMW. RLS scopes everything.
 	catalog.RegisterRoutes(v1, pool, cfg.JWTSecret, catalog.New(pool))
+
+	// Phase 4 — guest carts. RLS scopes rows by the tenant resolved from
+	// X-Tenant-ID (auth.CustomerMW); the customer_session (cookie/header) keys
+	// the cart within it. Stock arbitration happens at checkout (Phase 5); the
+	// Redis reserver is a best-effort fast path only (never authoritative).
+	var reserver cart.Reserver = cart.NoopReserver{}
+	if cfg.RedisURL != "" {
+		rr, err := cart.NewRedisReserver(cfg.RedisURL)
+		if err != nil {
+			log.Fatalf("failed to init redis reserver: %v", err)
+		}
+		defer rr.Close()
+		reserver = rr
+		log.Printf("cart unit reservation via Redis at %s", cfg.RedisURL)
+	}
+	cart.RegisterRoutes(v1, pool, cart.New(pool, reserver))
 
 	var mediaSvc *media.Service
 	if cfg.R2AccountID != "" {

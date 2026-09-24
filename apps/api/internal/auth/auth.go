@@ -6,10 +6,14 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// CustomerSessionCookie is the cookie that carries the guest cart session id.
+const CustomerSessionCookie = "shopkeet_session"
 
 // --- helpers -----------------------------------------------------------------
 
@@ -263,6 +267,61 @@ func PublicOrAdminMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 			return tx.Commit(ctx)
 		}
 		return publicTenantMW(pool)(c)
+	}
+}
+
+// CustomerMW serves guest-storefront routes (Phase 4 cart). It resolves the
+// tenant from X-Tenant-ID exactly like PublicTenantMW and additionally ensures
+// a customer_session exists for guest carts:
+//
+//   - from the shopkeet_session cookie, or the X-Customer-Session header;
+//   - if neither is present it mints a new UUID, sets an HttpOnly cookie, and
+//     echoes it back in the X-Customer-Session response header so non-cookie
+//     callers (the Next.js storefront) can persist it client-side.
+//
+// The session id is stored in c.Locals("customer_session"). RLS still scopes
+// rows by tenant; customer_session scoping happens in the cart queries.
+func CustomerMW(pool *pgxpool.Pool) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		tid := c.Get("X-Tenant-ID")
+		if tid == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing X-Tenant-ID header"})
+		}
+
+		session := c.Cookies(CustomerSessionCookie)
+		if h := c.Get("X-Customer-Session"); h != "" {
+			session = h
+		}
+		if session == "" || strings.TrimSpace(session) == "" {
+			session = uuid.NewString()
+			c.Cookie(&fiber.Cookie{
+				Name:     CustomerSessionCookie,
+				Value:    session,
+				Path:     "/",
+				HTTPOnly: true,
+				SameSite: "lax",
+			})
+		}
+		c.Set("X-Customer-Session", session)
+
+		ctx := c.Context()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return fiber.ErrInternalServerError
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			return fiber.ErrInternalServerError
+		}
+
+		c.Locals("tx", tx)
+		c.Locals("tenant_id", tid)
+		c.Locals("customer_session", session)
+		if err := c.Next(); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
 	}
 }
 

@@ -136,23 +136,27 @@ CREATE POLICY tenant_isolation ON product_images
 -- ============================================================
 
 CREATE TABLE carts (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id UUID NOT NULL REFERENCES tenants(id),
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id        UUID NOT NULL REFERENCES tenants(id),
   customer_session TEXT NOT NULL, -- opaque cookie-backed id; guest checkout supported
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, customer_session) -- one cart per guest session
 );
 ALTER TABLE carts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE carts FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON carts
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 
 CREATE TABLE cart_items (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id UUID NOT NULL REFERENCES tenants(id),
-  cart_id UUID NOT NULL REFERENCES carts(id),
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id  UUID NOT NULL REFERENCES tenants(id),
+  cart_id    UUID NOT NULL REFERENCES carts(id),
   product_id UUID NOT NULL REFERENCES products(id),
-  quantity INTEGER NOT NULL CHECK (quantity > 0)
+  quantity   INTEGER NOT NULL CHECK (quantity > 0),
+  UNIQUE (cart_id, product_id) -- one line per product in a cart; adds merge quantity
 );
 ALTER TABLE cart_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cart_items FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON cart_items
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 
