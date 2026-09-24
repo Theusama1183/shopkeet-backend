@@ -52,6 +52,12 @@ This project is built the way a small software house splits work — full roles 
   - RLS gotcha solved: the Postgres `POSTGRES_USER` (`shopkeet`) is a superuser and bypasses RLS silently. `0003_app_role` adds a dedicated **non-superuser** `shopkeet_app` role that owns the tenant tables; the API and tests connect as `shopkeet_app` (`DATABASE_URL=…shopkeet_app`), not `shopkeet`. `0004_default_grants` auto-grants future phase tables to `shopkeet_app`.
   - Endpoints live: `POST /api/v1/auth/signup`, `POST /api/v1/auth/login` (registered by `auth.RegisterRoutes` in `cmd/api/main.go`). JWT middleware `TenantMW` sets `app.current_tenant` per request.
   - Acceptance test: `TestTenantRLSIsolation` (skips unless `DATABASE_URL` set; run as `shopkeet_app`).
+- **Phase 2 — Media Library (Cloudflare R2): DONE** (verified: `go build ./...` ✓, `go vet ./...` ✓, `go test ./...` ✓, `migrations up: done` against VPS Postgres via SSH tunnel, cross-tenant media RLS acceptance test passes).
+  - `0005_media_assets.*` — `media_assets` + `tenant_isolation` policy **in the same migration** + `FORCE ROW LEVEL SECURITY`; owner `shopkeet_app` (matches 0003 model).
+  - `internal/media/` — `R2` (AWS SDK S3 signing client, endpoint `https://{account_id}.r2.cloudflarestorage.com`) behind the `ObjectStore` interface (fake in tests), `Service` handlers + `RegisterRoutes` mounting under `auth.TenantMW` (RLS-scoped request tx): `POST /media/upload-url`, `POST /media`, `GET /media`, `DELETE /media/:id`.
+  - Upload flow (API never sees bytes): client → presigned PUT URL → direct R2 upload → POST /media records metadata. r2_key is `{tenant_id}/{uuid}.{ext}`; a key whose first path segment isn't the caller's tenant is refused 403 — defense in depth on top of RLS.
+  - R2 envs: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_URL` (config.Load requires all-or-none; `/media` routes mount only when configured).
+  - Acceptance test: `TestMediaRLSIsolation` (`internal/media/media_test.go`; skips without `DATABASE_URL`, run as `shopkeet_app`) — upload/confirm/list/delete through live HTTP handlers + RLS; asserts cross-tenant list empty, cross-tenant delete 404 (no R2 delete fires), stolen-key confirm 403.
 
 ## Working agreement for any agent in this repo
 

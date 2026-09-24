@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -91,9 +90,9 @@ func SignupHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 			return fiber.ErrInternalServerError
 		}
 		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-			"token": token,
-			"user":  fiber.Map{"id": userID, "email": req.Email, "role": "owner"},
-			"tenant": fiber.Map{"id": tenantID, "name": req.Name, "subdomain": req.Subdomain},
+			"token":   token,
+			"user":    fiber.Map{"id": userID, "email": req.Email, "role": "owner"},
+			"tenant":  fiber.Map{"id": tenantID, "name": req.Name, "subdomain": req.Subdomain},
 			"expires": time.Now().Add(24 * time.Hour).Format(time.RFC3339),
 		})
 	}
@@ -188,12 +187,13 @@ func TenantMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 	}
 }
 
-// RegisterRoutes mounts the Phase 1 auth surface:
+// RegisterRoutes mounts the Phase 1 auth surface onto an existing router that
+// already carries the /api/v1 prefix (so later phases can share the group):
 //
 //	POST /api/v1/auth/signup   (public)
 //	POST /api/v1/auth/login    (public)
-func RegisterRoutes(app *fiber.App, pool *pgxpool.Pool, secret string) {
-	g := app.Group("/api/v1", logger.New())
-	g.Post("/auth/signup", SignupHandler(pool, secret))
-	g.Post("/auth/login", LoginHandler(pool, secret))
+func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string) {
+	g := router.Group("/auth")
+	g.Post("/signup", SignupHandler(pool, secret))
+	g.Post("/login", LoginHandler(pool, secret))
 }

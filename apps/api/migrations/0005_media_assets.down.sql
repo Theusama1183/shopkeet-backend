@@ -1,0 +1,4 @@
+DROP POLICY IF EXISTS tenant_isolation ON media_assets;
+ALTER TABLE media_assets NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE media_assets DISABLE ROW LEVEL SECURITY;
+DROP TABLE IF EXISTS media_assets;

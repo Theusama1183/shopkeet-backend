@@ -63,6 +63,7 @@ CREATE TABLE media_assets (
   UNIQUE (r2_key)
 );
 ALTER TABLE media_assets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE media_assets FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON media_assets
   USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
 

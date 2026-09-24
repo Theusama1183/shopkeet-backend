@@ -12,6 +12,14 @@ type Config struct {
 	Port          string
 	JWTSecret     string
 	AppBaseDomain string
+
+	// Cloudflare R2 (object storage — Phase 2). R2_PUBLIC_URL is the public
+	// base (r2.dev or custom domain) that media URLs are built from.
+	R2AccountID   string
+	R2AccessKeyID string
+	R2SecretKey   string
+	R2BucketName  string
+	R2PublicURL   string
 }
 
 // Load reads configuration from the environment.
@@ -22,6 +30,11 @@ func Load() (*Config, error) {
 		Port:          os.Getenv("PORT"),
 		JWTSecret:     os.Getenv("JWT_SECRET"),
 		AppBaseDomain: os.Getenv("APP_BASE_DOMAIN"),
+		R2AccountID:   os.Getenv("R2_ACCOUNT_ID"),
+		R2AccessKeyID: os.Getenv("R2_ACCESS_KEY_ID"),
+		R2SecretKey:   os.Getenv("R2_SECRET_ACCESS_KEY"),
+		R2BucketName:  os.Getenv("R2_BUCKET_NAME"),
+		R2PublicURL:   os.Getenv("R2_PUBLIC_URL"),
 	}
 
 	if c.DatabaseURL == "" {
@@ -29,6 +42,16 @@ func Load() (*Config, error) {
 	}
 	if c.Port == "" {
 		c.Port = "3001"
+	}
+
+	// R2 is required together: either all of account/creds/bucket/public URL
+	// are configured (media enabled) or none of them is.
+	hasAny := c.R2AccountID != "" || c.R2AccessKeyID != "" || c.R2SecretKey != "" ||
+		c.R2BucketName != "" || c.R2PublicURL != ""
+	hasAll := c.R2AccountID != "" && c.R2AccessKeyID != "" && c.R2SecretKey != "" &&
+		c.R2BucketName != "" && c.R2PublicURL != ""
+	if hasAny && !hasAll {
+		return nil, fmt.Errorf("R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME, R2_PUBLIC_URL must be set together")
 	}
 
 	return c, nil
