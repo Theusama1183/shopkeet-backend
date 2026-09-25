@@ -7,6 +7,7 @@
 package customers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -163,9 +164,11 @@ func (s *Service) Signup(c *fiber.Ctx) error {
 	}
 
 	if s.bus != nil {
-		s.bus.Emit(ctx, events.Event{
-			Name: "customers.signup",
-			Data: fiber.Map{"tenant_id": tid, "email": email, "customer_id": id},
+		auth.AfterCommit(c, func() {
+			s.bus.Emit(context.Background(), events.Event{
+				Name: "customers.signup",
+				Data: fiber.Map{"tenant_id": tid, "email": email, "customer_id": id},
+			})
 		})
 	}
 

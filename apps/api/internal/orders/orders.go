@@ -1,6 +1,7 @@
 package orders
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/shopkeet/api/internal/auth"
 	"github.com/shopkeet/api/internal/discounts"
 	"github.com/shopkeet/api/internal/payments"
 	"github.com/shopkeet/api/internal/platform/events"
@@ -391,12 +393,12 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		return httperr.ErrInternalServerError
 	}
 
-	if err := s.bus.Emit(ctx, events.Event{
-		Name: "order.created",
-		Data: fiber.Map{"order_id": orderID, "tenant_id": tid},
-	}); err != nil {
-		return httperr.ErrInternalServerError
-	}
+	auth.AfterCommit(c, func() {
+		s.bus.Emit(context.Background(), events.Event{
+			Name: "order.created",
+			Data: fiber.Map{"order_id": orderID, "tenant_id": tid},
+		})
+	})
 
 	order, err := loadOrder(c, tx, "id = $1", orderID)
 	if err != nil || order == nil {
@@ -573,12 +575,12 @@ func (s *Service) UpdateStatus(c *fiber.Ctx) error {
 
 	if target == "delivered" {
 		tid, _ := c.Locals("tenant_id").(string)
-		if err := s.bus.Emit(ctx, events.Event{
-			Name: "order.paid",
-			Data: fiber.Map{"order_id": c.Params("id"), "tenant_id": tid},
-		}); err != nil {
-			return httperr.ErrInternalServerError
-		}
+		auth.AfterCommit(c, func() {
+			s.bus.Emit(context.Background(), events.Event{
+				Name: "order.paid",
+				Data: fiber.Map{"order_id": c.Params("id"), "tenant_id": tid},
+			})
+		})
 	}
 
 	order, err := loadOrder(c, tx, "id = $1", c.Params("id"))

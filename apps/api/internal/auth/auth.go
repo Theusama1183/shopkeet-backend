@@ -18,6 +18,35 @@ import (
 // CustomerSessionCookie is the cookie that carries the guest cart session id.
 const CustomerSessionCookie = "shopkeet_session"
 
+// AfterCommit registers fn to run once the request's transaction commits. A
+// handler that produces a domain event inside its tx (order.created,
+// customers.signup) registers the emit here so subscribers observe committed
+// rows — a goroutine launched before commit would miss them. Every RLS-scoped
+// request middleware flushes these after tx.Commit succeeds.
+func AfterCommit(c *fiber.Ctx, fn func()) {
+	fns, _ := c.Locals(postCommitKey).([]func())
+	c.Locals(postCommitKey, append(fns, fn))
+}
+
+// commitAndFlush commits the request transaction and then runs any
+// AfterCommit callbacks, so side effects (event emits) see committed data.
+func commitAndFlush(c *fiber.Ctx, tx pgx.Tx, ctx context.Context) error {
+	if err := tx.Commit(ctx); err != nil {
+		return httperr.ErrInternalServerError
+	}
+	if fns, ok := c.Locals(postCommitKey).([]func()); ok && len(fns) > 0 {
+		c.Locals(postCommitKey, nil)
+		for _, fn := range fns {
+			fn()
+		}
+	}
+	return nil
+}
+
+type postCommitType struct{}
+
+var postCommitKey postCommitType
+
 // TenantCreatedHook runs inside the signup transaction, once RLS is scoped to
 // the new tenant, so later phases can seed per-tenant defaults atomically with
 // tenant creation (Phase 6 seeds the storefront chrome via content.SeedDefaults).
@@ -249,7 +278,7 @@ func TenantMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 		if err := c.Next(); err != nil {
 			return err
 		}
-		return tx.Commit(ctx)
+		return commitAndFlush(c, tx, ctx)
 	}
 }
 
@@ -285,7 +314,7 @@ func publicTenantMW(pool *pgxpool.Pool) fiber.Handler {
 		if err := c.Next(); err != nil {
 			return err
 		}
-		return tx.Commit(ctx)
+		return commitAndFlush(c, tx, ctx)
 	}
 }
 
@@ -327,7 +356,7 @@ func PublicOrAdminMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 		if err := c.Next(); err != nil {
 			return err
 		}
-		return tx.Commit(ctx)
+		return commitAndFlush(c, tx, ctx)
 	}
 }
 
@@ -392,7 +421,7 @@ func CustomerMW(pool *pgxpool.Pool) fiber.Handler {
 		if err := c.Next(); err != nil {
 			return err
 		}
-		return tx.Commit(ctx)
+		return commitAndFlush(c, tx, ctx)
 	}
 }
 
@@ -434,7 +463,7 @@ func CustomerAuthMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 		if err := c.Next(); err != nil {
 			return err
 		}
-		return tx.Commit(ctx)
+		return commitAndFlush(c, tx, ctx)
 	}
 }
 
@@ -487,7 +516,7 @@ func CustomerOrGuestMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 			if err := c.Next(); err != nil {
 				return err
 			}
-			return tx.Commit(ctx)
+			return commitAndFlush(c, tx, ctx)
 		}
 		return CustomerMW(pool)(c)
 	}
