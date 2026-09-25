@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/platform/events"
@@ -116,7 +117,7 @@ func (s *Service) Subscribe(bus *events.Bus) {
 }
 
 func (s *Service) onOrderCreated(ctx context.Context, e events.Event) error {
-	m, ok := e.Data.(map[string]any)
+	m, ok := e.Data.(fiber.Map)
 	if !ok {
 		return nil
 	}
@@ -132,7 +133,7 @@ func (s *Service) onOrderCreated(ctx context.Context, e events.Event) error {
 }
 
 func (s *Service) onOrderPaid(ctx context.Context, e events.Event) error {
-	m, ok := e.Data.(map[string]any)
+	m, ok := e.Data.(fiber.Map)
 	if !ok {
 		return nil
 	}
@@ -148,7 +149,7 @@ func (s *Service) onOrderPaid(ctx context.Context, e events.Event) error {
 }
 
 func (s *Service) onCustomerSignup(ctx context.Context, e events.Event) error {
-	m, ok := e.Data.(map[string]any)
+	m, ok := e.Data.(fiber.Map)
 	if !ok {
 		return nil
 	}
