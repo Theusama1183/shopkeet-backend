@@ -25,10 +25,18 @@ type Config struct {
 	R2BucketName  string
 	R2PublicURL   string
 
-	// Resend (transactional email — Phase 12). Both must be set together to enable;
-	// if unset, a log-only provider is used.
-	ResendAPIKey           string
+	// Email delivery (Phase 12). Priority: SMTP if SMTP_HOST is set, else
+	// Resend if RESEND_API_KEY is set, else a log-only provider.
 	NotificationsFromEmail string
+
+	SMTPHost      string // e.g. mailpit-p1zaxdgvrrdf9p6bb1czudqi (dev mailpit)
+	SMTPPort      string // default 587 (auto-sniffs 465 -> SMTPS)
+	SMTPUsername  string
+	SMTPPassword  string
+	SMTPTLSMode   string // auto | starttls | smtps | none
+	SMTPTLSVerify bool   // when true, validate the server certificate
+	SMTPFromEmail string // SMTP envelope From; falls back to NOTIFICATIONS_FROM_EMAIL
+	ResendAPIKey  string
 }
 
 // Load reads configuration from the environment.
@@ -47,6 +55,14 @@ func Load() (*Config, error) {
 		R2PublicURL:            os.Getenv("R2_PUBLIC_URL"),
 		ResendAPIKey:           os.Getenv("RESEND_API_KEY"),
 		NotificationsFromEmail: os.Getenv("NOTIFICATIONS_FROM_EMAIL"),
+
+		SMTPHost:      os.Getenv("SMTP_HOST"),
+		SMTPPort:      os.Getenv("SMTP_PORT"),
+		SMTPUsername:  os.Getenv("SMTP_USERNAME"),
+		SMTPPassword:  os.Getenv("SMTP_PASSWORD"),
+		SMTPTLSMode:   os.Getenv("SMTP_TLS_MODE"),
+		SMTPTLSVerify: os.Getenv("SMTP_TLS_VERIFY") == "true",
+		SMTPFromEmail: os.Getenv("SMTP_FROM_EMAIL"),
 	}
 
 	if c.DatabaseURL == "" {

@@ -131,16 +131,33 @@ func main() {
 	customers.RegisterRoutes(v1, pool, cfg.JWTSecret, customers.New(pool, cfg.JWTSecret, bus))
 
 	// Phase 12 — notifications. Subscribe to the internal event bus; sends
-	// order confirmations, delivery updates, and welcome emails via Resend
-	// (if configured) or logs to stdout. A failed send never fails checkout.
+	// order confirmations, delivery updates, and welcome emails. Provider
+	// priority: SMTP (when SMTP_HOST is set) > Resend (when RESEND_API_KEY is
+	// set) > log-to-stdout. A failed send never fails checkout.
 	var notifProv notifications.Provider = notifications.LogProvider{}
-	if cfg.ResendAPIKey != "" && cfg.NotificationsFromEmail != "" {
+	fromEmail := cfg.SMTPFromEmail
+	if fromEmail == "" {
+		fromEmail = cfg.NotificationsFromEmail
+	}
+	switch {
+	case cfg.SMTPHost != "":
+		notifProv = notifications.NewSMTPProvider(notifications.SMTPConfig{
+			Host:       cfg.SMTPHost,
+			Port:       cfg.SMTPPort,
+			Username:   cfg.SMTPUsername,
+			Password:   cfg.SMTPPassword,
+			From:       fromEmail,
+			TLSMode:    cfg.SMTPTLSMode,
+			SkipVerify: !cfg.SMTPTLSVerify,
+		})
+		log.Printf("notifications: using SMTP provider at %s:%s (tls=%s)", cfg.SMTPHost, orDefault(cfg.SMTPPort, "587"), orDefault(cfg.SMTPTLSMode, "auto"))
+	case cfg.ResendAPIKey != "" && cfg.NotificationsFromEmail != "":
 		notifProv = notifications.NewResendProvider(cfg.ResendAPIKey, cfg.NotificationsFromEmail)
 		log.Printf("notifications: using Resend provider")
-	} else {
-		log.Printf("notifications: using log provider (set RESEND_API_KEY + NOTIFICATIONS_FROM_EMAIL to enable email)")
+	default:
+		log.Printf("notifications: using log provider (set SMTP_HOST or RESEND_API_KEY + NOTIFICATIONS_FROM_EMAIL to enable email)")
 	}
-	notifSvc := notifications.New(pool, notifProv)
+	notifSvc := notifications.New(pool, notifProv, cfg.AppBaseDomain)
 	notifSvc.Subscribe(bus)
 	notifications.RegisterRoutes(v1, pool, cfg.JWTSecret)
 
@@ -164,4 +181,11 @@ func main() {
 	if err := app.Listen(":" + cfg.Port); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
 }

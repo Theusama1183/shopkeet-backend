@@ -22,6 +22,8 @@ type Notification struct {
 	TenantID  string
 	Type      string // order_confirmation, order_shipped, order_delivered, customer_welcome
 	Recipient string // email or phone
+	From      string // envelope/From override, e.g. "Shopkeet Support <support@shopkeet.com>"
+	ReplyTo   string // optional; when set, customer replies land here
 	OrderID   string // empty for customer_welcome
 	Subject   string
 	Body      string
@@ -93,15 +95,16 @@ func (p *ResendProvider) Send(ctx context.Context, n Notification) error {
 
 // Service runs the event subscribers and logs delivery attempts.
 type Service struct {
-	pool *pgxpool.Pool
-	prov Provider
+	pool    *pgxpool.Pool
+	prov    Provider
+	baseDmn string // app base domain, e.g. "shopkeet.com"
 }
 
-func New(pool *pgxpool.Pool, prov Provider) *Service {
+func New(pool *pgxpool.Pool, prov Provider, baseDomain string) *Service {
 	if prov == nil {
 		prov = LogProvider{}
 	}
-	return &Service{pool: pool, prov: prov}
+	return &Service{pool: pool, prov: prov, baseDmn: baseDomain}
 }
 
 // Subscribe wires the internal event handlers. Handlers always return nil so
@@ -193,11 +196,17 @@ func (s *Service) deliverOrder(ctx context.Context, tenantID, orderID, typ strin
 		return
 	}
 
-	var storeName string
-	_ = tx.QueryRow(ctx, `SELECT name FROM tenants WHERE id = $1`, tenantID).Scan(&storeName)
+	var storeName, storeSubdomain string
+	_ = tx.QueryRow(ctx, `SELECT name, subdomain FROM tenants WHERE id = $1`, tenantID).Scan(&storeName, &storeSubdomain)
 	if storeName == "" {
 		storeName = "Shopkeet"
 	}
+
+	// Shopify-style: the store's own domain addresses the customer. Order
+	// confirmations come from the store host and replies land back on the
+	// store's support address (<subdomain>.<base>).
+	from := fmt.Sprintf("%s via Shopkeet <no-reply@%s>", storeName, s.storeHost(storeSubdomain))
+	replyTo := fmt.Sprintf("support@%s", s.storeHost(storeSubdomain))
 
 	var subject, html string
 	switch typ {
@@ -218,6 +227,8 @@ func (s *Service) deliverOrder(ctx context.Context, tenantID, orderID, typ strin
 		TenantID:  tenantID,
 		Type:      typ,
 		Recipient: recipient,
+		From:      from,
+		ReplyTo:   replyTo,
 		OrderID:   orderID,
 		Subject:   subject,
 		Body:      html,
@@ -252,11 +263,16 @@ func (s *Service) deliverWelcome(ctx context.Context, tenantID, email string) {
 		return
 	}
 
-	var storeName string
-	_ = tx.QueryRow(ctx, `SELECT name FROM tenants WHERE id = $1`, tenantID).Scan(&storeName)
+	var storeName, storeSubdomain string
+	_ = tx.QueryRow(ctx, `SELECT name, subdomain FROM tenants WHERE id = $1`, tenantID).Scan(&storeName, &storeSubdomain)
 	if storeName == "" {
 		storeName = "Shopkeet"
 	}
+
+	// Account emails come from the platform brand but still let the customer
+	// reply on the store's own support address.
+	from := fmt.Sprintf("%s via Shopkeet <no-reply@%s>", storeName, s.storeHost(storeSubdomain))
+	replyTo := fmt.Sprintf("support@%s", s.storeHost(storeSubdomain))
 
 	subject := fmt.Sprintf("Welcome to %s!", storeName)
 	html := fmt.Sprintf("<p>Hi,</p><p>Thanks for creating an account at <strong>%s</strong>. You can now track orders and save addresses.</p>", storeName)
@@ -268,6 +284,8 @@ func (s *Service) deliverWelcome(ctx context.Context, tenantID, email string) {
 		TenantID:  tenantID,
 		Type:      "customer_welcome",
 		Recipient: email,
+		From:      from,
+		ReplyTo:   replyTo,
 		OrderID:   "",
 		Subject:   subject,
 		Body:      html,
@@ -286,4 +304,20 @@ func (s *Service) deliverWelcome(ctx context.Context, tenantID, email string) {
 	if err := tx.Commit(ctx); err != nil {
 		log.Printf("[notifications] commit failed: %v", err)
 	}
+}
+
+// storeHost builds the public host for a tenant storefront: <sub>.<base>. The
+// notify code uses it for per-store From/Reply-To addresses (like Shopify's
+// <store>.myshopify.com mail identities).
+func (s *Service) storeHost(subdomain string) string {
+	if subdomain == "" {
+		if s.baseDmn != "" {
+			return s.baseDmn
+		}
+		return "shopkeet.com"
+	}
+	if s.baseDmn != "" {
+		return subdomain + "." + s.baseDmn
+	}
+	return subdomain + ".shopkeet.com"
 }
