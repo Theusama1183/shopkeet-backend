@@ -613,7 +613,16 @@ Default codes by status:
 | Domain | `https://api.shopkeet.com` | 200 (`/healthz` → `{"status":"ok"}`), TLS via Coolify proxy |
 | Source | `Theusama1183/shopkeet-backend`, branch `main` | build pack `dockerfile`, `base_directory /apps/api`, `dockerfile_location /Dockerfile`, `ports_exposes 3001` |
 | Auto-deploy | `is_auto_deploy_enabled=true` | pushes to `main` trigger builds (webhook; fallback: `POST /api/v1/applications/{uuid}/start`) |
-| Env | 10 vars incl. `DATABASE_URL`, `REDIS_URL`, JWT/R2/METRICS + `APP_BASE_DOMAIN=shopkeet.com` | `PORT` unset → default 3001 |
+| Env | 15 vars incl. `DATABASE_URL`, `REDIS_URL`, JWT/R2/METRICS + `APP_BASE_DOMAIN=shopkeet.com` | `PORT` unset → default 3001 |
+
+### Notifications & email (Phase 12, live 2026-09-25)
+
+- Provider resolution in `main.go`: **SMTP** (`SMTP_HOST` ≥ 1 var) → **Resend** (`RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL`) → **LogProvider**.
+- SMTP → **Mailpit** service in Coolify (SMTP `:1025`, no auth): sees the app container as `mailpit-p1zaxdgvrrdf9p6bb1czudqi`; from the VPS host use `127.0.0.1:1025`. Set env vars: `SMTP_HOST`, `SMTP_PORT=1025`, `SMTP_TLS_MODE=starttls` (falls back to plaintext when the peer doesn't advertise STARTTLS), `SMTP_TLS_VERIFY=false`, `NOTIFICATIONS_FROM_EMAIL=no-reply@shopkeet.com`.
+- Mailpit UI (HTTPS, LE cert via Traefik): `https://mailpit-p1zaxdgvrrdf9p6bb1czudqi.13.61.125.59.sslip.io`. Messages API: `GET /api/v1/messages?limit=N`.
+- Shopify-style addressing (per store): `From: "<StoreName> via Shopkeet <no-reply@<subdomain>.shopkeet.com>"`, `Reply-To: `support@<subdomain>.shopkeet.com`` (base domain from `APP_BASE_DOMAIN`). Verified live in Mailpit headers.
+- E2E verified: `customers.signup` → `customer_welcome`, checkout → `order_confirmation`, status → `delivered` → `order_delivered`; all `notification_log` rows `status=sent`.
+- Two latent bugs fixed en route: (1) event payload is typed `fiber.Map`, so handlers asserting `map[string]any` never fired — now assert `fiber.Map`; (2) events were emitted inside the request tx but async handlers read on a fresh connection, racing the commit — now emitted via `auth.AfterCommit` after `tx.Commit`.
 
 ### Data layer (still manual containers, attached to `coolify` network)
 
