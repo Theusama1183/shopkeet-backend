@@ -20,7 +20,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/shopkeet-api ./cm
 
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata curl \
     && addgroup -S shopkeet && adduser -S -G shopkeet shopkeet
 
 COPY --from=build /out/shopkeet-api /usr/local/bin/shopkeet-api
