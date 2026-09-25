@@ -428,7 +428,29 @@ type Provider interface {
 ### Implementations
 
 - `LogProvider` (default) — logs JSON to stdout
-- `ResendProvider` — HTTPS POST to `api.resend.com` (requires `RESEND_API_KEY`, `NOTIFICATIONS_FROM_EMAIL`)
+- `ResendProvider` — HTTPS POST to `api.resend.com` (requires `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL`)
+- `SMTPProvider` — Go stdlib `net/smtp`; the live path in production
+
+### Provider resolution (`main.go`)
+
+Priority: **SMTP → Resend → Log**. SMTP wins the moment `SMTP_HOST` is set (even non-empty). Resend needs `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL`. Otherwise LogProvider.
+
+**SMTP env vars:**
+
+| Variable | Example | Default | Notes |
+|----------|---------|---------|-------|
+| `SMTP_HOST` | `mailpit-p1zaxdgvrrdf9p6bb1czudqi` | — (LogProvider if unset) | presence of this key is the switch |
+| `SMTP_PORT` | `1025` | `587` | |
+| `SMTP_TLS_MODE` | `starttls` | `starttls` | `starttls` \| `tls` \| `none`; `starttls` falls back to plaintext when the peer doesn't advertise STARTTLS |
+| `SMTP_TLS_VERIFY` | `false` | `true` | `false` skips cert verification (Mailpit is self-signed) |
+| `NOTIFICATIONS_FROM_EMAIL` | `no-reply@shopkeet.com` | — | envelope sender |
+
+**Shopify-style store addressing** — From/Reply-To are derived per tenant from `APP_BASE_DOMAIN`:
+
+- `From:` `"<StoreName> via Shopkeet <no-reply@<subdomain>.<base>.com>"`
+- `Reply-To:` `support@<subdomain>.<base>.com`
+
+Example (live): `MailTest Store via Shopkeet <no-reply@mailtest.shopkeet.com>` / `support@mailtest.shopkeet.com`.
 
 ### Event Subscriptions
 
@@ -439,6 +461,9 @@ type Provider interface {
 | `customers.signup` | Customer registers | `customer_welcome` |
 
 **Handlers always return `nil`** — failed sends never break checkout/status change. Log row status = `sent` or `failed`.
+
+**Events are emitted post-commit, not inside the tx.** The request tx middlewares commit via `auth.commitAndFlush(c, tx, ctx)`, which runs callbacks registered with `auth.AfterCommit(c, fn)` right after `tx.Commit()`. Emitters (checkout `order.created`, status→delivered `order.paid`, customer signup `customers.signup`) schedule the bus emit there so
+async notification handlers — which read on a **fresh pool connection** — never race the producing transaction (previously failed with `no rows in result set`). Handlers run with `context.Background()`, not the request ctx.
 
 ### Endpoint
 
@@ -598,8 +623,12 @@ Default codes by status:
 | `R2_SECRET_ACCESS_KEY` | Set together | 2 | |
 | `R2_BUCKET_NAME` | Set together | 2 | |
 | `R2_PUBLIC_URL` | Set together | 2 | Public base for media URLs |
-| `RESEND_API_KEY` | No | 12 | Transactional email (Resend) |
-| `NOTIFICATIONS_FROM_EMAIL` | No | 12 | From address for notifications |
+| `RESEND_API_KEY` | No | 12 | Transactional email (Resend) — used only when SMTP is NOT set |
+| `NOTIFICATIONS_FROM_EMAIL` | No | 12 | From address for notifications (SMTP envelope + Resend sender) |
+| `SMTP_HOST` | No | 12 | SMTP server host — **set this to enable SMTP provider** (overrides Resend) |
+| `SMTP_PORT` | No | 12 | SMTP port (default `587`) — `1025` for Mailpit |
+| `SMTP_TLS_MODE` | No | 12 | `starttls` (default) \| `tls` \| `none` |
+| `SMTP_TLS_VERIFY` | No | 12 | `true` (default) verify cert; `false` for Mailpit/self-signed |
 
 ---
 
@@ -610,10 +639,11 @@ Default codes by status:
 | Resource | Identifier | Status |
 |----------|-----------|--------|
 | Coolify app `shopkeet-api` | uuid `l6modsyezs1vlrv6ly1oqz4i` | **running:healthy** |
+| Live commit | `1368afb` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-152514994209`, image `:1ce5bd40…` |
 | Domain | `https://api.shopkeet.com` | 200 (`/healthz` → `{"status":"ok"}`), TLS via Coolify proxy |
 | Source | `Theusama1183/shopkeet-backend`, branch `main` | build pack `dockerfile`, `base_directory /apps/api`, `dockerfile_location /Dockerfile`, `ports_exposes 3001` |
 | Auto-deploy | `is_auto_deploy_enabled=true` | pushes to `main` trigger builds (webhook; fallback: `POST /api/v1/applications/{uuid}/start`) |
-| Env | 15 vars incl. `DATABASE_URL`, `REDIS_URL`, JWT/R2/METRICS + `APP_BASE_DOMAIN=shopkeet.com` | `PORT` unset → default 3001 |
+| Env | 15 vars incl. `DATABASE_URL`, `REDIS_URL`, JWT/R2/METRICS + `APP_BASE_DOMAIN=shopkeet.com` + `SMTP_*` | `PORT` unset → default 3001 |
 
 ### Notifications & email (Phase 12, live 2026-09-25)
 
@@ -647,6 +677,14 @@ Default codes by status:
 - `POST https://api.shopkeet.com/api/v1/auth/signup` `{name, subdomain, email, password}` → 200 + JWT. (Payload field is **`subdomain`**, not `tenant_name`.)
 - Signups appear in `shopkeet-postgres`/`shopkeet` DB (`tenants`), never in coolify-db.
 - `POST /auth/login`, public `GET /products`, admin `/products` with JWT beside `X-Tenant-ID` all pass.
+- **Notifications E2E:** `POST /customers/signup` `{email, password}` with `X-Tenant-ID: <tenant uuid>` → `customer_welcome`; guest checkout s→`order_confirmation`; `PATCH /orders/:id/status` pending→confirmed→shipped→delivered → `order_delivered`. Watch `GET /notifications/log` (rows `sent`) and Mailpit UI for the mails.
+
+**Gotchas:**
+- `X-Tenant-ID` must be the tenant **UUID**, not the subdomain — `PublicTenantMW` does `set_config('app.current_tenant', <header>)` and RLS casts `::uuid`, so a subdomain → `500 internal_error`.
+- Merchant signup does **not** emit `customers.signup`; only customer account signup does.
+- Guest cart/checkout rides `X-Customer-Session` header (e.g. `sess-e2e-1`).
+- Order status transitions are strictly linear: `pending → confirmed → shipped → delivered` (or cancel from pending/confirmed); jumping straight to `delivered` → `400 invalid status transition`.
+- Coolify auto-deploy webhook has not been observed firing; after a push, force deploy: `POST /api/v1/applications/l6modsyezs1vlrv6ly1oqz4i/start?force=true`.
 
 ### Migration runbook
 
