@@ -12,7 +12,10 @@ import (
 	"github.com/shopkeet/api/internal/cart"
 	"github.com/shopkeet/api/internal/catalog"
 	"github.com/shopkeet/api/internal/content"
+	"github.com/shopkeet/api/internal/customers"
+	"github.com/shopkeet/api/internal/discounts"
 	"github.com/shopkeet/api/internal/media"
+	"github.com/shopkeet/api/internal/notifications"
 	"github.com/shopkeet/api/internal/orders"
 	"github.com/shopkeet/api/internal/payments"
 	"github.com/shopkeet/api/internal/platform/config"
@@ -20,6 +23,8 @@ import (
 	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
 	"github.com/shopkeet/api/internal/platform/observe"
+	"github.com/shopkeet/api/internal/shipping"
+	"github.com/shopkeet/api/internal/tenants"
 )
 
 func main() {
@@ -110,6 +115,37 @@ func main() {
 	})
 	orders.RegisterRoutes(v1, pool, cfg.JWTSecret,
 		orders.New(pool, bus, payments.NewRegistry()))
+
+	// Phase 9 — shipping zones/rates. The public GET /shipping/rates feeds the
+	// checkout form; checkout snapshots the resolved rate into the order.
+	shipping.RegisterRoutes(v1, pool, cfg.JWTSecret, shipping.New(pool))
+
+	// Phase 10 — discounts. Admin CRUD behind TenantMW; the cart apply endpoint
+	// lives in the cart package and checkout claims the usage atomically.
+	discounts.RegisterRoutes(v1, pool, cfg.JWTSecret, discounts.New(pool))
+
+	// Phase 11 — customer accounts. Signup/login are storefront-public; the
+	// /me group (profile, order history, saved addresses) requires a
+	// customer-scoped JWT. Checkout under CustomerOrGuestMW links orders to the
+	// account when the caller is signed in, and stays fully guest otherwise.
+	customers.RegisterRoutes(v1, pool, cfg.JWTSecret, customers.New(pool, cfg.JWTSecret, bus))
+
+	// Phase 12 — notifications. Subscribe to the internal event bus; sends
+	// order confirmations, delivery updates, and welcome emails via Resend
+	// (if configured) or logs to stdout. A failed send never fails checkout.
+	var notifProv notifications.Provider = notifications.LogProvider{}
+	if cfg.ResendAPIKey != "" && cfg.NotificationsFromEmail != "" {
+		notifProv = notifications.NewResendProvider(cfg.ResendAPIKey, cfg.NotificationsFromEmail)
+		log.Printf("notifications: using Resend provider")
+	} else {
+		log.Printf("notifications: using log provider (set RESEND_API_KEY + NOTIFICATIONS_FROM_EMAIL to enable email)")
+	}
+	notifSvc := notifications.New(pool, notifProv)
+	notifSvc.Subscribe(bus)
+	notifications.RegisterRoutes(v1, pool, cfg.JWTSecret)
+
+	// Phase 13 — store settings + tax. Admin GET/PATCH /tenant/settings.
+	tenants.RegisterRoutes(v1, pool, cfg.JWTSecret)
 
 	var mediaSvc *media.Service
 	if cfg.R2AccountID != "" {

@@ -13,13 +13,13 @@ This replaces the original "Shopify-at-scale" design with an architecture sized 
                   │                                       │
                   └───────────────────┬───────────────────┘
                                        ▼
-                [ Coolify's Traefik proxy — auto TLS per domain ]
+                [ Caddy — on-demand TLS per domain ]
                                        │
                     ┌──────────────────┴──────────────────┐
                     ▼                                       ▼
       [ Next.js app (storefronts + admin) ]   [ Go API — modular monolith ]
-                                                modules: tenants, catalog, cart,
-                                                orders, payments
+                                                modules: tenants, media, catalog,
+                                                cart, orders, payments, content
                                                    │              │
                                                    ▼              ▼
                                             [ PostgreSQL ]   [ Redis ]
@@ -109,21 +109,22 @@ All three store content the same way: structured JSON (never raw HTML), keyed by
 
 ## 7. Deployment
 
-**Coolify** (open-source, self-hosted PaaS) is the deployment layer, running on a single VPS alongside everything it manages:
+**Docker Compose + Caddy** is the deployment layer, running directly on a single VPS — chosen over Coolify specifically to avoid its management-stack RAM overhead competing with the app's own containers (Postgres, Redis, API, Next.js, Prometheus/Grafana) on a small instance:
 
 ```
-Internet → Coolify's Traefik proxy (auto TLS, per domain, via Let's Encrypt)
-             ├── shopkeet.com, *.shopkeet.com  → Next.js "application"
-             ├── any merchant custom domain     → same Next.js application
-             └── api.shopkeet.com               → Go API "application"
+Internet → Caddy (on-demand TLS, ask-endpoint-gated, via Let's Encrypt)
+             ├── shopkeet.com, *.shopkeet.com  → Next.js container
+             ├── any merchant custom domain     → same Next.js container
+             └── api.shopkeet.com               → Go API container
 ```
 
-- Next.js and the Go API are each deployed as a Coolify **application**, pointed at the repo — pushing to the deploy branch triggers a build and redeploy. Postgres and Redis run as Coolify **services**.
-- Coolify's built-in reverse proxy (Traefik) auto-provisions and renews a Let's Encrypt certificate the moment a domain is attached to an application — this covers both `*.shopkeet.com` subdomains and every merchant custom domain, with no manual Nginx/Caddy/certbot setup.
-- **Cloudflare** sits in front of `shopkeet.com` itself for DNS, edge caching, and DDoS protection — no Enterprise tier needed at this stage. If Cloudflare's proxy (orange cloud) is enabled, set SSL mode to **Full (Strict)** so Cloudflare validates Traefik's real certificate instead of accepting anything. Merchant custom domains are typically pointed directly at the VPS by the merchant's own DNS (not through this Cloudflare account), so Traefik issues those certificates directly.
-- **GitHub Actions** runs tests/builds on every PR; Coolify's own git-push deploy handles the actual release, so CI's job is to gate merges, not to push containers itself.
+- Next.js and the Go API are plain containers in `docker-compose.yml`. Deploys are `scp`/`ssh` + `docker compose up -d` — no git-push-to-deploy convenience, but no PaaS management overhead either.
+- **Caddy's on-demand TLS** (`on_demand_tls` + an `ask` endpoint) issues a certificate the first time a request arrives for a domain it doesn't already have one for, instead of requiring every domain pre-listed in config. This is what covers arbitrary merchant custom domains without Coolify or Traefik: the `ask` endpoint is a small Go API route that checks `tenants.custom_domain` and returns 200 only for domains that actually belong to a real tenant — this guard is mandatory, not optional, or the server will happily request (and burn Let's Encrypt's rate limit on) certificates for domains attackers point at it. Pair it with `interval`/`burst` rate limiting on the `on_demand_tls` block.
+- **Cloudflare** sits in front of `shopkeet.com` itself for DNS, edge caching, and DDoS protection — no Enterprise tier needed at this stage. If Cloudflare's proxy (orange cloud) is enabled, set SSL mode to **Full (Strict)** so Cloudflare validates Caddy's real certificate instead of accepting anything. Merchant custom domains are typically pointed directly at the VPS by the merchant's own DNS (not through this Cloudflare account), so Caddy issues those certificates directly via the on-demand flow above.
+- **GitHub Actions** runs tests/builds on every PR; the manual deploy step handles the actual release.
+- If the deploy workflow (not the TLS/RAM concern) becomes painful enough later — e.g. wanting git-push deploys back — Coolify remains a fine thing to add on a bigger VPS at that point. It's not ruled out forever, just not worth its overhead on the current box.
 
-**Trade-off worth knowing:** Coolify plus Traefik adds some CPU/RAM overhead on top of the app containers, so size the VPS accordingly (comfortable at 4GB+ RAM; tight on the smallest tiers). In exchange, custom-domain TLS and git-push deploys are solved without hand-rolled scripts — for a small team, that's worth the overhead.
+**Trade-off worth knowing:** Caddy's on-demand TLS gives up nothing on the TLS side compared to the Coolify/Traefik approach — the real trade-off is the deploy workflow: manual `ssh`/`docker compose` instead of git-push, in exchange for a materially lighter footprint on a small VPS.
 
 **Media storage sits outside this VPS entirely.** Product and content images live in **Cloudflare R2**, not on local disk — the Go API issues short-lived presigned upload URLs, and the browser uploads bytes directly to R2 (see `04-agent-build-spec.md` Phase 2). This keeps the VPS stateless for media and avoids needing a backup strategy for locally-stored files. R2 is the second deliberate non-open-source exception in this stack, alongside Cloudflare itself — see `02-tech-stack.md` for the reasoning.
 

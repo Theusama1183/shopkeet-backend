@@ -13,9 +13,11 @@ Public URL: **`https://api.shopkeet.com`** — live, TLS via Let's Encrypt/Caddy
 | Item | Value |
 |---|---|
 | VPS | `13.61.125.59` (Ubuntu 26.04, single VPS) |
-| Deploy method | plain `docker compose` on the VPS (Coolify/Traefik not installed) |
+| Deploy method | plain `docker compose` on the VPS (Caddy on 80/443) + **Coolify 4.3.23 alongside** (dev-stage, UI on 8000 via Caddy) |
 | Stack root | `/home/ubuntu/shopkeet/` (`apps/api` source, `infra/` compose + monitoring config) |
 | Compose project | `infra` |
+
+> **Coolify on this box (dev pilot):** installed 2026-09-25 as an *adjacent* management layer so the running shopkeet stack is untouched (coolify-proxy is not bound to 80/443 — no conflict). Coolify UI: **https://coolify.shopkeet.com** (login `admin@shopkeet.com`), reached through Caddy `host.docker.internal:8000`. The real, Coolify-managed production setup is documented in §5 (Hetzner).
 
 ### Containers
 
@@ -27,6 +29,7 @@ Public URL: **`https://api.shopkeet.com`** — live, TLS via Let's Encrypt/Caddy
 | `shopkeet-caddy` | caddy:2.8-alpine | **`80`/`443` public** | TLS for `api.shopkeet.com` → `api:3001`; blocks `/metrics` |
 | `shopkeet-prometheus` | prom/prometheus:v2.53.0 | `127.0.0.1:9090` | target `api:3001` UP |
 | `shopkeet-grafana` | grafana/grafana:11.1.0 | `127.0.0.1:3000` | 200 (dashboard "Shopkeet API" provisioned) |
+| `coolify` (+`coolify-db`, `coolify-redis`, `coolify-realtime`, `coolify-sentinel`) | coollabsio/coolify:4.3.23 | `0.0.0.0:8000` (UI host port; reachable via Caddy → `coolify.shopkeet.com`) | healthy — adjacent to the shopkeet stack, does not manage it yet |
 
 `DATABASE_URL`, `REDIS_URL` resolve inside the compose network (`postgres`, `redis`). Only Caddy's `80/443` are public; Postgres/Redis/API/Prometheus/Grafana all stay **localhost-bound on the VPS**.
 
@@ -212,9 +215,10 @@ Backend half (Puck editor UI + storefront rendering are the future `apps/web`). 
 
 ### Remaining / optional
 
-1. Enable **Cloudflare R2 media**: add the `R2_*` vars to `api.env` and re-run `docker compose up -d` (mounts `/media/*` routes).
+1. ~~Enable Cloudflare R2 media~~ — **DONE (2026-09-24):** `R2_*` vars live in `api.env`; `/media/*` routes live with custom domain **`media.shopkeet.com`** (R2 bucket `shopkeet-media`, presigned upload round-trip verified).
 2. If you later want the API behind Cloudflare's proxy, flip the `api` record to orange cloud and set the zone SSL mode to **Full (Strict)** (Cloudflare → your VPS serves the Let's Encrypt cert).
 3. `*.shopkeet.com` wildcard + the storefront (`apps/web`) are future work — root/www currently resolve to Squarespace.
+4. **Coolify as the actual deploy layer** = production move → **§5 (Hetzner runbook)**.
 
 ### Redeploying after code changes
 
@@ -225,3 +229,79 @@ scp infra/prod/{docker-compose.yml,Caddyfile} ubuntu@13.61.125.59:/home/ubuntu/s
 ssh ubuntu@13.61.125.59 "cd /home/ubuntu/shopkeet/infra && docker compose up -d --build"
 # migrations are idempotent: docker exec shopkeet-api /usr/local/bin/shopkeet-migrate up
 ```
+
+---
+
+## 5. Production on Hetzner + Coolify — runbook (when development is complete)
+
+The dev box (13.61.125.59) keeps the plain-compose stack running during development. When v1 is feature-complete, the **same workload moves to a fresh Hetzner server managed by Coolify** — one bill, git-push deploys, Coolify's proxy handles per-domain TLS. Todo-list, not a suggestion.
+
+### 5.1 Provision the Hetzner server
+
+| Item | Value |
+|---|---|
+| Recommended | **CX32** — 4 vCPU / 8 GB / 80 GB NVMe (≈€8/mo). CX42 (8 vCPU / 16 GB) if the frontend + Asynq queues + Prometheus/Grafana will be heavy. |
+| OS | **Ubuntu 24.04 LTS** (fresh), amd64 |
+| Access | root SSH key; open ports 22, 80, 443, **8000** (temporary Coolify UI) in the Hetzner firewall |
+
+### 5.2 Install Coolify on the fresh box (pre-created admin — registration page must never be public)
+
+```bash
+# as root on the Hetzner box:
+curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash
+# Better: pre-create the admin so the first-visitor-registration risk is gone:
+env ROOT_USERNAME=Admin ROOT_USER_EMAIL=YOU@shopkeet.com \
+  ROOT_USER_PASSWORD='StrongPassword123!' \
+  bash -c 'curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash'
+```
+
+- Coolify UI: `http://<hetzner-ip>:8000`, then point a domain at it (below). **Back up `/data/coolify/source/.env`** (contains `APP_KEY` — needed to restore Coolify) into a password manager before doing anything else.
+- Coolify manages its own proxy → on production there is **no Caddy**; the shopkeet stack and Coolify UI domains all get TLS from Coolify's proxy.
+
+### 5.3 DNS (Cloudflare, zone `shopkeet.com`)
+
+| Record | Type | Value | Purpose |
+|---|---|---|---|
+| `coolify` | A | Hetzner IP | Coolify dashboard (DNS-only) |
+| `api` | A | Hetzner IP | Go API (change from dev IP when you cut over) |
+| `*.shopkeet.com` | A | Hetzner IP | future tenant subdomains |
+| merchant custom domains | A/CNAME | Hetzner IP / `cname.*` | potential merchant domains via Coolify |
+
+All `*.shopkeet.com` + merchants get TLS via Coolify's on-demand proxy (its ask/on-demand equivalents), same model as Caddy's `on_demand_tls`.
+
+### 5.4 Migrate data from the dev box
+
+```bash
+# Postgres → dump on dev, restore on Hetzner (data is small at this stage).
+ssh ubuntu@13.61.125.59 "docker exec shopkeet-postgres pg_dump -U shopkeet -d shopkeet -Fc" > shopkeet.dump
+docker exec -i shopkeet-postgres pg_restore -U shopkeet -d shopkeet --clean --if-exists < shopkeet.dump
+```
+- **Redis** — transient only (sessions, best-effort reservation TTLs) → no migration needed.
+- **R2 media** — already in Cloudflare R2 (`shopkeet-media`, public `media.shopkeet.com`); nothing to move.
+
+> Note the app role model must survive: shopkeet_app owns tenant tables. Run the restore as `shopkeet` (superuser), then run the embedded migrations (`shopkeet-migrate up`) which recreate roles/grants. Keep `DATABASE_URL` pointing at `shopkeet_app`.
+
+### 5.5 Register the stack in Coolify (UI)
+
+1. **PostgreSQL** service → create, then restore the dump above.
+2. **Redis** service → create (used for cart reservations + future Asynq jobs).
+3. **Application `api`**:
+   - Git source: shopkeet repo; Dockerfile = `apps/api/Dockerfile.prod`; build context `apps/api`.
+   - Env (from dev `api.env`, **never commit**): `JWT_SECRET`, `APP_BASE_DOMAIN`, `METRICS_TOKEN`, `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_PUBLIC_URL=https://media.shopkeet.com`, `DATABASE_URL` → Cloudflare…/Coolify Postgres (`...@postgres:5432/shopkeet?sslmode=disable`), `REDIS_URL`.
+   - Domain: `api.shopkeet.com`; port internal `3001`; health check `/healthz`.
+4. **Observability** as services (Coolify one-click or custom compose): `prometheus` (scrape `api:3001/metrics` with `METRICS_TOKEN`) + `grafana` (reuse `infra/grafana-provisioning/` + `infra/prometheus/prometheus.yml`). Mount Coolify UI domain `coolify` → port 8000.
+
+### 5.6 Cut-over & verification checklist
+
+- `https://api.shopkeet.com/healthz` → 200
+- `POST /api/v1/auth/login` (subdomain) → 200 + JWT; wrong password → 401   *(the FORCE RLS fix must hold first — it does, `TestLoginUnderRLS`)*
+- `GET /api/v1/products` JWT + `X-Tenant-ID` → 200
+- Media round-trip from a *fresh* upload → `https://media.shopkeet.com/...` → 200
+- `/metrics` → 403 at the edge; Prometheus scrape UP; Grafana dashboard renders
+- Existing dev tenants (`cln0101`, `deploytest`) visible after restore
+
+### 5.7 Rollback / safety
+
+- Dev box **stays running unmodified** on `13.61.125.59` during cut-over — flip the `api` record back to it if production misbehaves.
+- Coolify UI + `api.env` secrets + Hetzner root creds live in the password manager before any cut-over.
+- Out of the box on day one: `api.env` on Hetzner should be *generated fresh* — rotate `JWT_SECRET`/`METRICS_TOKEN` on the production box (dev secrets were only ever for dev).

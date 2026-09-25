@@ -10,3 +10,10 @@ api.shopkeet.com {
 		reverse_proxy api:3001
 	}
 }
+
+# Coolify dashboard (dev VPS only) — Coolify UI listens on host port 8000;
+# reaching it via host.docker.internal requires extra_hosts host-gateway on
+# the caddy service (see docker-compose.yml).
+coolify.shopkeet.com {
+	reverse_proxy host.docker.internal:8000
+}

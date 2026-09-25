@@ -198,20 +198,35 @@ func LoginHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 
 // --- middleware + routes -------------------------------------------------------
 
-// TenantMW validates a Bearer JWTcase and, on success, opens a real DB
-// transaction with app.current_tenant SET LOCAL so RLS scopes every query to
-// that tenant for the rest of the request. The tx is stored in c.Locals("tx")
-// for handlers to use; TenantMW commits it automatically when the handler
-// chain completes without error.
+// parseMerchant validates an Authorization header that must be a merchant token.
+// A customer-scoped JWT (Phase 11) is rejected here so a storefront shopper can
+// never reach admin routes.
+func parseMerchant(c *fiber.Ctx, secret string) (*Claims, int, string) {
+	h := c.Get("Authorization")
+	if !strings.HasPrefix(h, "Bearer ") {
+		return nil, fiber.StatusUnauthorized, "missing bearer token"
+	}
+	claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
+	if err != nil {
+		return nil, fiber.StatusUnauthorized, "invalid token"
+	}
+	if claims.Scope == "customer" {
+		return nil, fiber.StatusForbidden, "customer token not allowed here"
+	}
+	return claims, 0, ""
+}
+
+// TenantMW validates a Bearer JWT (merchant scope — a customer token is
+// refused, Phase 11) and, on success, opens a real DB transaction with
+// app.current_tenant SET LOCAL so RLS scopes every query to that tenant for the
+// rest of the request. The tx is stored in c.Locals("tx") for handlers to use;
+// TenantMW commits it automatically when the handler chain completes without
+// error.
 func TenantMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		h := c.Get("Authorization")
-		if !strings.HasPrefix(h, "Bearer ") {
-			return httperr.C(fiber.StatusUnauthorized, "missing bearer token")
-		}
-		claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
-		if err != nil {
-			return httperr.C(fiber.StatusUnauthorized, "invalid token")
+		claims, status, msg := parseMerchant(c, secret)
+		if claims == nil {
+			return httperr.C(status, msg)
 		}
 
 		ctx := c.Context()
@@ -285,36 +300,45 @@ func PublicTenantMW(pool *pgxpool.Pool) fiber.Handler { return publicTenantMW(po
 // whether admin in c.Locals("admin").
 func PublicOrAdminMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		h := c.Get("Authorization")
-		if strings.HasPrefix(h, "Bearer ") {
-			claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
-			if err != nil {
-				return httperr.C(fiber.StatusUnauthorized, "invalid token")
-			}
-
-			ctx := c.Context()
-			tx, err := pool.Begin(ctx)
-			if err != nil {
-				return httperr.ErrInternalServerError
-			}
-			defer tx.Rollback(ctx)
-			if _, err := tx.Exec(ctx,
-				"SELECT set_config('app.current_tenant', $1, true)", claims.TenantID); err != nil {
-				return httperr.ErrInternalServerError
-			}
-			c.Locals("tx", tx)
-			c.Locals("tenant_id", claims.TenantID)
-			c.Locals("user_id", claims.UserID)
-			c.Locals("role", claims.Role)
-			c.Locals("admin", true)
-
-			if err := c.Next(); err != nil {
-				return err
-			}
-			return tx.Commit(ctx)
+		claims, status, msg := parseMerchantWithOptional(c, secret)
+		if status > 0 {
+			return httperr.C(status, msg)
 		}
-		return publicTenantMW(pool)(c)
+		if claims == nil {
+			return publicTenantMW(pool)(c)
+		}
+
+		ctx := c.Context()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return httperr.ErrInternalServerError
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", claims.TenantID); err != nil {
+			return httperr.ErrInternalServerError
+		}
+		c.Locals("tx", tx)
+		c.Locals("tenant_id", claims.TenantID)
+		c.Locals("user_id", claims.UserID)
+		c.Locals("role", claims.Role)
+		c.Locals("admin", true)
+
+		if err := c.Next(); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
 	}
+}
+
+// parseMerchantWithOptional resolves a merchant token if a Bearer header is
+// present (invalid/customer tokens are still refused — fail closed), and
+// returns nil claims when there is no Authorization header at all.
+func parseMerchantWithOptional(c *fiber.Ctx, secret string) (*Claims, int, string) {
+	if !strings.HasPrefix(c.Get("Authorization"), "Bearer ") {
+		return nil, 0, ""
+	}
+	return parseMerchant(c, secret)
 }
 
 // CustomerMW serves guest-storefront routes (Phase 4 cart). It resolves the
@@ -369,6 +393,103 @@ func CustomerMW(pool *pgxpool.Pool) fiber.Handler {
 			return err
 		}
 		return tx.Commit(ctx)
+	}
+}
+
+// CustomerAuthMW guards Phase 11 customer-account routes. It requires a
+// customer-scoped JWT (scope="customer", signed via SignCustomer) and opens the
+// RLS-scoped request transaction pinned to the token's tenant — the same shape
+// as TenantMW, but the identity is c.Locals("customer_id"), never user_id/role.
+func CustomerAuthMW(pool *pgxpool.Pool, secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		h := c.Get("Authorization")
+		if !strings.HasPrefix(h, "Bearer ") {
+			return httperr.C(fiber.StatusUnauthorized, "missing bearer token")
+		}
+		claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
+		if err != nil {
+			return httperr.C(fiber.StatusUnauthorized, "invalid token")
+		}
+		if claims.Scope != "customer" {
+			return httperr.C(fiber.StatusForbidden, "merchant token not allowed here")
+		}
+		if claims.CustomerID == "" {
+			return httperr.C(fiber.StatusForbidden, "token carries no customer identity")
+		}
+
+		ctx := c.Context()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return httperr.ErrInternalServerError
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", claims.TenantID); err != nil {
+			return httperr.ErrInternalServerError
+		}
+
+		c.Locals("tx", tx)
+		c.Locals("tenant_id", claims.TenantID)
+		c.Locals("customer_id", claims.CustomerID)
+		if err := c.Next(); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	}
+}
+
+// CustomerOrGuestMW serves checkout: a signed-in customer (customer JWT) gets
+// their tenant from the token and their customer_id attached to the order;
+// a guest falls back to the regular CustomerMW guest-session path, leaving
+// customer_id NULL (Phase 11). Either way a cart is resolved by guest session,
+// so an account holder's cart continues to work before and after login.
+func CustomerOrGuestMW(pool *pgxpool.Pool, secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		h := c.Get("Authorization")
+		if strings.HasPrefix(h, "Bearer ") {
+			claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
+			if err != nil {
+				return httperr.C(fiber.StatusUnauthorized, "invalid token")
+			}
+			if claims.Scope != "customer" {
+				return httperr.C(fiber.StatusForbidden, "merchant token not allowed here")
+			}
+
+			// Guest-session resolution identical to CustomerMW (a shopper keeps
+			// the same cart across login), plus tenant + identity from the token.
+			session := c.Cookies(CustomerSessionCookie)
+			if hs := c.Get("X-Customer-Session"); hs != "" {
+				session = hs
+			}
+			if session == "" || strings.TrimSpace(session) == "" {
+				session = uuid.NewString()
+				c.Cookie(&fiber.Cookie{
+					Name: CustomerSessionCookie, Value: session, Path: "/",
+					HTTPOnly: true, SameSite: "lax",
+				})
+			}
+			c.Set("X-Customer-Session", session)
+
+			ctx := c.Context()
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				return httperr.ErrInternalServerError
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx,
+				"SELECT set_config('app.current_tenant', $1, true)", claims.TenantID); err != nil {
+				return httperr.ErrInternalServerError
+			}
+			c.Locals("tx", tx)
+			c.Locals("tenant_id", claims.TenantID)
+			c.Locals("customer_session", session)
+			c.Locals("customer_id", claims.CustomerID)
+			if err := c.Next(); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
+		return CustomerMW(pool)(c)
 	}
 }
 

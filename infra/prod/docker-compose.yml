@@ -63,13 +63,17 @@ services:
       timeout: 3s
       retries: 5
 
-  # Public edge: TLS termination + reverse proxy for api.shopkeet.com.
+  # Public edge: TLS termination + reverse proxy for api.shopkeet.com and
+  # coolify.shopkeet.com (Coolify UI lives on host port 8000 — reached via
+  # host.docker.internal, which requires extra_hosts host-gateway below).
   caddy:
     image: caddy:2.8-alpine
     container_name: shopkeet-caddy
     ports:
       - "80:80"
       - "443:443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - /home/ubuntu/shopkeet/infra/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

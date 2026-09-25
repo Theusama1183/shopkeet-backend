@@ -24,22 +24,29 @@ type Config struct {
 	R2SecretKey   string
 	R2BucketName  string
 	R2PublicURL   string
+
+	// Resend (transactional email — Phase 12). Both must be set together to enable;
+	// if unset, a log-only provider is used.
+	ResendAPIKey           string
+	NotificationsFromEmail string
 }
 
 // Load reads configuration from the environment.
 func Load() (*Config, error) {
 	c := &Config{
-		DatabaseURL:   os.Getenv("DATABASE_URL"),
-		RedisURL:      os.Getenv("REDIS_URL"),
-		Port:          os.Getenv("PORT"),
-		JWTSecret:     os.Getenv("JWT_SECRET"),
-		AppBaseDomain: os.Getenv("APP_BASE_DOMAIN"),
-		MetricsToken:  os.Getenv("METRICS_TOKEN"),
-		R2AccountID:   os.Getenv("R2_ACCOUNT_ID"),
-		R2AccessKeyID: os.Getenv("R2_ACCESS_KEY_ID"),
-		R2SecretKey:   os.Getenv("R2_SECRET_ACCESS_KEY"),
-		R2BucketName:  os.Getenv("R2_BUCKET_NAME"),
-		R2PublicURL:   os.Getenv("R2_PUBLIC_URL"),
+		DatabaseURL:            os.Getenv("DATABASE_URL"),
+		RedisURL:               os.Getenv("REDIS_URL"),
+		Port:                   os.Getenv("PORT"),
+		JWTSecret:              os.Getenv("JWT_SECRET"),
+		AppBaseDomain:          os.Getenv("APP_BASE_DOMAIN"),
+		MetricsToken:           os.Getenv("METRICS_TOKEN"),
+		R2AccountID:            os.Getenv("R2_ACCOUNT_ID"),
+		R2AccessKeyID:          os.Getenv("R2_ACCESS_KEY_ID"),
+		R2SecretKey:            os.Getenv("R2_SECRET_ACCESS_KEY"),
+		R2BucketName:           os.Getenv("R2_BUCKET_NAME"),
+		R2PublicURL:            os.Getenv("R2_PUBLIC_URL"),
+		ResendAPIKey:           os.Getenv("RESEND_API_KEY"),
+		NotificationsFromEmail: os.Getenv("NOTIFICATIONS_FROM_EMAIL"),
 	}
 
 	if c.DatabaseURL == "" {

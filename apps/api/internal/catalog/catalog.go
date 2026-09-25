@@ -35,6 +35,11 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+func isFKViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
+}
+
 // savepoint runs fn inside a SAVEPOINT so a failing statement (e.g. a unique
 // violation that maps to a 409/400) does not poison the whole request
 // transaction. Handlers run under TenantMW which auto-commits on success; a
@@ -81,7 +86,43 @@ type categoryRow struct {
 	slug string
 }
 
-// productRow mirrors a products row plus its images/categories.
+// optionValueRow is a product option's selectable value.
+type optionValueRow struct {
+	id        string
+	value     string
+	sortOrder int
+}
+
+// optionRow is a product option (e.g. "Size") with its values.
+type optionRow struct {
+	id        string
+	name      string
+	sortOrder int
+	values    []optionValueRow
+}
+
+// variantOptionRow is one entry of a variant's option-value mapping, joined
+// with the option so the storefront can group by option.
+type variantOptionRow struct {
+	optionValueID string
+	optionID      string
+	optionName    string
+	value         string
+}
+
+// variantRow is a concrete purchasable variant (price/stock/SKU) with its
+// option-value mapping.
+type variantRow struct {
+	id             string
+	sku            *string
+	priceCents     int
+	inventoryCount int
+	weightGrams    *int
+	status         string
+	optionValues   []variantOptionRow
+}
+
+// productRow mirrors a products row plus its images/categories/options/variants.
 type productRow struct {
 	id              string
 	name            string
@@ -96,6 +137,8 @@ type productRow struct {
 	createdAt       time.Time
 	images          []imageRow
 	categories      []categoryRow
+	options         []optionRow
+	variants        []variantRow
 }
 
 func strp(s *string) string {
@@ -116,6 +159,29 @@ func productJSON(p *productRow) fiber.Map {
 	for _, ct := range p.categories {
 		cats = append(cats, fiber.Map{"id": ct.id, "name": ct.name, "slug": ct.slug})
 	}
+	opts := make([]fiber.Map, 0, len(p.options))
+	for _, o := range p.options {
+		vals := make([]fiber.Map, 0, len(o.values))
+		for _, v := range o.values {
+			vals = append(vals, fiber.Map{"id": v.id, "value": v.value, "sort_order": v.sortOrder})
+		}
+		opts = append(opts, fiber.Map{"id": o.id, "name": o.name, "sort_order": o.sortOrder, "values": vals})
+	}
+	variants := make([]fiber.Map, 0, len(p.variants))
+	for _, v := range p.variants {
+		links := make([]fiber.Map, 0, len(v.optionValues))
+		for _, l := range v.optionValues {
+			links = append(links, fiber.Map{
+				"option_value_id": l.optionValueID, "option_id": l.optionID,
+				"option_name": l.optionName, "value": l.value,
+			})
+		}
+		variants = append(variants, fiber.Map{
+			"id": v.id, "sku": strp(v.sku), "price_cents": v.priceCents,
+			"inventory_count": v.inventoryCount, "weight_grams": v.weightGrams,
+			"status": v.status, "option_values": links,
+		})
+	}
 	return fiber.Map{
 		"id": p.id, "name": p.name, "slug": p.slug,
 		"description": strp(p.description), "price_cents": p.priceCents,
@@ -125,6 +191,8 @@ func productJSON(p *productRow) fiber.Map {
 		"created_at":       p.createdAt.Format(time.RFC3339),
 		"images":           images,
 		"categories":       cats,
+		"options":          opts,
+		"variants":         variants,
 	}
 }
 
@@ -147,6 +215,9 @@ func (s *Service) queryProduct(ctx *fiber.Ctx, tx pgx.Tx, where string, args ...
 		return nil, err
 	}
 	if err := s.hydrate(ctx, tx, &p); err != nil {
+		return nil, err
+	}
+	if err := s.hydrateDetail(ctx, tx, &p); err != nil {
 		return nil, err
 	}
 	return &p, nil
@@ -193,6 +264,125 @@ func (s *Service) hydrate(ctx *fiber.Ctx, tx pgx.Tx, p *productRow) error {
 		p.categories = append(p.categories, ct)
 	}
 	return crows.Err()
+}
+
+// hydrateDetail loads a row's options (with their values) and variants (with
+// their option-value mapping). Only single-product responses (GET/POST/PATCH
+// /products/:id) embed these; list responses stay light. Each section is a
+// single query that is fully drained before the next section's query runs —
+// pgx allows only one active result per transaction connection.
+func (s *Service) hydrateDetail(ctx *fiber.Ctx, tx pgx.Tx, p *productRow) error {
+	orows, err := tx.Query(ctx.Context(), `
+		SELECT id, name, sort_order
+		FROM product_options
+		WHERE product_id = $1
+		ORDER BY sort_order, id`, p.id)
+	if err != nil {
+		return err
+	}
+	var options []optionRow
+	for orows.Next() {
+		var o optionRow
+		if err := orows.Scan(&o.id, &o.name, &o.sortOrder); err != nil {
+			orows.Close()
+			return err
+		}
+		options = append(options, o)
+	}
+	if err := orows.Err(); err != nil {
+		return err
+	}
+	orows.Close()
+	p.options = options
+
+	if len(options) > 0 {
+		vrows, err := tx.Query(ctx.Context(), `
+			SELECT ov.option_id, ov.id, ov.value, ov.sort_order
+			FROM product_option_values ov
+			JOIN product_options o ON o.id = ov.option_id
+			WHERE o.product_id = $1
+			ORDER BY o.sort_order, ov.sort_order, ov.id`, p.id)
+		if err != nil {
+			return err
+		}
+		byOption := make(map[string]*optionRow, len(options))
+		for i := range p.options {
+			byOption[p.options[i].id] = &p.options[i]
+		}
+		for vrows.Next() {
+			var oid, vid, val string
+			var so int
+			if err := vrows.Scan(&oid, &vid, &val, &so); err != nil {
+				vrows.Close()
+				return err
+			}
+			if o, ok := byOption[oid]; ok {
+				o.values = append(o.values, optionValueRow{id: vid, value: val, sortOrder: so})
+			}
+		}
+		if err := vrows.Err(); err != nil {
+			return err
+		}
+		vrows.Close()
+	}
+
+	vr, err := tx.Query(ctx.Context(), `
+		SELECT v.id, v.sku, v.price_cents, v.inventory_count, v.weight_grams, v.status
+		FROM product_variants v
+		WHERE v.product_id = $1
+		ORDER BY v.created_at, v.id`, p.id)
+	if err != nil {
+		return err
+	}
+	var variants []variantRow
+	for vr.Next() {
+		var v variantRow
+		if err := vr.Scan(&v.id, &v.sku, &v.priceCents, &v.inventoryCount, &v.weightGrams, &v.status); err != nil {
+			vr.Close()
+			return err
+		}
+		variants = append(variants, v)
+	}
+	if err := vr.Err(); err != nil {
+		return err
+	}
+	vr.Close()
+	p.variants = variants
+
+	if len(variants) > 0 {
+		lrows, err := tx.Query(ctx.Context(), `
+			SELECT vov.variant_id, vov.option_value_id, ov.option_id, o.name, ov.value
+			FROM product_variant_option_values vov
+			JOIN product_variants v ON v.id = vov.variant_id
+			JOIN product_option_values ov ON ov.id = vov.option_value_id
+			JOIN product_options o ON o.id = ov.option_id
+			WHERE v.product_id = $1
+			ORDER BY o.sort_order, ov.sort_order, ov.id`, p.id)
+		if err != nil {
+			return err
+		}
+		byVariant := make(map[string]*variantRow, len(variants))
+		for i := range p.variants {
+			byVariant[p.variants[i].id] = &p.variants[i]
+		}
+		for lrows.Next() {
+			var vid, ovalueID, oid, oname, val string
+			if err := lrows.Scan(&vid, &ovalueID, &oid, &oname, &val); err != nil {
+				lrows.Close()
+				return err
+			}
+			if v, ok := byVariant[vid]; ok {
+				v.optionValues = append(v.optionValues, variantOptionRow{
+					optionValueID: ovalueID, optionID: oid, optionName: oname, value: val,
+				})
+			}
+		}
+		if err := lrows.Err(); err != nil {
+			return err
+		}
+		lrows.Close()
+	}
+	return nil
 }
 
 // --- request/response types -----------------------------------------------------
@@ -276,6 +466,20 @@ func (s *Service) CreateProduct(c *fiber.Ctx) error {
 		}); err != nil {
 			return httperr.C(fiber.StatusBadRequest, "unknown category id")
 		}
+	}
+
+	// Every product always has at least one variant (Phase 8 design rule): a
+	// simple product gets one auto-created "Default" variant — no option
+	// values, no SKU — carrying the flat product's price and stock. products
+	// .price_cents/inventory_count cache it.
+	if err := savepoint(ctx, tx, func() error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO product_variants (tenant_id, product_id, price_cents, inventory_count, status)
+			VALUES ($1,$2,$3,$4,$5)`,
+			tid, id, req.PriceCents, req.InventoryCount, "active")
+		return err
+	}); err != nil {
+		return httperr.ErrInternalServerError
 	}
 
 	p, err := s.queryProduct(c, tx, "p.id = $1", id)
@@ -463,6 +667,43 @@ func (s *Service) UpdateProduct(c *fiber.Ctx) error {
 		}
 	}
 
+	// A product with exactly one variant (the flat "Default" variant, the only
+	// shape produced by the pre-Phase-8 API) treats price/inventory patches as
+	// edits to that variant, so the cached products row and the variant stay in
+	// sync and simple-store behaviour is unchanged. Multi-variant products are
+	// priced per-variant instead; the cached product value is recomputed on
+	// every variant mutation.
+	if req.PriceCents >= 0 || req.InventoryCount >= 0 {
+		var variantCount int
+		if err := tx.QueryRow(ctx,
+			"SELECT count(*) FROM product_variants WHERE product_id = $1", id).Scan(&variantCount); err != nil {
+			return httperr.ErrInternalServerError
+		}
+		if variantCount == 1 {
+			var vsets []string
+			var vargs []any
+			if req.PriceCents >= 0 {
+				vargs = append(vargs, req.PriceCents)
+				vsets = append(vsets, fmt.Sprintf("price_cents = $%d", len(vargs)))
+			}
+			if req.InventoryCount >= 0 {
+				vargs = append(vargs, req.InventoryCount)
+				vsets = append(vsets, fmt.Sprintf("inventory_count = $%d", len(vargs)))
+			}
+			if len(vsets) > 0 {
+				vargs = append(vargs, id)
+				if err := savepoint(ctx, tx, func() error {
+					_, err := tx.Exec(ctx, fmt.Sprintf(
+						"UPDATE product_variants SET %s WHERE product_id = $%d",
+						strings.Join(vsets, ", "), len(vargs)), vargs...)
+					return err
+				}); err != nil {
+					return httperr.ErrInternalServerError
+				}
+			}
+		}
+	}
+
 	p, err := s.queryProduct(c, tx, "p.id = $1", id)
 	if err != nil {
 		return httperr.ErrInternalServerError
@@ -473,8 +714,10 @@ func (s *Service) UpdateProduct(c *fiber.Ctx) error {
 	return c.JSON(productJSON(p))
 }
 
-// DeleteProduct handles DELETE /products/:id (admin). Removes image/category
-// links first (FKs), then the product — inside the request tx.
+// DeleteProduct handles DELETE /products/:id (admin). Removes image/category,
+// variant and option structures first (FKs), then the product — inside the
+// request tx. Deleting a product whose variants have order history fails on the
+// order_items FK (409).
 func (s *Service) DeleteProduct(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
@@ -491,6 +734,25 @@ func (s *Service) DeleteProduct(c *fiber.Ctx) error {
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
+	if _, err := tx.Exec(ctx,
+		"DELETE FROM product_variant_option_values vov USING product_variants v WHERE vov.variant_id = v.id AND v.product_id = $1",
+		id); err != nil {
+		return httperr.ErrInternalServerError
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM product_variants WHERE product_id = $1", id); err != nil {
+		if isFKViolation(err) {
+			return httperr.C(fiber.StatusConflict, "product referenced by carts or orders")
+		}
+		return httperr.ErrInternalServerError
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM product_option_values vov USING product_options o
+		WHERE vov.option_id = o.id AND o.product_id = $1`, id); err != nil {
+		return httperr.ErrInternalServerError
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM product_options WHERE product_id = $1", id); err != nil {
+		return httperr.ErrInternalServerError
+	}
 	if _, err := tx.Exec(ctx, "DELETE FROM product_images WHERE product_id = $1", id); err != nil {
 		return httperr.ErrInternalServerError
 	}
@@ -498,6 +760,9 @@ func (s *Service) DeleteProduct(c *fiber.Ctx) error {
 		return httperr.ErrInternalServerError
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM products WHERE id = $1", id); err != nil {
+		if isFKViolation(err) {
+			return httperr.C(fiber.StatusConflict, "product referenced by cart_items or order_items")
+		}
 		return httperr.ErrInternalServerError
 	}
 	return c.JSON(fiber.Map{"deleted": id})

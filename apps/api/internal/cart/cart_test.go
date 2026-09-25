@@ -31,6 +31,7 @@ type tenantC struct {
 type item struct {
 	ID             string `json:"id"`
 	ProductID      string `json:"product_id"`
+	VariantID      string `json:"variant_id"`
 	Name           string `json:"name"`
 	Slug           string `json:"slug"`
 	Quantity       int    `json:"quantity"`
@@ -84,7 +85,9 @@ func TestCartRLSIsolation(t *testing.T) {
 
 	// A's catalog: an in-stock active product, a 0-inventory active product
 	// (stock must not gate adding), and an archived product (cannot be carted).
-	seedProduct := func(tid, slug string, price int, inv int, status string) string {
+	// Every product gets one active default variant (Phase 8); carts reference
+	// the variant id.
+	seedProduct := func(tid, slug string, price int, inv int, status string) (prodID, variantID string) {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatalf("begin: %v", err)
@@ -94,21 +97,26 @@ func TestCartRLSIsolation(t *testing.T) {
 			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
 			t.Fatalf("set tenant: %v", err)
 		}
-		var id string
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO products (tenant_id, name, slug, price_cents, currency, inventory_count, status)
 			VALUES ($1, $2, $3, $4, 'usd', $5, $6) RETURNING id`,
-			tid, slug, "cart-"+slug+"-"+sfx, price, inv, status).Scan(&id); err != nil {
+			tid, slug, "cart-"+slug+"-"+sfx, price, inv, status).Scan(&prodID); err != nil {
 			t.Fatalf("seed product %s: %v", slug, err)
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO product_variants (tenant_id, product_id, price_cents, inventory_count, status)
+			VALUES ($1, $2, $3, $4, 'active') RETURNING id`,
+			tid, prodID, price, inv).Scan(&variantID); err != nil {
+			t.Fatalf("seed variant %s: %v", slug, err)
 		}
 		if err := tx.Commit(ctx); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
-		return id
+		return prodID, variantID
 	}
-	p1 := seedProduct(a.id, "p1", 1000, 5, "active") // in stock
-	p2 := seedProduct(a.id, "p2", 250, 0, "active")  // zero stock — cartable now
-	arch := seedProduct(a.id, "arch", 999, 1, "archived")
+	p1, v1 := seedProduct(a.id, "p1", 1000, 5, "active") // in stock
+	p2, v2 := seedProduct(a.id, "p2", 250, 0, "active")  // zero stock — cartable now
+	_, archV := seedProduct(a.id, "arch", 999, 1, "archived")
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	RegisterRoutes(app.Group("/api/v1"), pool, New(pool, NoopReserver{}))
@@ -172,34 +180,34 @@ func TestCartRLSIsolation(t *testing.T) {
 
 	// Add in-stock product, then merge more of it.
 	cr = decodeCart(do("POST", "/api/v1/cart", sessionA,
-		`{"product_id":"`+p1+`","quantity":2}`, fiber.StatusOK))
+		`{"variant_id":"`+v1+`","quantity":2}`, fiber.StatusOK))
 	if cr.Cart == nil || len(cr.Cart.Items) != 1 {
 		t.Fatalf("expected 1 item after first add, got %+v", cr.Cart)
 	}
 	it := cr.Cart.Items[0]
-	if it.ProductID != p1 || it.Quantity != 2 {
-		t.Fatalf("p1 qty should be 2, got %+v", it)
+	if it.ProductID != p1 || it.VariantID != v1 || it.Quantity != 2 {
+		t.Fatalf("p1/v1 qty should be 2, got %+v", it)
 	}
 	if it.LineTotalCents != 2000 || cr.Cart.TotalCents != 2000 {
 		t.Fatalf("totals wrong: line %d, total %d", it.LineTotalCents, cr.Cart.TotalCents)
 	}
 
 	cr = decodeCart(do("POST", "/api/v1/cart", sessionA,
-		`{"product_id":"`+p1+`","quantity":3}`, fiber.StatusOK))
+		`{"variant_id":"`+v1+`","quantity":3}`, fiber.StatusOK))
 	if it = *find(cr.Cart.Items, p1); it.Quantity != 5 {
-		t.Fatalf("adding same product should merge to 5, got %d", it.Quantity)
+		t.Fatalf("adding same variant should merge to 5, got %d", it.Quantity)
 	}
 
 	// 0-inventory product is cartable now (no stock gating at add time).
 	cr = decodeCart(do("POST", "/api/v1/cart", sessionA,
-		`{"product_id":"`+p2+`","quantity":1}`, fiber.StatusOK))
+		`{"variant_id":"`+v2+`","quantity":1}`, fiber.StatusOK))
 	if len(cr.Cart.Items) != 2 || cr.Cart.TotalCents != 5250 {
 		t.Fatalf("expected 2 items / 5250 total after adding p2, got %+v", cr.Cart)
 	}
 
-	// Archived product cannot be carted.
+	// Archived product's variant cannot be carted.
 	do("POST", "/api/v1/cart", sessionA,
-		`{"product_id":"`+arch+`","quantity":1}`, fiber.StatusNotFound)
+		`{"variant_id":"`+archV+`","quantity":1}`, fiber.StatusNotFound)
 
 	// PATCH one line's quantity.
 	p1Item := find(cr.Cart.Items, p1)
@@ -259,7 +267,7 @@ func TestCartRLSIsolation(t *testing.T) {
 
 	// --- Session minting without a pre-existing session ----------------------
 	// A brand-new cart POST (no session header/cookie) mints one and echoes it.
-	mint := do("POST", "/api/v1/cart", "", `{"product_id":"`+p1+`","quantity":1}`, fiber.StatusOK)
+	mint := do("POST", "/api/v1/cart", "", `{"variant_id":"`+v1+`","quantity":1}`, fiber.StatusOK)
 	if mint.session == "" {
 		t.Fatal("expected a minted X-Customer-Session response header")
 	}

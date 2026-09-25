@@ -22,6 +22,10 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, svc 
 	admin.Delete("/:id", svc.DeleteProduct)
 	admin.Post("/:id/images", svc.AddImage)
 	admin.Delete("/:id/images/:imageId", svc.RemoveImage)
+	admin.Post("/:id/options", svc.CreateOption)
+	admin.Post("/:id/variants", svc.CreateVariant)
+	admin.Patch("/:id/variants/:variantId", svc.UpdateVariant)
+	admin.Delete("/:id/variants/:variantId", svc.DeleteVariant)
 
 	router.Get("/categories", auth.PublicTenantMW(pool), svc.ListCategories)
 }
