@@ -84,6 +84,13 @@ func zoneMatches(country, state string, countries, regions []string) bool {
 	return contains(regions, state)
 }
 
+// ErrStateRequired is returned by ResolveRate when the destination country is
+// covered only by region-restricted zones but no state was supplied. Checkout
+// maps this to a 400 asking for shipping_state instead of a silent "no rate",
+// so a merchant who set up region-only rates (and no country-wide fallback)
+// can't leave customers with literally no shipping option.
+var ErrStateRequired = errors.New("shipping_state required")
+
 // --- public rates --------------------------------------------------------------
 
 type zoneRow struct {
@@ -127,12 +134,20 @@ func (s *Service) ListRates(c *fiber.Ctx) error {
 	}
 	defer rows.Close()
 	var rates []fiber.Map
+	stateRequired := false
 	for rows.Next() {
 		var z zoneRow
 		var r rateRow
 		if err := rows.Scan(&z.id, &z.name, &z.countries, &z.regions,
 			&r.id, &r.name, &r.rateCents, &r.freeOverCents, &r.sortOrder); err != nil {
 			return httperr.ErrInternalServerError
+		}
+		// When no state is supplied but the destination country has
+		// region-restricted zones, downstream checkout needs the state — surface
+		// it so the frontend can collect it instead of the customer hitting a
+		// dead end at pay time (see ErrStateRequired).
+		if state == "" && contains(z.countries, country) && len(z.regions) > 0 {
+			stateRequired = true
 		}
 		if !zoneMatches(country, state, z.countries, z.regions) {
 			continue
@@ -146,7 +161,7 @@ func (s *Service) ListRates(c *fiber.Ctx) error {
 	if err := rows.Err(); err != nil {
 		return httperr.ErrInternalServerError
 	}
-	return c.JSON(fiber.Map{"rates": rates})
+	return c.JSON(fiber.Map{"rates": rates, "state_required": stateRequired})
 }
 
 func intOrNil(v *int) any {
@@ -180,6 +195,12 @@ func ResolveRate(ctx context.Context, tx pgx.Tx, rateID, country, state string, 
 	}
 	if err != nil {
 		return nil, err
+	}
+	// Destination country is covered, but only via region-restricted zones and
+	// the customer didn't provide a state: ask for it rather than silently
+	// resolving to "no rate" (see ErrStateRequired).
+	if contains(z.countries, country) && len(z.regions) > 0 && state == "" {
+		return nil, ErrStateRequired
 	}
 	if !zoneMatches(country, state, z.countries, z.regions) {
 		return nil, nil

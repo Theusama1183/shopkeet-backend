@@ -14,4 +14,10 @@ Applies to: all code under `apps/api/`. Load this rule for any backend task.
 - MUST set `app.current_tenant` via `SET LOCAL` inside the request's transaction on every authenticated request — this is what makes RLS actually apply. A handler that queries the database outside this pattern is a bug, not a style choice.
 - MUST NOT deviate from this file without flagging the conflict first. If a task appears to require it, stop and raise the conflict rather than proceeding around it.
 
+## Deployment constraint (supersedes the earlier "no Coolify" call — re-decided 2026-09-25)
+
+- The API deploys via **Coolify** (app uuid `l6modsyezs1vlrv6ly1oqz4i`, source `Theusama1183/shopkeet-backend` `main`), NOT compose/Caddy. Caddy was dropped. This reverses the original compose+Caddy-for-RAM decision documented in `03-architecture.md`; Coolify was chosen because the frontend will deploy on it too, avoiding Vercel. `03-architecture.md` was updated to match.
+- Current deployment is **hybrid**: only the Coolify app is Coolify-managed; `shopkeet-postgres` and `shopkeet-redis` are still the original manual containers attached to Coolify's Docker network. The app connects to them via hostname `shopkeet-postgres` / `shopkeet-redis` (never `postgres` — `coolify-db` owns that alias on the network).
+- Mailpit (Coolify service) is the email sink in dev/staging. Real customer-facing email must go through a real relaying provider — set `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL` (Resend free tier, 3000/mo) or point `SMTP_HOST*` at a relaying server. Do not ship to merchants with Mailpit as the only sink.
+
 Full reasoning for these constraints: `docs/02-tech-stack.md`, `docs/03-architecture.md`, `docs/04-agent-build-spec.md §0`.

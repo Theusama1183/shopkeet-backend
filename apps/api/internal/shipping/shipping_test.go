@@ -3,6 +3,7 @@ package shipping
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -175,7 +176,8 @@ func TestShippingRLSIsolation(t *testing.T) {
 
 	// Public listing resolves destination. No state → general zone only.
 	var list struct {
-		Rates []map[string]any `json:"rates"`
+		Rates         []map[string]any `json:"rates"`
+		StateRequired bool             `json:"state_required"`
 	}
 	do("GET", "/api/v1/shipping/rates?country=PK", aID, "", "", fiber.StatusOK)
 	json.NewDecoder(do("GET", "/api/v1/shipping/rates?country=PK", aID, "", "", fiber.StatusOK).Body).Decode(&list)
@@ -186,11 +188,17 @@ func TestShippingRLSIsolation(t *testing.T) {
 	if !names["Standard"] || !names["Express"] || names["Local"] {
 		t.Fatalf("no-state listing should be Standard+Express only, got %v", names)
 	}
+	if !list.StateRequired {
+		t.Fatalf("no-state listing for a country with region-restricted zones should set state_required=true")
+	}
 	// State PUNJAB adds the region-restricted Local rate.
 	do("GET", "/api/v1/shipping/rates?country=PK&state=KPK", aID, "", "", fiber.StatusOK)
 	json.NewDecoder(do("GET", "/api/v1/shipping/rates?country=PK&state=PUNJAB", aID, "", "", fiber.StatusOK).Body).Decode(&list)
 	if len(list.Rates) != 3 {
 		t.Fatalf("PUNJAB should expose 3 rates, got %d", len(list.Rates))
+	}
+	if list.StateRequired {
+		t.Fatalf("state provided should clear state_required")
 	}
 
 	// Rate resolution used by checkout. Every resolve runs inside a tenant-scoped
@@ -250,12 +258,9 @@ func TestShippingRLSIsolation(t *testing.T) {
 	}
 	txNoState := beginTx(aID)
 	locNoState, err := ResolveRate(ctx, txNoState, rLoc.ID, "PK", "", 100)
-	if err != nil {
-		t.Fatalf("resolve local nostate: %v", err)
-	}
 	txNoState.Rollback(ctx)
-	if locNoState != nil {
-		t.Fatalf("region-restricted rate without state should NOT resolve, got %+v", locNoState)
+	if !errors.Is(err, ErrStateRequired) {
+		t.Fatalf("region-restricted rate without state should return ErrStateRequired, got err=%v quote=%+v", err, locNoState)
 	}
 
 	// Unknown rate resolves nil; tenant-B's rate is hidden from tenant A by RLS.

@@ -553,3 +553,171 @@ func TestOrdersRLSIsolation(t *testing.T) {
 		t.Fatalf("B customer fetching A's order should 404, got %d (%s)", resB2.StatusCode, rawB2)
 	}
 }
+
+// TestPostDiscountTax is the Phase 13 acceptance criterion: tax applies to the
+// discounted subtotal — what the customer actually pays for goods — not the
+// pre-discount price. A 2000-cent subtotal with a 20% percentage discount and
+// 10% tax → tax on (2000 − 400) = 160, total = 1600 + 160 + shipping 500 = 2260.
+// The discount is applied to the guest cart (POST /cart/discount), then checkout
+// re-validates and claims it inside the order transaction.
+func TestPostDiscountTax(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL not set; skipping integration")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+
+	const secret = "test-secret"
+	sfx := randSuffix5()
+
+	var tid string
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO tenants (name, subdomain, tax_rate_percent) VALUES ($1, $2, 10) RETURNING id",
+		"taxtenant", "tax-"+sfx).Scan(&tid); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+	if _, err := auth.Sign(secret, tid, tid[:8], "owner", time.Hour); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	execAs := func(sql string, args ...any) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		if _, err := tx.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+
+	// Product + its variant (no auto-creation: 0010 only backfills once) and a
+	// PK zone/rate pair, plus a 20% percentage discount (no minimum).
+	var variantID string
+	execAs(`INSERT INTO products (tenant_id, name, slug, price_cents, currency, inventory_count, status)
+		VALUES ($1, 'tx', 'tax-' || $2, 2000, 'usd', 10, 'active')`, tid, sfx)
+	{
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin variant: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO product_variants (tenant_id, product_id, price_cents, inventory_count, status)
+			SELECT tenant_id, id, price_cents, inventory_count, 'active' FROM products
+			WHERE tenant_id = $1 AND slug = $2
+			RETURNING id`, tid, "tax-"+sfx).Scan(&variantID); err != nil {
+			t.Fatalf("seed variant: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit variant: %v", err)
+		}
+	}
+	execAs(`INSERT INTO discounts (tenant_id, code, type, value_percent, status)
+		VALUES ($1, 'SAVE20', 'percentage', 20, 'active')`, tid)
+	execAs(`INSERT INTO shipping_zones (tenant_id, name, countries, regions)
+		VALUES ($1, 'PK', '{"PK"}', '{}')`, tid)
+	var rateID string
+	{
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin rate: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO shipping_rates (tenant_id, zone_id, name, rate_cents, sort_order)
+			SELECT $1, id, 'Standard', 500, 0 FROM shipping_zones
+			WHERE tenant_id = $1 AND name = 'PK'
+			RETURNING id`, tid).Scan(&rateID); err != nil {
+			t.Fatalf("seed rate: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit rate: %v", err)
+		}
+	}
+
+	bus := events.NewBus()
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
+	v1 := app.Group("/api/v1")
+	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}))
+	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()))
+
+	do := func(method, path, session, body string, want int) *http.Response {
+		t.Helper()
+		var req *http.Request
+		if body == "" {
+			req = httptest.NewRequest(method, path, nil)
+		} else {
+			req = httptest.NewRequest(method, path, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("X-Tenant-ID", tid)
+		if session != "" {
+			req.Header.Set("X-Customer-Session", session)
+		}
+		res, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode != want {
+			t.Fatalf("%s %s: status %d, want %d (body=%s)", method, path, res.StatusCode, want, raw)
+		}
+		res.Body = io.NopCloser(strings.NewReader(string(raw)))
+		return res
+	}
+
+	session := "sess-tax-" + sfx
+	do("POST", "/api/v1/cart", session, `{"variant_id":"`+variantID+`","quantity":1}`, fiber.StatusOK)
+	do("GET", "/api/v1/cart", session, "", fiber.StatusOK) // cart now exists
+	do("POST", "/api/v1/cart/discount", session, `{"code":"SAVE20"}`, fiber.StatusOK)
+
+	phone := "+1-555-" + sfx
+	co := do("POST", "/api/v1/checkout", session,
+		`{"customer_name":"Tax","customer_phone":"`+phone+`","customer_email":"tax@example.com",`+
+			`"shipping_address_line1":"1 Main St","shipping_city":"Lahore","shipping_country":"PK",`+
+			`"shipping_state":"Punjab","shipping_rate_id":"`+rateID+`"}`,
+		fiber.StatusCreated)
+	var ord struct {
+		TotalCents        int    `json:"total_cents"`
+		DiscountCode      string `json:"discount_code"`
+		DiscountCents     int    `json:"discount_cents"`
+		TaxCents          int    `json:"tax_cents"`
+		ShippingCostCents int    `json:"shipping_cost_cents"`
+	}
+	if err := json.NewDecoder(co.Body).Decode(&ord); err != nil {
+		t.Fatalf("decode order: %v", err)
+	}
+	if ord.DiscountCode != "SAVE20" || ord.DiscountCents != 400 {
+		t.Fatalf("expected SAVE20/400, got code=%q cents=%d", ord.DiscountCode, ord.DiscountCents)
+	}
+	if ord.TaxCents != 160 {
+		t.Fatalf("tax must be on the discounted subtotal (1600×10%%=160), got %d", ord.TaxCents)
+	}
+	if ord.ShippingCostCents != 500 || ord.TotalCents != 2260 {
+		t.Fatalf("expected shipping 500 and total 2260 (1600+160+500), got ship=%d total=%d",
+			ord.ShippingCostCents, ord.TotalCents)
+	}
+}

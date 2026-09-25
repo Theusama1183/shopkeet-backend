@@ -309,6 +309,9 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	// name are snapshotted into the order — later rate edits never touch it.
 	quote, err := shipping.ResolveRate(ctx, tx, req.ShippingRateID,
 		req.ShippingCountry, req.ShippingState, subtotal)
+	if errors.Is(err, shipping.ErrStateRequired) {
+		return httperr.C(fiber.StatusBadRequest, "shipping_state required for this destination")
+	}
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
@@ -334,8 +337,9 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		discountCents = q.DiscountCents
 	}
 
-	// Tax is calculated on the subtotal (Phase 13).
-	taxCents := subtotal * taxRatePercent / 100
+	// Tax is calculated on the discounted subtotal — the amount the customer
+	// actually pays for goods — then shipping is added (Phase 13).
+	taxCents := (subtotal - discountCents) * taxRatePercent / 100
 	total := subtotal - discountCents + quote.CostCents + taxCents
 
 	var orderID string

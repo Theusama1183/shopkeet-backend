@@ -318,7 +318,7 @@ Structured JSON per request: `request_id`, `method`, `path`, `status`, `latency_
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/shipping/rates?country=&state=` | Public | All rates of zones covering destination. `free_over_cents` included. |
+| GET | `/shipping/rates?country=&state=` | Public | All rates of zones covering destination. `free_over_cents` included. Response adds `state_required: true` when the country has region-restricted zones but no state was given (frontend should then require state). |
 | POST | `/shipping/zones` | Admin | Create zone: `{name, countries[], regions[]}`. |
 | PATCH | `/shipping/zones/:id` | Admin | Update zone. Type change with rates → 409. |
 | DELETE | `/shipping/zones/:id` | Admin | Delete (409 if rates exist). |
@@ -496,9 +496,11 @@ async notification handlers — which read on a **fresh pool connection** — ne
 
 ### Tax Calculation
 
+Tax is calculated on the **discounted** subtotal — the amount the customer actually pays for goods — then shipping is added:
+
 ```
-tax_cents = subtotal_cents * tax_rate_percent / 100
-total_cents = subtotal - discount_cents + shipping_cost_cents + tax_cents
+tax_cents = (subtotal_cents - discount_cents) * tax_rate_percent / 100
+total_cents = (subtotal - discount_cents) + shipping_cost_cents + tax_cents
 ```
 
 `tax_cents` snapshot stored on order. Order JSON always includes `tax_cents`.
@@ -636,6 +638,8 @@ Default codes by status:
 
 ### Running under Coolify (single source of truth for the API)
 
+> **Deploy decision (re-confirmed 2026-09-25):** Coolify is the deploy layer — the frontend will run on it too, so there's no Vercel and one management surface. This reverses the original compose+Caddy-for-RAM preference (see `shopkeet-agents-package/.agents/rules/backend-constraints.md` and `docs/03-architecture.md` §7). Caddy and its on-demand-TLS redesign for merchant custom domains is **deferred**, not dropped.
+
 | Resource | Identifier | Status |
 |----------|-----------|--------|
 | Coolify app `shopkeet-api` | uuid `l6modsyezs1vlrv6ly1oqz4i` | **running:healthy** |
@@ -648,10 +652,11 @@ Default codes by status:
 ### Notifications & email (Phase 12, live 2026-09-25)
 
 - Provider resolution in `main.go`: **SMTP** (`SMTP_HOST` ≥ 1 var) → **Resend** (`RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL`) → **LogProvider**.
-- SMTP → **Mailpit** service in Coolify (SMTP `:1025`, no auth): sees the app container as `mailpit-p1zaxdgvrrdf9p6bb1czudqi`; from the VPS host use `127.0.0.1:1025`. Set env vars: `SMTP_HOST`, `SMTP_PORT=1025`, `SMTP_TLS_MODE=starttls` (falls back to plaintext when the peer doesn't advertise STARTTLS), `SMTP_TLS_VERIFY=false`, `NOTIFICATIONS_FROM_EMAIL=no-reply@shopkeet.com`.
+- ⚠️ **Mailpit is a dev/staging mail *catcher*, not a relaying provider.** It acknowledges the message and shows it in its UI but never delivers to real inboxes. `notification_log` rows say `sent` because SMTP accepted — the message is NOT on the road to the customer. **Before any real merchant ships, replace it with a real provider:** set `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL` (Resend v2 free tier ≈ 3000 emails/mo) or point `SMTP_HOST*` at a relaying server (SES/Brevo/Postmark) and add SPF/DKIM on the sending domain. The `Provider` interface is the swap seam — no code change needed.
+- Current SMTP → **Mailpit** service in Coolify (SMTP `:1025`, no auth): sees the app container as `mailpit-p1zaxdgvrrdf9p6bb1czudqi`; from the VPS host use `127.0.0.1:1025`. Set env vars: `SMTP_HOST`, `SMTP_PORT=1025`, `SMTP_TLS_MODE=starttls` (falls back to plaintext when the peer doesn't advertise STARTTLS), `SMTP_TLS_VERIFY=false`, `NOTIFICATIONS_FROM_EMAIL=no-reply@shopkeet.com`.
 - Mailpit UI (HTTPS, LE cert via Traefik): `https://mailpit-p1zaxdgvrrdf9p6bb1czudqi.13.61.125.59.sslip.io`. Messages API: `GET /api/v1/messages?limit=N`.
 - Shopify-style addressing (per store): `From: "<StoreName> via Shopkeet <no-reply@<subdomain>.shopkeet.com>"`, `Reply-To: `support@<subdomain>.shopkeet.com`` (base domain from `APP_BASE_DOMAIN`). Verified live in Mailpit headers.
-- E2E verified: `customers.signup` → `customer_welcome`, checkout → `order_confirmation`, status → `delivered` → `order_delivered`; all `notification_log` rows `status=sent`.
+- E2E verified against Mailpit: `customers.signup` → `customer_welcome`, checkout → `order_confirmation`, status → `delivered` → `order_delivered`; all `notification_log` rows `status=sent`.
 - Two latent bugs fixed en route: (1) event payload is typed `fiber.Map`, so handlers asserting `map[string]any` never fired — now assert `fiber.Map`; (2) events were emitted inside the request tx but async handlers read on a fresh connection, racing the commit — now emitted via `auth.AfterCommit` after `tx.Commit`.
 
 ### Data layer (still manual containers, attached to `coolify` network)

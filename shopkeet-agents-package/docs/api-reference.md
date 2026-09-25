@@ -67,7 +67,7 @@ File bytes never pass through the Go API — the browser uploads directly to R2 
 
 **Discounts:** if the cart has a `discount_code`, checkout re-validates it inside the order transaction (`FOR UPDATE` on the code row) and increments `times_used`; a code that expired, was disabled, or hit its usage limit since it was applied → 400 and the order is not created. Order JSON includes `discount_code` (or empty) and `discount_cents` (what was actually applied).
 
-**Tax (Phase 13):** `tax_cents = subtotal_cents × tenants.tax_rate_percent / 100`, added into `total_cents`. Order JSON includes `tax_cents` and (for admin responses) `internal_note` — the merchant's private note never appears in customer-facing responses.
+**Tax (Phase 13):** `tax_cents = (subtotal_cents − discount_cents) × tenants.tax_rate_percent / 100` — tax applies to what the customer actually pays for goods, then shipping is added. Order JSON includes `tax_cents` and (for admin responses) `internal_note` — the merchant's private note never appears in customer-facing responses.
 
 **Customer accounts:** order JSON includes `customer_id` — the linked `customers` row when checkout ran with a customer JWT, else `null`.
 
@@ -77,7 +77,7 @@ File bytes never pass through the Go API — the browser uploads directly to R2 
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/shipping/rates?country=&state=` | Public | Every rate of every zone covering the destination (country in the zone's `countries`; a region-restricted zone also requires the state to be in its `regions` and is skipped without one). `free_over_cents` included — the options a checkout form presents |
+| GET | `/shipping/rates?country=&state=` | Public | Every rate of every zone covering the destination (country in the zone's `countries`; a region-restricted zone also requires the state to be in its `regions` and is skipped without one). Response also carries `state_required: true` when the country has region-restricted zones and no state was given — the frontend should then require the state field before checkout. `free_over_cents` included — the options a checkout form presents |
 | POST | `/shipping/zones` | Admin | Create a zone: `{name, countries[], regions[]}`. `regions` (state codes) restricts the zone; empty means nationwide |
 | PATCH | `/shipping/zones/:id` | Admin | Update a zone. Changing the type (restricted ↔ unrestricted) while rates exist → 409 |
 | DELETE | `/shipping/zones/:id` | Admin | Delete a zone; 409 while any rate still references it (delete the rates first) |
@@ -85,7 +85,7 @@ File bytes never pass through the Go API — the browser uploads directly to R2 
 | PATCH | `/shipping/rates/:id` | Admin | Update a rate (`name`, `rate_cents`, `free_over_cents`, `sort_order`) |
 | DELETE | `/shipping/rates/:id` | Admin | Remove a rate |
 
-**Checkout integration:** `POST /checkout` requires a `shipping_rate_id` that resolves to the destination (country/state), else 400. The applied cost — `rate_cents`, or `0` when the subtotal is `>= free_over_cents` — is added to `total_cents` and snapshotted. Later rate/zone edits never alter past orders.
+**Checkout integration:** `POST /checkout` requires a `shipping_rate_id` that resolves to the destination (country/state), else 400. If the chosen rate's zone is region-restricted and no `shipping_state` was supplied, checkout returns 400 `"shipping_state required for this destination"` instead of a generic no-rate error (Shopify-like: the state is collected when the country needs it). The applied cost — `rate_cents`, or `0` when the subtotal is `>= free_over_cents` — is added to `total_cents` and snapshotted. Later rate/zone edits never alter past orders.
 
 ## Discounts
 
@@ -172,7 +172,7 @@ File bytes never pass through the Go API — the browser uploads directly to R2 
 | GET | `/tenant/settings` | Admin | Fetch the current tenant's settings: `name`, `logo_media_asset_id`, `default_currency`, `timezone`, `support_email`, `support_phone`, `tax_rate_percent` |
 | PATCH | `/tenant/settings` | Admin | Update any of the above settings (partial merge). `tax_rate_percent` must be 0–100 |
 
-**Tax impact:** when `tax_rate_percent > 0`, checkout computes `tax_cents = subtotal_cents × tax_rate_percent / 100` and adds it to `total_cents` (alongside shipping, minus discount). The `tax_cents` snapshot is stored on the order.
+**Tax impact:** when `tax_rate_percent > 0`, checkout computes `tax_cents = (subtotal_cents − discount_cents) × tax_rate_percent / 100` and adds it to `total_cents` (alongside shipping). Tax applies to the discounted subtotal — what the customer actually pays — not the pre-discount price. The `tax_cents` snapshot is stored on the order.
 
 ## Platform
 
