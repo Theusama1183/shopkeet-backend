@@ -8,6 +8,52 @@
 
 ---
 
+## Executed: API-driven deployment (2026-09-25)
+
+> The migration was actually completed via the Coolify REST API (not the UI). Architecture is simpler than planned below: **only the API app is Coolify-managed**; postgres/redis remain the existing manual containers, now attached to the `coolify` network and referenced by container-name aliases. Old manual `shopkeet-api` container is stopped.
+
+### Resulting topology (`13.61.125.59`)
+
+- **Coolify app**: uuid `l6modsyezs1vlrv6ly1oqz4i`, name `shopkeet-api`, public repo `Theusama1183/shopkeet-backend`, branch `main`, build pack `dockerfile`, `base_directory: /apps/api`, `dockerfile_location: /Dockerfile`, domain `https://api.shopkeet.com`, healthcheck `GET /healthz` :3001.
+- **Data**: existing containers `shopkeet-postgres` (postgres:16-alpine) and `shopkeet-redis` (redis:7-alpine) still run under compose but are attached to the **`coolify`** network with aliases `shopkeet-postgres`/`shopkeet-redis`. The app connects via hostname `shopkeet-postgres` (NOT `postgres` — coolify-db owns that alias on the coolify network).
+- **Manual `shopkeet-api`** container (old compose image `shopkeet-api:latest`) is **stopped** (`docker stop shopkeet-api`). Keep postgres/redis running.
+- Old Coolify apps deleted: `hkgdwooa0vivixdehdqpxwfr` (original failed app) and junk `s28ucomlzbvv09w1mcsif8ym`, `yfhv2ed0ywnayqascwr0eoa` (auto-created dockerfile apps).
+
+### Working API endpoints (Coolify v4.3.23, base `https://coolify.shopkeet.com/api/v1`)
+
+All `-H "Authorization: Bearer 1|KZeej8fnRctMU379Zs6CnWhtaFXvf3GaUlCRNGIvb16c67c4"`.
+
+- `GET /applications` — list. `GET /deployments/{uuid}` — status + `logs` (build/deploy output). `GET /deployments/applications/{uuid}` — deploy history.
+- `POST /applications/public` — create app from public git repo. Payload (project/environment/server uuids from Coolify UI):
+  `git_repository, git_branch, build_pack=dockerfile, name, ports_exposes, base_directory, dockerfile_location, domains, health_check_enabled, health_check_path=/healthz, health_check_port=3001, health_check_scheme=http, health_check_method=GET, is_auto_deploy_enabled=true, is_force_https_enabled=true, instant_deploy=false, project_uuid, environment_uuid, server_uuid`.
+- `POST /applications/{uuid}/envs` — create env var (body `{"key","value"}`); returns 409 if exists → use `PATCH /applications/{uuid}/envs` to update.
+- `POST /applications/{uuid}/start` — trigger deploy (this is the "Deploy" action). Also `/restart`, `/stop`, `/rollback`.
+- `DELETE /applications/{uuid}` — delete (removes resources + volumes).
+
+### Gotchas (make the SAME mistakes not twice)
+
+1. **PowerShell + Coolify JSON**: `Set-Content -Encoding utf8` writes a BOM (PS 5.1) → Coolify returns `Invalid JSON.`. Use `[System.IO.File]::WriteAllText(path, json, (New-Object System.Text.UTF8Encoding($false)))`, then pipe over SSH: `echo <base64> | base64 -d > /tmp/x.json`, then `curl -d @/tmp/x.json`.
+2. **No inline python over SSH**: PowerShell mangles `'...'`/`''` in the command string. Always write the `.py`/`.sql` locally (WriteAllText, no BOM), base64 it, decode on VPS, run from file.
+3. **`postgres` hostname collision**: `coolify-db` has alias `postgres` on the `coolify` network. `DATABASE_URL` must use `shopkeet-postgres:5432` (or the container's own name/alias), otherwise the app randomly hits coolify's DB (auth failures). Fixed via PATCH env + redeploy.
+4. **Healthcheck `curl: not found`**: Alpine runtime image lacked curl; Coolify's in-container healthcheck needed it. Added `curl` to `apps/api/Dockerfile` and `Dockerfile.prod` final stage (commit `ca160ab`). App binds IPv4-only (`0.0.0.0:3001`), so `localhost`→`::1` refused; curl falls back to `127.0.0.1` and passes.
+5. **Build ~4–5 min** every deploy (Go compile, no cache reuse across deployments). Don't interpret `in_progress` as hung.
+6. **Auto-deploy**: `is_auto_deploy_enabled=true` on public-repo apps picks up pushes to `main` via webhook; if it doesn't fire, `POST /applications/{uuid}/start` forces it.
+7. **Coolify app container name is unique** (`{uuid}-{n}`) — coexists fine with the old manual `shopkeet-api` container.
+
+### Verified end-to-end (2026-09-25)
+
+- `docker ps`: Coolify app `l6modsyezs1vlrv6ly1oqz4i-133710085986` **Up (healthy)**.
+- `https://api.shopkeet.com/healthz` → `{"status":"ok"}` HTTP 200 (TLS via Coolify proxy).
+- `POST /api/v1/auth/signup` over the public domain → 201 + JWT; tenant row confirmed in **shopkeet-postgres** (`shopkeet` DB), not coolify-db. Test tenants purged afterwards.
+
+### Remaining (from original plan, still open)
+
+- Observability (Prometheus/Grafana), Caddy under Coolify, `*.shopkeet.com` on-demand TLS for merchant subdomains.
+- Old Prometheus/Grafana containers cleanup once observability is done.
+- Redis read-through cache for hot public reads (backlog).
+
+---
+
 ## Prerequisites
 
 - SSH access to VPS: `ssh -i ~/.ssh/shopkeet_key_pair.pem ubuntu@13.61.125.59`

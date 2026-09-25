@@ -2,6 +2,7 @@
 
 **Last updated:** 2026-09-25  
 **DB version:** 15 (migrations 0001–0015 applied on VPS)  
+**Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthy)  
 **All acceptance tests:** PASS  
 **Stack:** Go 1.27 · Fiber · pgx/pgxpool · PostgreSQL 16 (RLS + FORCE) · Redis 7 · golang-migrate (embedded)
 
@@ -599,6 +600,48 @@ Default codes by status:
 | `R2_PUBLIC_URL` | Set together | 2 | Public base for media URLs |
 | `RESEND_API_KEY` | No | 12 | Transactional email (Resend) |
 | `NOTIFICATIONS_FROM_EMAIL` | No | 12 | From address for notifications |
+
+---
+
+## Live Deployment Status (VPS 13.61.125.59) — 2026-09-25
+
+### Running under Coolify (single source of truth for the API)
+
+| Resource | Identifier | Status |
+|----------|-----------|--------|
+| Coolify app `shopkeet-api` | uuid `l6modsyezs1vlrv6ly1oqz4i` | **running:healthy** |
+| Domain | `https://api.shopkeet.com` | 200 (`/healthz` → `{"status":"ok"}`), TLS via Coolify proxy |
+| Source | `Theusama1183/shopkeet-backend`, branch `main` | build pack `dockerfile`, `base_directory /apps/api`, `dockerfile_location /Dockerfile`, `ports_exposes 3001` |
+| Auto-deploy | `is_auto_deploy_enabled=true` | pushes to `main` trigger builds (webhook; fallback: `POST /api/v1/applications/{uuid}/start`) |
+| Env | 10 vars incl. `DATABASE_URL`, `REDIS_URL`, JWT/R2/METRICS + `APP_BASE_DOMAIN=shopkeet.com` | `PORT` unset → default 3001 |
+
+### Data layer (still manual containers, attached to `coolify` network)
+
+- `shopkeet-postgres` (postgres:16-alpine) → volume `infra_postgres_data` — **the real DB**, migrations 0001–0015.
+- `shopkeet-redis` (redis:7-alpine) → volume `infra_redis_data` — cart reservation/units.
+- App connects via hostname **`shopkeet-postgres`** / **`shopkeet-redis`**. ⚠️ Do NOT use host `postgres` on the coolify network — `coolify-db` owns that alias and it points at Coolify's own DB.
+- Old manual `shopkeet-api` compose container: **stopped and removed** (Coolify is now the only API).
+- Healthcheck note: runtime image includes `curl`; app binds IPv4 only, so Coolify's in-container check (localhost → `::1`) relies on curl's fallback to `127.0.0.1`.
+
+### Cleanup performed 2026-09-25 (VPS + Coolify)
+
+- Deleted Coolify apps: old `hkgdwooa0vivixdehdqpxwfr`, junk `s28ucomlzbvv09w1mcsif8ym`, `yfhv2ed0ywnayqascwr0eoa`.
+- Deleted unused dev DBs `pilot-pg` (`tyjcf7e0bdoi4bnuskwxkfmi`) and `pilot-redis` (`cocsvhri8k91dcvp1n6gepds`) — leftovers, not referenced by the app.
+- Removed containers `manual-hc` (debug), old `shopkeet-api`, `shopkeet-caddy` (never used).
+- Removed images `shopkeet-api:latest`, `caddy:2.8-alpine`, stale `l6mods…:66b01a4` build.
+- Removed volumes `caddy_config`, `caddy_data`, `infra_caddy_*`, `infra_grafana_data`, 2 anonymous Prometheus/empty volumes.
+- Final volume set: `coolify-db`, `coolify-redis`, `infra_postgres_data`, `infra_redis_data`. Disk 38G (8.8G used, 29G free).
+
+### Known good paths (for verification after any change)
+
+- `curl https://api.shopkeet.com/healthz` → 200.
+- `POST https://api.shopkeet.com/api/v1/auth/signup` `{name, subdomain, email, password}` → 200 + JWT. (Payload field is **`subdomain`**, not `tenant_name`.)
+- Signups appear in `shopkeet-postgres`/`shopkeet` DB (`tenants`), never in coolify-db.
+- `POST /auth/login`, public `GET /products`, admin `/products` with JWT beside `X-Tenant-ID` all pass.
+
+### Migration runbook
+
+See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** for the exact API endpoints, payloads, and gotchas (PowerShell BOM, base64-over-SSH pattern, `postgres` alias collision, curl-in-alpine).
 
 ---
 
