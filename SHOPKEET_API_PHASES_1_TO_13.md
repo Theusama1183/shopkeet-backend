@@ -653,11 +653,12 @@ Default codes by status:
 | Resource | Identifier | Status |
 |----------|-----------|--------|
 | Coolify app `shopkeet-api` | uuid `l6modsyezs1vlrv6ly1oqz4i` | **running:healthy** |
-| Live commit | `03d4d61` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-074549689073` |
+| Live commit | `e44aa8c` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-091956308564` (deploy `zpi5qoydsct0t437raguropt`, cache-aside) + `dh57abexrchf2t388j9fjigk` (REDIS_URL fix) |
 | Domain | `https://api.shopkeet.com` | 200 (`/healthz` → `{"status":"ok"}`), TLS via Coolify proxy |
 | Source | `Theusama1183/shopkeet-backend`, branch `main` | build pack `dockerfile`, `base_directory /apps/api`, `dockerfile_location /Dockerfile`, `ports_exposes 3001` |
-| Auto-deploy | `is_auto_deploy_enabled=true` | pushes to `main` trigger builds (webhook; fallback: `POST /api/v1/applications/{uuid}/start`) |
+| Auto-deploy | `is_auto_deploy_enabled=true` | pushes to `main` trigger builds (webhook; fallback: `POST /api/v1/deploy?uuid={uuid}&force=true` — do **not** use `/applications/{uuid}/start` or `/applications/{uuid}/deploy`, both 404; `/applications/{uuid}/restart` restarts without rebuild) |
 | Env | 12 vars incl. `DATABASE_URL`, `REDIS_URL`, JWT/R2/METRICS + `APP_BASE_DOMAIN=shopkeet.com` + `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL` | `PORT` unset → default 3001; `SMTP_*` vars **removed** (2026-09-26) so Resend is the active provider |
+| `REDIS_URL` | **`redis://shopkeet-redis:6379`** (fixed 2026-09-26) | was wrongly `redis://redis:6379` → resolved to Coolify's own auth'd `coolify-redis` on the `coolify` network, all Asynq ops `NOAUTH` + cache/rate-limit silently dead; fixed via `PATCH /api/v1/applications/{uuid}/envs` |
 
 ### Notifications & email (Phase 12, live via Resend 2026-09-26)
 
@@ -672,8 +673,8 @@ Default codes by status:
 ### Data layer (still manual containers, attached to `coolify` network)
 
 - `shopkeet-postgres` (postgres:16-alpine) → volume `infra_postgres_data` — **the real DB**, migrations 0001–0015.
-- `shopkeet-redis` (redis:7-alpine) → volume `infra_redis_data` — cart reservation/units.
-- App connects via hostname **`shopkeet-postgres`** / **`shopkeet-redis`**. ⚠️ Do NOT use host `postgres` on the coolify network — `coolify-db` owns that alias and it points at Coolify's own DB.
+- `shopkeet-redis` (redis:7-alpine) → volume `infra_redis_data` — cart reservation + product cache-aside + rate limiting + Asynq queues (all verified live 2026-09-26: rate-limit key `shopkeet:rl:...` observed with 429s, cache key `shopkeet:cache:product:{tid}/{id}/public` observed + TTL'd).
+- App connects via hostname **`shopkeet-postgres`** / **`shopkeet-redis`**. ⚠️ Do NOT use host `postgres` — or `redis` — on the coolify network: `coolify-db`/`coolify-redis` own those aliases and they point at Coolify's own auth'd instances (the `NOAUTH` incident on 2026-09-26).
 - Old manual `shopkeet-api` compose container: **stopped and removed** (Coolify is now the only API).
 - Healthcheck note: runtime image includes `curl`; app binds IPv4 only, so Coolify's in-container check (localhost → `::1`) relies on curl's fallback to `127.0.0.1`.
 
