@@ -428,12 +428,12 @@ type Provider interface {
 ### Implementations
 
 - `LogProvider` (default) — logs JSON to stdout
-- `ResendProvider` — HTTPS POST to `api.resend.com` (requires `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL`)
-- `SMTPProvider` — Go stdlib `net/smtp`; the live path in production
+- `ResendProvider` — HTTPS POST to `api.resend.com` (requires `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL`); **the live path in production**
+- `SMTPProvider` — Go stdlib `net/smtp`; available, used only if `SMTP_*` vars are set again
 
 ### Provider resolution (`main.go`)
 
-Priority: **SMTP → Resend → Log**. SMTP wins the moment `SMTP_HOST` is set (even non-empty). Resend needs `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL`. Otherwise LogProvider.
+Priority: **SMTP → Resend → Log**. SMTP would win the moment `SMTP_HOST` is set (even non-empty). Resend needs `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL`. Otherwise LogProvider. **Production currently has no `SMTP_*` vars → Resend wins.**
 
 **SMTP env vars:**
 
@@ -625,16 +625,16 @@ Default codes by status:
 | `R2_SECRET_ACCESS_KEY` | Set together | 2 | |
 | `R2_BUCKET_NAME` | Set together | 2 | |
 | `R2_PUBLIC_URL` | Set together | 2 | Public base for media URLs |
-| `RESEND_API_KEY` | No | 12 | Transactional email (Resend) — used only when SMTP is NOT set |
-| `NOTIFICATIONS_FROM_EMAIL` | No | 12 | From address for notifications (SMTP envelope + Resend sender) |
-| `SMTP_HOST` | No | 12 | SMTP server host — **set this to enable SMTP provider** (overrides Resend) |
+| `RESEND_API_KEY` | Yes | 12 | Transactional email (Resend) — the **live** provider since 2026-09-26 (no `SMTP_*` vars set) |
+| `NOTIFICATIONS_FROM_EMAIL` | Yes | 12 | From address for notifications (SMTP envelope + Resend sender); live value `Shopkeet <no-reply@mail.shopkeet.com>` |
+| `SMTP_HOST` | No | 12 | SMTP server host — **removed from live env** (2026-09-26); re-adding it would override Resend |
 | `SMTP_PORT` | No | 12 | SMTP port (default `587`) — `1025` for Mailpit |
 | `SMTP_TLS_MODE` | No | 12 | `starttls` (default) \| `tls` \| `none` |
 | `SMTP_TLS_VERIFY` | No | 12 | `true` (default) verify cert; `false` for Mailpit/self-signed |
 
 ---
 
-## Live Deployment Status (VPS 13.61.125.59) — 2026-09-25
+## Live Deployment Status (VPS 13.61.125.59) — 2026-09-26
 
 ### Running under Coolify (single source of truth for the API)
 
@@ -643,20 +643,20 @@ Default codes by status:
 | Resource | Identifier | Status |
 |----------|-----------|--------|
 | Coolify app `shopkeet-api` | uuid `l6modsyezs1vlrv6ly1oqz4i` | **running:healthy** |
-| Live commit | `1368afb` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-152514994209`, image `:1ce5bd40…` |
+| Live commit | `03d4d61` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-074549689073` |
 | Domain | `https://api.shopkeet.com` | 200 (`/healthz` → `{"status":"ok"}`), TLS via Coolify proxy |
 | Source | `Theusama1183/shopkeet-backend`, branch `main` | build pack `dockerfile`, `base_directory /apps/api`, `dockerfile_location /Dockerfile`, `ports_exposes 3001` |
 | Auto-deploy | `is_auto_deploy_enabled=true` | pushes to `main` trigger builds (webhook; fallback: `POST /api/v1/applications/{uuid}/start`) |
-| Env | 15 vars incl. `DATABASE_URL`, `REDIS_URL`, JWT/R2/METRICS + `APP_BASE_DOMAIN=shopkeet.com` + `SMTP_*` | `PORT` unset → default 3001 |
+| Env | 12 vars incl. `DATABASE_URL`, `REDIS_URL`, JWT/R2/METRICS + `APP_BASE_DOMAIN=shopkeet.com` + `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL` | `PORT` unset → default 3001; `SMTP_*` vars **removed** (2026-09-26) so Resend is the active provider |
 
-### Notifications & email (Phase 12, live 2026-09-25)
+### Notifications & email (Phase 12, live via Resend 2026-09-26)
 
-- Provider resolution in `main.go`: **SMTP** (`SMTP_HOST` ≥ 1 var) → **Resend** (`RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL`) → **LogProvider**.
-- ⚠️ **Mailpit is a dev/staging mail *catcher*, not a relaying provider.** It acknowledges the message and shows it in its UI but never delivers to real inboxes. `notification_log` rows say `sent` because SMTP accepted — the message is NOT on the road to the customer. **Before any real merchant ships, replace it with a real provider:** set `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL` (Resend v2 free tier ≈ 3000 emails/mo) or point `SMTP_HOST*` at a relaying server (SES/Brevo/Postmark) and add SPF/DKIM on the sending domain. The `Provider` interface is the swap seam — no code change needed.
-- Current SMTP → **Mailpit** service in Coolify (SMTP `:1025`, no auth): sees the app container as `mailpit-p1zaxdgvrrdf9p6bb1czudqi`; from the VPS host use `127.0.0.1:1025`. Set env vars: `SMTP_HOST`, `SMTP_PORT=1025`, `SMTP_TLS_MODE=starttls` (falls back to plaintext when the peer doesn't advertise STARTTLS), `SMTP_TLS_VERIFY=false`, `NOTIFICATIONS_FROM_EMAIL=no-reply@shopkeet.com`.
-- Mailpit UI (HTTPS, LE cert via Traefik): `https://mailpit-p1zaxdgvrrdf9p6bb1czudqi.13.61.125.59.sslip.io`. Messages API: `GET /api/v1/messages?limit=N`.
-- Shopify-style addressing (per store): `From: "<StoreName> via Shopkeet <no-reply@<subdomain>.shopkeet.com>"`, `Reply-To: `support@<subdomain>.shopkeet.com`` (base domain from `APP_BASE_DOMAIN`). Verified live in Mailpit headers.
-- E2E verified against Mailpit: `customers.signup` → `customer_welcome`, checkout → `order_confirmation`, status → `delivered` → `order_delivered`; all `notification_log` rows `status=sent`.
+- Provider resolution in `main.go`: **SMTP** (`SMTP_HOST` ≥ 1 var) → **Resend** (`RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL`) → **LogProvider**. Production has **no** `SMTP_*` vars, so **ResendProvider is live**: container log shows `notifications: using Resend provider`.
+- ✅ **Resend = production mail relay.** Sending domain `mail.shopkeet.com` added + DNS-verified in Resend. Env: `RESEND_API_KEY` set, `NOTIFICATIONS_FROM_EMAIL=Shopkeet <no-reply@mail.shopkeet.com>`. All 4 `SMTP_*` (Mailpit) vars deleted from the live env (deploy `uika6xnucvdpaleelsitbbba`, 2026-09-26).
+- E2E verified live through Resend: `POST /customers/signup` → `customer_welcome` to a real inbox; `notification_log` row `status=sent`. Delivery proof lives in the Resend dashboard / inbox (the log stores no provider message id).
+- The `Provider` interface swap seam means Mailpit/SMTP can be restored later by re-adding `SMTP_*` vars — no code change. Mailpit itself remains a perfectly good dev-time catcher.
+- Shopify-style addressing (per store): `From: "<StoreName> via Shopkeet <no-reply@<subdomain>.shopkeet.com>"` (strictly the verified `mail.shopkeet.com` envelope via Resend; per-store subdomains are not Resend-verifiable), `Reply-To: `support@<subdomain>.shopkeet.com`` (base domain from `APP_BASE_DOMAIN`). `ResendProvider` sends `reply_to` from the notification payload (commit `03d4d61`).
+- Phase 12 E2E matrix previously verified against Mailpit (customers.signup → `customer_welcome`, checkout → `order_confirmation`, status → `delivered` → `order_delivered`; all `notification_log` rows `status=sent`) — provider-agnostic, still valid.
 - Two latent bugs fixed en route: (1) event payload is typed `fiber.Map`, so handlers asserting `map[string]any` never fired — now assert `fiber.Map`; (2) events were emitted inside the request tx but async handlers read on a fresh connection, racing the commit — now emitted via `auth.AfterCommit` after `tx.Commit`.
 
 ### Data layer (still manual containers, attached to `coolify` network)
@@ -682,7 +682,7 @@ Default codes by status:
 - `POST https://api.shopkeet.com/api/v1/auth/signup` `{name, subdomain, email, password}` → 200 + JWT. (Payload field is **`subdomain`**, not `tenant_name`.)
 - Signups appear in `shopkeet-postgres`/`shopkeet` DB (`tenants`), never in coolify-db.
 - `POST /auth/login`, public `GET /products`, admin `/products` with JWT beside `X-Tenant-ID` all pass.
-- **Notifications E2E:** `POST /customers/signup` `{email, password}` with `X-Tenant-ID: <tenant uuid>` → `customer_welcome`; guest checkout s→`order_confirmation`; `PATCH /orders/:id/status` pending→confirmed→shipped→delivered → `order_delivered`. Watch `GET /notifications/log` (rows `sent`) and Mailpit UI for the mails.
+- **Notifications E2E:** `POST /customers/signup` `{email, password}` with `X-Tenant-ID: <tenant uuid>` → `customer_welcome`; guest checkout s→`order_confirmation`; `PATCH /orders/:id/status` pending→confirmed→shipped→delivered → `order_delivered`. Watch `GET /notifications/log` (rows `sent`) — mails go out via **Resend** (dashboard inbox, `mail.shopkeet.com`).
 
 **Gotchas:**
 - `X-Tenant-ID` must be the tenant **UUID**, not the subdomain — `PublicTenantMW` does `set_config('app.current_tenant', <header>)` and RLS casts `::uuid`, so a subdomain → `500 internal_error`.

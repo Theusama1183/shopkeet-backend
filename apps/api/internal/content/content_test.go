@@ -18,6 +18,7 @@ import (
 
 	"github.com/shopkeet/api/internal/auth"
 	"github.com/shopkeet/api/internal/platform/httperr"
+	"github.com/shopkeet/api/internal/platform/ratelimit"
 )
 
 func randSuffix5() string {
@@ -51,7 +52,7 @@ func TestContentRLSIsolation(t *testing.T) {
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
 	auth.RegisterTenantCreatedHook(SeedDefaults)
-	auth.RegisterRoutes(v1, pool, secret)
+	auth.RegisterRoutes(v1, pool, secret, ratelimit.New(nil))
 	RegisterRoutes(v1, pool, secret, New(pool))
 
 	type tenantT struct {

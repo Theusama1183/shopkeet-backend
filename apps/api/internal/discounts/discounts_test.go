@@ -26,6 +26,7 @@ import (
 	"github.com/shopkeet/api/internal/payments"
 	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
+	"github.com/shopkeet/api/internal/platform/ratelimit"
 	"github.com/shopkeet/api/internal/shipping"
 )
 
@@ -145,10 +146,10 @@ func TestDiscountsAcceptance(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}))
+	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	discounts.RegisterRoutes(v1, pool, secret, discounts.New(pool))
 	bus := events.NewBus()
-	orders.RegisterRoutes(v1, pool, secret, orders.New(pool, bus, payments.NewRegistry()))
+	orders.RegisterRoutes(v1, pool, secret, orders.New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
 	shipping.RegisterRoutes(v1, pool, secret, shipping.New(pool))
 
 	doTenant := func(tid string) func(method, path, session, body string, want int) *http.Response {

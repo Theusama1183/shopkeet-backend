@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"log"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/hibiken/asynq"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/shopkeet/api/internal/auth"
 	"github.com/shopkeet/api/internal/cart"
@@ -22,7 +26,10 @@ import (
 	"github.com/shopkeet/api/internal/platform/db"
 	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
+	"github.com/shopkeet/api/internal/platform/idempotency"
 	"github.com/shopkeet/api/internal/platform/observe"
+	"github.com/shopkeet/api/internal/platform/queue"
+	"github.com/shopkeet/api/internal/platform/ratelimit"
 	"github.com/shopkeet/api/internal/shipping"
 	"github.com/shopkeet/api/internal/tenants"
 )
@@ -42,6 +49,47 @@ func main() {
 		log.Fatalf("failed to connect to database: %v", err)
 	}
 	defer pool.Close()
+
+	// Phase 14 — Redis-backed reliability layer: the per-route rate limiter
+	// and the Asynq job worker share the same Redis the cart Reserver uses.
+	// Redis is a cache/queue only; Postgres stays the source of truth.
+	// When REDIS_URL is absent, limiting is disabled and the Asynq worker
+	// never starts (the API still serves; it just can't enqueue/dequeue jobs).
+	var rdb *redis.Client
+	var worker *queue.Worker
+	if cfg.RedisURL != "" {
+		ropt, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			log.Fatalf("failed to parse redis url: %v", err)
+		}
+		rdb = redis.NewClient(ropt)
+		defer rdb.Close()
+
+		// Asynq worker: registers the idempotency-key purge (Phase 14) as a
+		// scheduled hourly job, drains Redis-backed job queues in-process.
+		w, err := queue.NewWorker(cfg.RedisURL, 4)
+		if err != nil {
+			log.Fatalf("failed to init asynq worker: %v", err)
+		}
+		worker = w
+		// Purge idempotency rows older than 24h hourly (docs/08-hardening… §14).
+		worker.Register(queue.TaskTypeIdempotencyPurge,
+			purgeIdempotencyHandler(pool))
+		if err := worker.RegisterPeriodic("@every 1h",
+			asynq.NewTask(queue.TaskTypeIdempotencyPurge, nil)); err != nil {
+			log.Fatalf("failed to schedule idempotency purge: %v", err)
+		}
+		worker.Start()
+		log.Printf("redis rate limiting + asynq worker enabled at %s", cfg.RedisURL)
+	}
+	defer func() {
+		if worker != nil {
+			worker.Stop()
+		}
+	}()
+
+	// Rate limiter (nil-safe: disabling when Redis is absent).
+	rl := ratelimit.New(rdb)
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 
@@ -75,7 +123,7 @@ func main() {
 	// New tenants get their storefront chrome (home page post, the required
 	// templates, header/footer sections) inside the signup transaction.
 	auth.RegisterTenantCreatedHook(content.SeedDefaults)
-	auth.RegisterRoutes(v1, pool, cfg.JWTSecret)
+	auth.RegisterRoutes(v1, pool, cfg.JWTSecret, rl)
 
 	// Phase 6 — content & page builder. Placeholder JSON feeds the Puck editor;
 	// onPublish saves the Puck layout verbatim through the admin endpoints.
@@ -98,9 +146,8 @@ func main() {
 		}
 		defer rr.Close()
 		reserver = rr
-		log.Printf("cart unit reservation via Redis at %s", cfg.RedisURL)
 	}
-	cart.RegisterRoutes(v1, pool, cart.New(pool, reserver))
+	cart.RegisterRoutes(v1, pool, cart.New(pool, reserver), rl)
 
 	// Phase 5 — checkout & orders (COD). The payments registry has one provider
 	// (cod); events surface order.created / order.paid for future webhooks.
@@ -114,7 +161,7 @@ func main() {
 		return nil
 	})
 	orders.RegisterRoutes(v1, pool, cfg.JWTSecret,
-		orders.New(pool, bus, payments.NewRegistry()))
+		orders.New(pool, bus, payments.NewRegistry()), rl)
 
 	// Phase 9 — shipping zones/rates. The public GET /shipping/rates feeds the
 	// checkout form; checkout snapshots the resolved rate into the order.
@@ -128,7 +175,7 @@ func main() {
 	// /me group (profile, order history, saved addresses) requires a
 	// customer-scoped JWT. Checkout under CustomerOrGuestMW links orders to the
 	// account when the caller is signed in, and stays fully guest otherwise.
-	customers.RegisterRoutes(v1, pool, cfg.JWTSecret, customers.New(pool, cfg.JWTSecret, bus))
+	customers.RegisterRoutes(v1, pool, cfg.JWTSecret, customers.New(pool, cfg.JWTSecret, bus), rl)
 
 	// Phase 12 — notifications. Subscribe to the internal event bus; sends
 	// order confirmations, delivery updates, and welcome emails. Provider
@@ -188,4 +235,21 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// purgeIdempotencyHandler is the Asynq task for the hourly idempotency-key
+// sweep. It deletes keys older than idempotency.Retention; failures are logged
+// and re-queued by Asynq's retry (MaxRetry set at enqueue time).
+func purgeIdempotencyHandler(pool *pgxpool.Pool) func(context.Context, *asynq.Task) error {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		n, err := idempotency.PurgeExpired(ctx, pool, time.Now().Add(-idempotency.Retention))
+		if err != nil {
+			log.Printf("idempotency purge failed: %v", err)
+			return err
+		}
+		if n > 0 {
+			log.Printf("idempotency purge removed %d expired keys", n)
+		}
+		return nil
+	}
 }

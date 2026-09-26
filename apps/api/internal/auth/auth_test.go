@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/platform/httperr"
+	"github.com/shopkeet/api/internal/platform/ratelimit"
 )
 
 func randSuffix6() string {
@@ -47,7 +48,7 @@ func TestLoginUnderRLS(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	RegisterRoutes(v1, pool, secret)
+	RegisterRoutes(v1, pool, secret, ratelimit.New(nil))
 
 	// do signs up a fresh tenant and returns its subdomain + owner email.
 	do := func(name, subdomain string) (string, string) {

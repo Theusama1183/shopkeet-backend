@@ -25,6 +25,7 @@ import (
 	"github.com/shopkeet/api/internal/payments"
 	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
+	"github.com/shopkeet/api/internal/platform/ratelimit"
 )
 
 type customerPayload struct {
@@ -162,10 +163,10 @@ func TestCustomersRLSIsolation(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}))
+	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	bus := events.NewBus()
-	orders.RegisterRoutes(v1, pool, secret, orders.New(pool, bus, payments.NewRegistry()))
-	customers.RegisterRoutes(v1, pool, secret, customers.New(pool, secret, bus))
+	orders.RegisterRoutes(v1, pool, secret, orders.New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
+	customers.RegisterRoutes(v1, pool, secret, customers.New(pool, secret, bus), ratelimit.New(nil))
 
 	// doTenant issues a request for a given tenant, with optional session and
 	// bearer auth headers.

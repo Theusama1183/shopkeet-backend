@@ -23,6 +23,7 @@ import (
 	"github.com/shopkeet/api/internal/payments"
 	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
+	"github.com/shopkeet/api/internal/platform/ratelimit"
 )
 
 func randSuffix5() string {
@@ -216,8 +217,8 @@ func TestOrdersRLSIsolation(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}))
-	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()))
+	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
 
 	do := func(method, path, session, body string, want int) *http.Response {
 		t.Helper()
@@ -660,8 +661,8 @@ func TestPostDiscountTax(t *testing.T) {
 	bus := events.NewBus()
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}))
-	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()))
+	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
 
 	do := func(method, path, session, body string, want int) *http.Response {
 		t.Helper()

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/platform/httperr"
+	"github.com/shopkeet/api/internal/platform/ratelimit"
 )
 
 // CustomerSessionCookie is the cookie that carries the guest cart session id.
@@ -525,10 +526,28 @@ func CustomerOrGuestMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 // RegisterRoutes mounts the Phase 1 auth surface onto an existing router that
 // already carries the /api/v1 prefix (so later phases can share the group):
 //
-//	POST /api/v1/auth/signup   (public)
-//	POST /api/v1/auth/login    (public)
-func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string) {
+//	POST /api/v1/auth/signup   (public, rate-limited — Phase 14)
+//	POST /api/v1/auth/login    (public, rate-limited — Phase 14)
+//
+// limiter applies per-route Redis limits: login brute-force at 5/15min per
+// IP+email, signup at 10/hour per IP (docs/08-hardening… §14). A nil limiter
+// disables limiting entirely.
+func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, limiter *ratelimit.Limiter) {
 	g := router.Group("/auth")
-	g.Post("/signup", SignupHandler(pool, secret))
-	g.Post("/login", LoginHandler(pool, secret))
+	g.Post("/signup",
+		limiter.Middleware(ratelimit.Entry{
+			Route:   "POST /auth/signup",
+			Limit:   10,
+			Window:  time.Hour,
+			KeyFunc: ratelimit.ByIP(),
+		}),
+		SignupHandler(pool, secret))
+	g.Post("/login",
+		limiter.Middleware(ratelimit.Entry{
+			Route:   "POST /auth/login",
+			Limit:   5,
+			Window:  15 * time.Minute,
+			KeyFunc: ratelimit.ByIPAndBodyField("email"),
+		}),
+		LoginHandler(pool, secret))
 }

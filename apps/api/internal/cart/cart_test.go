@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/platform/httperr"
+	"github.com/shopkeet/api/internal/platform/ratelimit"
 )
 
 func randSuffix4() string {
@@ -119,7 +120,7 @@ func TestCartRLSIsolation(t *testing.T) {
 	_, archV := seedProduct(a.id, "arch", 999, 1, "archived")
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
-	RegisterRoutes(app.Group("/api/v1"), pool, New(pool, NoopReserver{}))
+	RegisterRoutes(app.Group("/api/v1"), pool, New(pool, NoopReserver{}), ratelimit.New(nil))
 
 	type resp struct {
 		httpResp *http.Response

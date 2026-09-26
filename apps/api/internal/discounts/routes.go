@@ -5,6 +5,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/platform/idempotency"
 )
 
 // RegisterRoutes mounts the Phase 10 discounts surface on /api/v1:
@@ -17,10 +18,12 @@ import (
 //
 // The customer-facing POST /cart/discount lives in the cart package (it needs
 // the CustomerMW group); checkout validation lives in internal/orders.
+// POST /discounts is idempotency-guarded (Phase 14) so a retry doesn't create
+// a duplicate discount.
 func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, svc *Service) {
 	g := router.Group("/discounts", auth.TenantMW(pool, secret))
 	g.Get("/", svc.ListDiscounts)
-	g.Post("/", svc.CreateDiscount)
+	g.Post("/", idempotency.Middleware("POST /discounts"), svc.CreateDiscount)
 	g.Get("/:id", svc.GetDiscount)
 	g.Patch("/:id", svc.UpdateDiscount)
 	g.Delete("/:id", svc.DeleteDiscount)
