@@ -23,6 +23,7 @@ import (
 	"github.com/shopkeet/api/internal/orders"
 	"github.com/shopkeet/api/internal/payments"
 	"github.com/shopkeet/api/internal/platform/config"
+	"github.com/shopkeet/api/internal/platform/cache"
 	"github.com/shopkeet/api/internal/platform/db"
 	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
@@ -91,6 +92,13 @@ func main() {
 	// Rate limiter (nil-safe: disabling when Redis is absent).
 	rl := ratelimit.New(rdb)
 
+	// Phase 14 (Redis hot-data layer) — cache-aside for product detail: same
+	// Redis client the limiter holds. cache.Noop{} when REDIS_URL is absent.
+	var cca cache.Cache = cache.Noop{}
+	if rdb != nil {
+		cca = cache.NewRedisClient(rdb)
+	}
+
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 
 	// Phase 7 — observable by default. Panics -> standard 500 error shape,
@@ -132,7 +140,9 @@ func main() {
 	// Phase 3 — catalog. Storefront routes resolve the tenant from the
 	// X-Tenant-ID header (Next.js middleware per docs/03-architecture.md §2);
 	// admin routes use the JWT via TenantMW. RLS scopes everything.
-	catalog.RegisterRoutes(v1, pool, cfg.JWTSecret, catalog.New(pool))
+	catalogSvc := catalog.New(pool)
+	catalogSvc.SetCache(cca)
+	catalog.RegisterRoutes(v1, pool, cfg.JWTSecret, catalogSvc)
 
 	// Phase 4 — guest carts. RLS scopes rows by the tenant resolved from
 	// X-Tenant-ID (auth.CustomerMW); the customer_session (cookie/header) keys
@@ -160,8 +170,10 @@ func main() {
 		log.Printf("event order.paid: %+v", e.Data)
 		return nil
 	})
+	ordersSvc := orders.New(pool, bus, payments.NewRegistry())
+	ordersSvc.SetCache(cca)
 	orders.RegisterRoutes(v1, pool, cfg.JWTSecret,
-		orders.New(pool, bus, payments.NewRegistry()), rl)
+		ordersSvc, rl)
 
 	// Phase 9 — shipping zones/rates. The public GET /shipping/rates feeds the
 	// checkout form; checkout snapshots the resolved rate into the order.

@@ -69,16 +69,21 @@ func nullableWeight(w int) *int {
 // recomputeCache refreshes products.price_cents (MIN active variant price) and
 // products.inventory_count (SUM active variant stock). Called after every
 // variant mutation and on checkout. products.price_cents/inventory_count are
-// cached display values (docs/07-expansion-build-spec.md Phase 8).
-func (s *Service) recomputeCache(ctx context.Context, tx pgx.Tx, productID string) error {
-	_, err := tx.Exec(ctx, `
+// cached display values (docs/07-expansion-build-spec.md Phase 8). It also
+// invalidates the Redis product-detail cache (Phase 14) so public reads
+// repopulate with the refreshed aggregates.
+func (s *Service) recomputeCache(ctx context.Context, tx pgx.Tx, tid, productID string) error {
+	if _, err := tx.Exec(ctx, `
 		UPDATE products p SET
 			price_cents = COALESCE((SELECT MIN(price_cents) FROM product_variants v
 				WHERE v.product_id = p.id AND v.status = 'active'), 0),
 			inventory_count = COALESCE((SELECT SUM(inventory_count) FROM product_variants v
 				WHERE v.product_id = p.id AND v.status = 'active'), 0)
-		WHERE p.id = $1`, productID)
-	return err
+		WHERE p.id = $1`, productID); err != nil {
+		return err
+	}
+	s.invalidateProduct(ctx, tid, productID)
+	return nil
 }
 
 func (s *Service) productExists(ctx *fiber.Ctx, tx pgx.Tx, id string) (bool, error) {
@@ -181,6 +186,7 @@ func (s *Service) CreateOption(c *fiber.Ctx) error {
 		}
 	}
 
+	s.invalidateProduct(ctx, tid, id)
 	return s.respondProduct(c, tx, id)
 }
 
@@ -244,7 +250,7 @@ func (s *Service) CreateVariant(c *fiber.Ctx) error {
 	if err := linkOptionValues(ctx, tx, tid, variantID, req.OptionValueIDs); err != nil {
 		return httperr.ErrInternalServerError
 	}
-	if err := s.recomputeCache(ctx, tx, id); err != nil {
+	if err := s.recomputeCache(ctx, tx, tid, id); err != nil {
 		return httperr.ErrInternalServerError
 	}
 
@@ -332,7 +338,7 @@ func (s *Service) UpdateVariant(c *fiber.Ctx) error {
 		}
 	}
 
-	if err := s.recomputeCache(ctx, tx, productID); err != nil {
+	if err := s.recomputeCache(ctx, tx, tid, productID); err != nil {
 		return httperr.ErrInternalServerError
 	}
 
@@ -386,7 +392,7 @@ func (s *Service) DeleteVariant(c *fiber.Ctx) error {
 		return httperr.ErrInternalServerError
 	}
 
-	if err := s.recomputeCache(ctx, tx, productID); err != nil {
+	if err := s.recomputeCache(ctx, tx, tid, productID); err != nil {
 		return httperr.ErrInternalServerError
 	}
 

@@ -120,6 +120,16 @@
 }
 ```
 
+### Product Detail Cache-aside (Redis) — Phase 14
+
+Public storefront reads of `GET /products/:id` are served from a cache-aside layer (1 min TTL). Admin reads bypass the cache (always fresh); admin writes invalidate the entry for both viewers.
+
+- Keys: `shopkeet:cache:product:{tenant_id}/{product_id}/{viewer}` where viewer ∈ `public|admin`. Entries are never shared between viewers.
+- Read flow (viewer=`public`): cache GET → hit sends raw JSON; miss runs the Postgres detail query and populates the cache before responding.
+- Invalidation on any write that can change the serialized product: `PATCH /products/:id`, `DELETE /products/:id`, `POST|DELETE /products/:id/images`, option/variant create/update/delete (incl. the sole-variant cascade), and the successful checkout aggregate-refresh in `orders`.
+- Fallback: when `REDIS_URL` is unset the app uses an in-memory `Noop` cache — reads always hit Postgres and everything stays correct.
+- Redis also powers cart reservation (`shopkeet:reserve:{variant_id}:{unit_index}`, TTL 15 min) and per-route rate limiting (`shopkeet:rl:{route}:{linger}:{key}`).
+
 ### Tables
 
 - `categories`, `products`, `product_categories`, `product_images`
@@ -615,7 +625,7 @@ Default codes by status:
 | Variable | Required | Phase | Description |
 |----------|----------|-------|-------------|
 | `DATABASE_URL` | Yes | 0 | Postgres as `shopkeet_app` (non-superuser) |
-| `REDIS_URL` | No | 4 | Cart reservation (falls back to NoopReserver) |
+| `REDIS_URL` | No | 4 | Cart reservation + product cache-aside + rate limiting (falls back to Noop: reservation disabled, reads always fresh, limits in-memory) |
 | `JWT_SECRET` | Yes | 1 | HS256 signing key |
 | `PORT` | No (3001) | 0 | HTTP port |
 | `APP_BASE_DOMAIN` | No | 1 | Tenant subdomain base (e.g. `shopkeet.com`) |
@@ -736,6 +746,11 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestShippingRLSIsolation` | `internal/shipping` | 9 |
 | `TestDiscountsAcceptance` | `internal/discounts` | 10 |
 | `TestCustomersRLSIsolation` | `internal/customers` | 11 |
+| `TestIdempotencyReplay` | `internal/platform/idempotency` | 14 |
+| `TestIdempotencyPurgeExpired` | `internal/platform/idempotency` | 14 |
+| `TestRateLimitWindow` | `internal/platform/ratelimit` | 14 |
+| `TestRedisSetGetRoundTrip`, `TestRedisDelPrefix`, `TestInvalidateProduct` | `internal/platform/cache` | 14 |
+| `TestProductCacheAside` | `internal/catalog` | 14 |
 
 Run:  
 ```bash
@@ -748,7 +763,7 @@ go test -count=1 ./...
 
 ## Deferred / Not Yet Built
 
-- Redis read-through cache for hot public reads (catalog, shipping rates)
+- Redis read-through cache for shipping rates (product/catalog cache-aside ships in Phase 14)
 - Webhooks / developer marketplace (`/webhooks/*`)
 - Public GraphQL/REST developer API
 - Online payments beyond COD

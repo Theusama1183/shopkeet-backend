@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/shopkeet/api/internal/platform/cache"
 	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
@@ -20,12 +22,34 @@ import (
 // request transaction TenantMW/PublicTenantMW opened (c.Locals("tx")), so RLS
 // scopes every query to the resolved tenant.
 type Service struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	cache cache.Cache
 }
 
-// New builds a catalog Service.
+// New builds a catalog Service with caching disabled until SetCache is called.
 func New(pool *pgxpool.Pool) *Service {
-	return &Service{pool: pool}
+	return &Service{pool: pool, cache: cache.Noop{}}
+}
+
+// SetCache enables cache-aside for product detail reads (Phase 14 / Redis
+// hot-data layer). Pass cache.Nop{} (or never call it) to keep reads 100% on
+// Postgres. Every entry is tenant-scoped and reconstructable, exactly as the
+// "Redis is a cache/queue layer only" rule requires.
+func (s *Service) SetCache(c cache.Cache) {
+	if c != nil {
+		s.cache = c
+	}
+}
+
+// ProductCacheTTL bounds how long a cached product detail may serve before the
+// stored inventory display goes stale even if an invalidation was missed.
+const ProductCacheTTL = time.Minute
+
+// invalidateProduct drops a product's cached detail entries. Safe to call even
+// if the entry never existed or the surrounding tx later rolls back (falling
+// back to Postgres is always correct — the next read simply repopulates).
+func (s *Service) invalidateProduct(ctx context.Context, tid, productID string) {
+	cache.InvalidateProduct(ctx, s.cache, tid, productID)
 }
 
 // --- helpers ------------------------------------------------------------------
@@ -558,23 +582,44 @@ func (s *Service) ListProducts(c *fiber.Ctx) error {
 }
 
 // GetProduct handles GET /products/:id (public: active only; admin: any status).
+// Cache-aside (Phase 14, Redis hot-data layer): public/active reads are cached
+// per tenant+product for a minute; a miss loads from Postgres and repopulates.
+// Admin reads bypass the shared cache (they see drafts) but invalidate it.
 func (s *Service) GetProduct(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
 		return httperr.ErrInternalServerError
 	}
-	where := "p.id = $1"
+	id := c.Params("id")
+	tid := tenantID(c)
+	viewer := "admin"
 	if !isAdmin(c) {
+		viewer = "public"
+	}
+
+	if viewer == "public" {
+		key := cache.ProductKey(tid, id, "public")
+		if b, hit := s.cache.Get(c.Context(), key); hit {
+			return c.Status(fiber.StatusOK).Type("json").Send(b)
+		}
+	}
+
+	where := "p.id = $1"
+	if viewer == "public" {
 		where += " AND p.status = 'active'"
 	}
-	p, err := s.queryProduct(c, tx, where, c.Params("id"))
+	p, err := s.queryProduct(c, tx, where, id)
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
 	if p == nil {
 		return httperr.C(fiber.StatusNotFound, "product not found")
 	}
-	return c.JSON(productJSON(p))
+	body, _ := json.Marshal(productJSON(p))
+	if viewer == "public" {
+		s.cache.Set(c.Context(), cache.ProductKey(tid, id, "public"), body, ProductCacheTTL)
+	}
+	return c.Status(fiber.StatusOK).Type("json").Send(body)
 }
 
 // UpdateProduct handles PATCH /products/:id (admin).
@@ -593,6 +638,11 @@ func (s *Service) UpdateProduct(c *fiber.Ctx) error {
 	ctx := c.Context()
 	id := c.Params("id")
 	tid := tenantID(c)
+
+	// Invalidate any cached detail before touching the row: even if this patch
+	// applies nothing or 404s (deleted product), a stale storefront copy must
+	// not outlive the attempt. Safe when the entry never existed.
+	s.invalidateProduct(ctx, tid, id)
 
 	// Ensure the product exists under this tenant before patching.
 	if err := tx.QueryRow(ctx,
@@ -725,6 +775,7 @@ func (s *Service) DeleteProduct(c *fiber.Ctx) error {
 	}
 	ctx := c.Context()
 	id := c.Params("id")
+	tid := tenantID(c)
 
 	var exists bool
 	err := tx.QueryRow(ctx, "SELECT true FROM products WHERE id = $1", id).Scan(&exists)
@@ -765,6 +816,7 @@ func (s *Service) DeleteProduct(c *fiber.Ctx) error {
 		}
 		return httperr.ErrInternalServerError
 	}
+	s.invalidateProduct(ctx, tid, id)
 	return c.JSON(fiber.Map{"deleted": id})
 }
 
@@ -814,6 +866,7 @@ func (s *Service) AddImage(c *fiber.Ctx) error {
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
+	s.invalidateProduct(ctx, tid, id)
 	return c.JSON(productJSON(p))
 }
 
@@ -833,6 +886,7 @@ func (s *Service) RemoveImage(c *fiber.Ctx) error {
 	if tag.RowsAffected() == 0 {
 		return httperr.C(fiber.StatusNotFound, "image not found")
 	}
+	s.invalidateProduct(ctx, tenantID(c), c.Params("id"))
 	return c.JSON(fiber.Map{"deleted": c.Params("imageId")})
 }
 

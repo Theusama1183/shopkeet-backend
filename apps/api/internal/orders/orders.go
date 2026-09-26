@@ -12,6 +12,7 @@ import (
 	"github.com/shopkeet/api/internal/auth"
 	"github.com/shopkeet/api/internal/discounts"
 	"github.com/shopkeet/api/internal/payments"
+	"github.com/shopkeet/api/internal/platform/cache"
 	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
 	"github.com/shopkeet/api/internal/shipping"
@@ -25,12 +26,24 @@ type Service struct {
 	pool     *pgxpool.Pool
 	bus      *events.Bus
 	payments *payments.Registry
+	cache    cache.Cache
 }
 
 // New builds an orders Service. The event bus receives order.created /
 // order.paid; the registry holds the payment providers (v1: cod only).
+// Caching is disabled until SetCache is called.
 func New(pool *pgxpool.Pool, bus *events.Bus, reg *payments.Registry) *Service {
-	return &Service{pool: pool, bus: bus, payments: reg}
+	return &Service{pool: pool, bus: bus, payments: reg, cache: cache.Noop{}}
+}
+
+// SetCache enables product-detail cache invalidation after checkout: the
+// inventory decrement refreshes product_variants and the products aggregates,
+// so any cached public product JSON (which embeds inventory_count) must be
+// dropped for the affected product.
+func (s *Service) SetCache(c cache.Cache) {
+	if c != nil {
+		s.cache = c
+	}
 }
 
 // --- helpers ------------------------------------------------------------------
@@ -376,7 +389,8 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		}
 	}
 	// Refresh the cached products.price_cents / products.inventory_count
-	// aggregates after the variant decrements.
+	// aggregates after the variant decrements, and drop the Redis product
+	// detail cache so the public storefront repopulates with fresh stock.
 	for _, l := range lines {
 		if _, err := tx.Exec(ctx, `
 			UPDATE products p SET
@@ -387,6 +401,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 			WHERE p.id = $1`, l.productID); err != nil {
 			return httperr.ErrInternalServerError
 		}
+		cache.InvalidateProduct(ctx, s.cache, tid, l.productID)
 	}
 	if _, err := tx.Exec(ctx,
 		"DELETE FROM cart_items WHERE cart_id = $1", cartID); err != nil {
