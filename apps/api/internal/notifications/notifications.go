@@ -70,11 +70,18 @@ func (p *ResendProvider) Send(ctx context.Context, n Notification) error {
 	if n.Recipient == "" {
 		return fmt.Errorf("empty recipient")
 	}
+	// Resend only sends from a verified domain, so the From must always come
+	// from NOTIFICATIONS_FROM_EMAIL (p.from), never from Notification.From —
+	// per-store subdomains like <store>.shopkeet.com can't be in the From. The
+	// per-store support address still lands in Reply-To, which may be any domain.
 	body := map[string]string{
 		"from":    p.from,
 		"to":      n.Recipient,
 		"subject": n.Subject,
 		"html":    n.Body,
+	}
+	if n.ReplyTo != "" {
+		body["reply_to"] = n.ReplyTo
 	}
 	bodyBytes, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.resend.com/emails", bytes.NewReader(bodyBytes))
