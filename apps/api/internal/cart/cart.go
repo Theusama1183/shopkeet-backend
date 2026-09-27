@@ -1,7 +1,9 @@
 package cart
 
 import (
+	"context"
 	"errors"
+	"regexp"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
@@ -11,6 +13,10 @@ import (
 	"github.com/shopkeet/api/internal/discounts"
 	"github.com/shopkeet/api/internal/platform/httperr"
 )
+
+// emailRe is a deliberately permissive email shape for recovery capture — the
+// provider does the strict validation at send time.
+var emailRe = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
 
 // Service implements the guest cart surface. Handlers read/write through the
 // request transaction CustomerMW opened (c.Locals("tx")), so RLS scopes every
@@ -57,6 +63,7 @@ type cartPayload struct {
 	currency      string
 	discountCode  string
 	discountCents int
+	email         string
 }
 
 // loadCart returns the customer's cart with its items (product info joined in)
@@ -65,10 +72,10 @@ type cartPayload struct {
 // when the session has no cart yet.
 func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 	ctx := c.Context()
-	var cartID, discountCode string
+	var cartID, discountCode, email string
 	err := tx.QueryRow(ctx,
-		"SELECT id, COALESCE(discount_code, '') FROM carts WHERE customer_session = $1",
-		session).Scan(&cartID, &discountCode)
+		"SELECT id, COALESCE(discount_code, ''), COALESCE(customer_email, '') FROM carts WHERE customer_session = $1",
+		session).Scan(&cartID, &discountCode, &email)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -105,6 +112,7 @@ func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 		return nil, err
 	}
 	cp.discountCode = discountCode
+	cp.email = email
 	if discountCode != "" {
 		if q, err := discounts.Resolve(ctx, tx, discountCode, cp.total); err == nil {
 			cp.discountCents = q.DiscountCents
@@ -138,6 +146,7 @@ func cartJSON(cp *cartPayload) fiber.Map {
 		"currency":       cp.currency,
 		"discount_code":  cp.discountCode,
 		"discount_cents": cp.discountCents,
+		"email":          cp.email,
 	}}
 }
 
@@ -223,6 +232,13 @@ func (s *Service) AddItem(c *fiber.Ctx) error {
 	// Fast-path reservation; never fails the request (checkout is authoritative).
 	_ = s.reserver.ReserveUnits(ctx, req.VariantID, req.Quantity)
 
+	// Phase 17 — cart activity: an add-to-cart is a sign of intent; refresh the
+	// recovery clock so the abandoned-cart sweep starts over for active carts.
+	if _, err := tx.Exec(ctx,
+		"UPDATE carts SET last_activity_at = now() WHERE customer_session = $1", session); err != nil {
+		return httperr.ErrInternalServerError
+	}
+
 	cp, err := loadCart(c, tx, session)
 	if err != nil {
 		return httperr.ErrInternalServerError
@@ -258,6 +274,11 @@ func (s *Service) UpdateItemQuantity(c *fiber.Ctx) error {
 	if tag.RowsAffected() == 0 {
 		return httperr.C(fiber.StatusNotFound, "cart item not found")
 	}
+	if _, err := tx.Exec(c.Context(),
+		"UPDATE carts SET last_activity_at = now() WHERE customer_session = $1",
+		customerSession(c)); err != nil {
+		return httperr.ErrInternalServerError
+	}
 	cp, err := loadCart(c, tx, customerSession(c))
 	if err != nil {
 		return httperr.ErrInternalServerError
@@ -281,6 +302,11 @@ func (s *Service) RemoveItem(c *fiber.Ctx) error {
 	}
 	if tag.RowsAffected() == 0 {
 		return httperr.C(fiber.StatusNotFound, "cart item not found")
+	}
+	if _, err := tx.Exec(c.Context(),
+		"UPDATE carts SET last_activity_at = now() WHERE customer_session = $1",
+		customerSession(c)); err != nil {
+		return httperr.ErrInternalServerError
 	}
 	cp, err := loadCart(c, tx, customerSession(c))
 	if err != nil {
@@ -336,7 +362,8 @@ func (s *Service) ApplyDiscount(c *fiber.Ctx) error {
 		return httperr.ErrInternalServerError
 	}
 	if _, err := tx.Exec(ctx,
-		"UPDATE carts SET discount_code = $1 WHERE customer_session = $2", code, session); err != nil {
+		"UPDATE carts SET discount_code = $1, last_activity_at = now() WHERE customer_session = $2",
+		code, session); err != nil {
 		return httperr.ErrInternalServerError
 	}
 	cp, err = loadCart(c, tx, session)
@@ -354,4 +381,139 @@ func translateDiscountErr(err error) error {
 		return httperr.C(ce.Status, ce.Message)
 	}
 	return httperr.ErrInternalServerError
+}
+
+type emailRequest struct {
+	Email string `json:"email"`
+}
+
+// CaptureEmail handles POST /cart/email (Customer, Phase 17). The storefront
+// collects an optional email before checkout; it is stored on the cart and
+// powers the abandoned-cart recovery job. Idempotent by construction — the
+// value is simply upserted, so retries never double-side-effect.
+func (s *Service) CaptureEmail(c *fiber.Ctx) error {
+	var req emailRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
+	}
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	if email == "" || !emailRe.MatchString(email) || len(email) > 320 {
+		return httperr.C(fiber.StatusBadRequest, "valid email required")
+	}
+	tx, ok := txFrom(c)
+	if !ok {
+		return httperr.ErrInternalServerError
+	}
+	ctx := c.Context()
+	tid, _ := c.Locals("tenant_id").(string)
+	session := customerSession(c)
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO carts (tenant_id, customer_session, customer_email)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (tenant_id, customer_session) DO NOTHING`, tid, session, email); err != nil {
+		return httperr.ErrInternalServerError
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE carts SET customer_email = $1, last_activity_at = now()
+		WHERE customer_session = $2`, email, session); err != nil {
+		return httperr.ErrInternalServerError
+	}
+	cp, err := loadCart(c, tx, session)
+	if err != nil {
+		return httperr.ErrInternalServerError
+	}
+	return c.JSON(cartJSON(cp))
+}
+
+// --- Phase 17: abandoned-cart sweep -------------------------------------------
+
+// SweepAbandonedCarts runs the hourly recovery job body. For every tenant it
+// finds carts that have sat idle (>1h), carry a captured email, have no
+// recovery email yet, and still hold items, then invokes send exactly once per
+// qualifying cart and stamps recovery_sent_at so the sweep is idempotent.
+// "Converted" carts — a cart whose owner checked out — are never candidates
+// structurally: checkout deletes the cart and its items in the order
+// transaction (orders.go), so they no longer exist to be swept.
+func SweepAbandonedCarts(ctx context.Context, pool *pgxpool.Pool,
+	send func(ctx context.Context, tenantID, cartID string) error) (int, error) {
+
+	tenantRows, err := pool.Query(ctx, "SELECT id FROM tenants ORDER BY id")
+	if err != nil {
+		return 0, err
+	}
+	var tenantIDs []string
+	for tenantRows.Next() {
+		var id string
+		if err := tenantRows.Scan(&id); err != nil {
+			tenantRows.Close()
+			return 0, err
+		}
+		tenantIDs = append(tenantIDs, id)
+	}
+	tenantRows.Close()
+	if err := tenantRows.Err(); err != nil {
+		return 0, err
+	}
+
+	emailed := 0
+	for _, tid := range tenantIDs {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return emailed, err
+		}
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			tx.Rollback(ctx)
+			return emailed, err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id FROM carts
+			WHERE customer_email IS NOT NULL
+			  AND recovery_sent_at IS NULL
+			  AND last_activity_at < now() - interval '1 hour'
+			  AND EXISTS (SELECT 1 FROM cart_items ci WHERE ci.cart_id = carts.id)
+			ORDER BY last_activity_at`)
+		if err != nil {
+			tx.Rollback(ctx)
+			return emailed, err
+		}
+		var candidates []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				tx.Rollback(ctx)
+				return emailed, err
+			}
+			candidates = append(candidates, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			tx.Rollback(ctx)
+			return emailed, err
+		}
+
+		for _, cartID := range candidates {
+			// Send outside the marking update so a slow provider call never
+			// holds the transaction open; notify failures don't abort the
+			// sweep (matching the checkout rule: a failed send must never
+			// fail the work that produced the event).
+			if err := send(ctx, tid, cartID); err != nil {
+				continue
+			}
+			emailed++
+		}
+		for _, cartID := range candidates {
+			if _, err := tx.Exec(ctx,
+				"UPDATE carts SET recovery_sent_at = now() WHERE id = $1", cartID); err != nil {
+				tx.Rollback(ctx)
+				return emailed, err
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return emailed, err
+		}
+	}
+	return emailed, nil
 }

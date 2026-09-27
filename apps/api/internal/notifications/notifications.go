@@ -314,6 +314,123 @@ func (s *Service) deliverWelcome(ctx context.Context, tenantID, email string) {
 	}
 }
 
+// SendCartAbandoned is the Phase 17 recovery email (Klaviyo replacement). It is
+// invoked by the hourly abandonment sweep; it renders the cart contents, sends
+// via the provider, and records a notification_log row. A failed send logs a
+// 'failed' row and returns nil — the sweep always stamps recovery_sent_at so a
+// cart is never emailed twice, matching the "failed send must never fail the
+// work that produced the event" rule.
+func (s *Service) SendCartAbandoned(ctx context.Context, tenantID, cartID string) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		log.Printf("[notifications] begin failed: %v", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		"SELECT set_config('app.current_tenant', $1, true)", tenantID); err != nil {
+		log.Printf("[notifications] set tenant failed: %v", err)
+		return
+	}
+
+	var email string
+	if err := tx.QueryRow(ctx,
+		"SELECT customer_email FROM carts WHERE id = $1", cartID).Scan(&email); err != nil {
+		log.Printf("[notifications] load cart %s failed: %v", cartID, err)
+		return
+	}
+	if email == "" {
+		return
+	}
+
+	type line struct {
+		name     string
+		qty      int
+		price    int
+		currency string
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT p.name, ci.quantity, v.price_cents, p.currency
+		FROM cart_items ci
+		JOIN products p ON p.id = ci.product_id
+		JOIN product_variants v ON v.id = ci.variant_id
+		WHERE ci.cart_id = $1
+		ORDER BY p.name`, cartID)
+	if err != nil {
+		log.Printf("[notifications] load cart items %s failed: %v", cartID, err)
+		return
+	}
+	var lines []line
+	total := 0
+	currency := "usd"
+	for rows.Next() {
+		var l line
+		if err := rows.Scan(&l.name, &l.qty, &l.price, &l.currency); err != nil {
+			rows.Close()
+			log.Printf("[notifications] scan cart item failed: %v", err)
+			return
+		}
+		lines = append(lines, l)
+		total += l.qty * l.price
+		currency = l.currency
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		log.Printf("[notifications] cart items rows failed: %v", err)
+		return
+	}
+	if len(lines) == 0 {
+		return
+	}
+
+	var storeName, storeSubdomain string
+	_ = tx.QueryRow(ctx, `SELECT name, subdomain FROM tenants WHERE id = $1`, tenantID).Scan(&storeName, &storeSubdomain)
+	if storeName == "" {
+		storeName = "Shopkeet"
+	}
+
+	from := fmt.Sprintf("%s via Shopkeet <no-reply@%s>", storeName, s.storeHost(storeSubdomain))
+	replyTo := fmt.Sprintf("support@%s", s.storeHost(storeSubdomain))
+	cartURL := fmt.Sprintf("https://%s/cart", s.storeHost(storeSubdomain))
+
+	var itemsHTML string
+	for _, l := range lines {
+		itemsHTML += fmt.Sprintf("<li>%dx %s — %d %s</li>", l.qty, l.name, l.qty*l.price, l.currency)
+	}
+	subject := fmt.Sprintf("Your cart is waiting at %s", storeName)
+	html := fmt.Sprintf(
+		"<p>Hi,</p><p>You left a few things in your cart at <strong>%s</strong>. They're saved — ready to finish when you are.</p><ul>%s</ul><p><strong>Total: %d %s</strong></p><p><a href=\"%s\">Return to your cart</a></p>",
+		storeName, itemsHTML, total, currency, cartURL)
+
+	status := "sent"
+	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := s.prov.Send(sendCtx, Notification{
+		TenantID:  tenantID,
+		Type:      "cart_abandoned",
+		Recipient: email,
+		From:      from,
+		ReplyTo:   replyTo,
+		Subject:   subject,
+		Body:      html,
+	}); err != nil {
+		status = "failed"
+		log.Printf("[notifications] cart_abandoned send failed for cart %s: %v", cartID, err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO notification_log (tenant_id, notification_type, recipient, order_id, status)
+		VALUES ($1, 'cart_abandoned', $2, NULL, $3)`, tenantID, email, status); err != nil {
+		log.Printf("[notifications] log insert failed: %v", err)
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("[notifications] commit failed: %v", err)
+	}
+}
+
 // storeHost builds the public host for a tenant storefront: <sub>.<base>. The
 // notify code uses it for per-store From/Reply-To addresses (like Shopify's
 // <store>.myshopify.com mail identities).

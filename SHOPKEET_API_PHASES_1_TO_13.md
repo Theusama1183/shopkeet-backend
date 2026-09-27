@@ -602,6 +602,51 @@ review and recomputes back. Rejected reviews never affect the aggregate.
 
 ---
 
+## Abandoned Cart Recovery & Lifecycle Emails (Phase 17)
+
+Klaviyo replacement: an hourly job emails shoppers who left a cart idle (>1h)
+with a captured email and no order yet — exactly once per cart.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/cart/email` | Customer (guest session) | Capture the shopper's email for recovery. `{email}` validated; upserts `carts.customer_email` idempotently, echoes the cart with `email` set. |
+
+Every cart mutation refreshes `carts.last_activity_at` (add, patch, delete,
+discount, email capture) so an active shopper is never flagged. The scheduled
+task `cart:abandonment` (Asynq, `@every 1h`, Phase 14 worker) scans per tenant:
+
+```sql
+-- candidate: has an email, not yet recovered, idle >1h, still has items
+SELECT id FROM carts
+WHERE customer_email IS NOT NULL
+  AND recovery_sent_at IS NULL
+  AND last_activity_at < now() - interval '1 hour'
+  AND EXISTS (SELECT 1 FROM cart_items ci WHERE ci.cart_id = carts.id);
+```
+
+Each candidate gets one `cart_abandoned` email (via the Phase 12 provider —
+Resend live) with the item list + total + a return-to-cart link, logged in
+`notification_log` (`order_id NULL`), then `recovery_sent_at` is stamped so a
+second sweep never emails the same cart. A **converted** cart is never a
+candidate: checkout deletes the cart + items transactionally (orders.go), so
+once an order exists the cart is gone. A cart converts *before* the hour is up
+the same way (deleted at checkout) — structurally immune.
+
+```sql
+-- Phase 17
+carts              + customer_email TEXT, last_activity_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                     recovery_sent_at TIMESTAMPTZ
+-- index (partial, candidate scan): (tenant_id, last_activity_at) WHERE customer_email IS NOT NULL
+--   AND recovery_sent_at IS NULL
+notification_log   + type 'cart_abandoned' (order_id NULL)
+```
+
+Delivery lifecycles (order shipped/delivered, etc.) beyond the recovery email
+remain covered by the Phase 12 order notifications — the recovery sweep is the
+only scheduled lifecycle email in v1.
+
+---
+
 ## Database Schema Summary (All Phases)
 
 ```sql
@@ -664,6 +709,14 @@ notification_log
 -- orders: source TEXT NOT NULL DEFAULT 'storefront' ('storefront' | 'draft')
 returns
 return_items
+
+-- Phase 16
+product_reviews
+-- products: rating_average NUMERIC(2,1) DEFAULT 0, rating_count INTEGER DEFAULT 0
+
+-- Phase 17
+-- carts: customer_email TEXT, last_activity_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+--        recovery_sent_at TIMESTAMPTZ
 ```
 
 **Every tenant-scoped table has:**
@@ -837,6 +890,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 16 | 14 | ✓ | Idempotency |
 | 17 | 15 | ✓ | Merchant Operations: `orders.source` + `returns` + `return_items` |
 | 18 | 16 | ✓ | Product Reviews: `product_reviews` + `products.rating_average/rating_count` |
+| 19 | 17 | | Abandoned Cart Recovery: `carts.customer_email` + `last_activity_at` + `recovery_sent_at` (+ partial scan index) |
 
 ---
 
@@ -866,6 +920,8 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestReturnRestocksCorrectVariant` | `internal/orders` | 15 |
 | `TestReviewLifecycleAndVerified` | `internal/reviews` | 16 |
 | `TestRejectAndDeleteRecompute` | `internal/reviews` | 16 |
+| `TestCartRecoverySweep` | `internal/cart` | 17 |
+| `TestSendCartAbandoned` | `internal/notifications` | 17 |
 
 Run:  
 ```bash
@@ -884,7 +940,7 @@ go test -count=1 ./...
 - Online payments beyond COD
 - Post/template revision history
 - Blog archive, search-results, announcement-bar templates
-- Reviews, wishlists, abandoned-cart recovery
+- Wishlists
 - Analytics dashboard
 - Granular staff permissions beyond `owner`/`staff`
 - Refund tracking

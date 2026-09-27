@@ -32,4 +32,5 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, svc *Service, limit
 		svc.ApplyDiscount)
 	g.Patch("/items/:id", svc.UpdateItemQuantity)
 	g.Delete("/items/:id", svc.RemoveItem)
+	g.Post("/email", svc.CaptureEmail)
 }

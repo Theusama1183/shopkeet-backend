@@ -18,6 +18,11 @@ const (
 	// middleware claims keys for 30 min (request_in_progress), keeps the
 	// response for 24h, and this job sweeps the rest.
 	TaskTypeIdempotencyPurge = "idempotency:purge"
+
+	// TaskTypeCartAbandonment (Phase 17) checks every tenant for carts that sat
+	// idle >1h with a captured email and no order yet, and sends exactly one
+	// recovery email per cart. Scheduled hourly via RegisterPeriodic.
+	TaskTypeCartAbandonment = "cart:abandonment"
 )
 
 // ClientOpts converts a redis:// URL into the options both the enqueuer

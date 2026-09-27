@@ -52,6 +52,35 @@ func main() {
 	}
 	defer pool.Close()
 
+	// Phase 12 — notifications provider, built before the Redis block so the
+	// hourly abandoned-cart sweep (Phase 17) can reuse it for the recovery
+	// email. Priority: SMTP (SMTP_HOST) > Resend (RESEND_API_KEY) > log. A
+	// failed send never fails the work that produced the event.
+	var notifProv notifications.Provider = notifications.LogProvider{}
+	fromEmail := cfg.SMTPFromEmail
+	if fromEmail == "" {
+		fromEmail = cfg.NotificationsFromEmail
+	}
+	switch {
+	case cfg.SMTPHost != "":
+		notifProv = notifications.NewSMTPProvider(notifications.SMTPConfig{
+			Host:       cfg.SMTPHost,
+			Port:       cfg.SMTPPort,
+			Username:   cfg.SMTPUsername,
+			Password:   cfg.SMTPPassword,
+			From:       fromEmail,
+			TLSMode:    cfg.SMTPTLSMode,
+			SkipVerify: !cfg.SMTPTLSVerify,
+		})
+		log.Printf("notifications: using SMTP provider at %s:%s (tls=%s)", cfg.SMTPHost, orDefault(cfg.SMTPPort, "587"), orDefault(cfg.SMTPTLSMode, "auto"))
+	case cfg.ResendAPIKey != "" && cfg.NotificationsFromEmail != "":
+		notifProv = notifications.NewResendProvider(cfg.ResendAPIKey, cfg.NotificationsFromEmail)
+		log.Printf("notifications: using Resend provider")
+	default:
+		log.Printf("notifications: using log provider (set SMTP_HOST or RESEND_API_KEY + NOTIFICATIONS_FROM_EMAIL to enable email)")
+	}
+	notifSvc := notifications.New(pool, notifProv, cfg.AppBaseDomain)
+
 	// Phase 14 — Redis-backed reliability layer: the per-route rate limiter
 	// and the Asynq job worker share the same Redis the cart Reserver uses.
 	// Redis is a cache/queue only; Postgres stays the source of truth.
@@ -80,6 +109,15 @@ func main() {
 		if err := worker.RegisterPeriodic("@every 1h",
 			asynq.NewTask(queue.TaskTypeIdempotencyPurge, nil)); err != nil {
 			log.Fatalf("failed to schedule idempotency purge: %v", err)
+		}
+		// Phase 17 — abandoned-cart recovery (Klaviyo replacement): hourly scan
+		// for idle carts with a captured email and no order; mails each once via
+		// the notifications provider and stamps recovery_sent_at.
+		worker.Register(queue.TaskTypeCartAbandonment,
+			cartAbandonmentHandler(pool, notifSvc))
+		if err := worker.RegisterPeriodic("@every 1h",
+			asynq.NewTask(queue.TaskTypeCartAbandonment, nil)); err != nil {
+			log.Fatalf("failed to schedule cart abandonment sweep: %v", err)
 		}
 		worker.Start()
 		log.Printf("redis rate limiting + asynq worker enabled at %s", cfg.RedisURL)
@@ -198,34 +236,10 @@ func main() {
 	// account when the caller is signed in, and stays fully guest otherwise.
 	customers.RegisterRoutes(v1, pool, cfg.JWTSecret, customers.New(pool, cfg.JWTSecret, bus), rl)
 
-	// Phase 12 — notifications. Subscribe to the internal event bus; sends
-	// order confirmations, delivery updates, and welcome emails. Provider
-	// priority: SMTP (when SMTP_HOST is set) > Resend (when RESEND_API_KEY is
-	// set) > log-to-stdout. A failed send never fails checkout.
-	var notifProv notifications.Provider = notifications.LogProvider{}
-	fromEmail := cfg.SMTPFromEmail
-	if fromEmail == "" {
-		fromEmail = cfg.NotificationsFromEmail
-	}
-	switch {
-	case cfg.SMTPHost != "":
-		notifProv = notifications.NewSMTPProvider(notifications.SMTPConfig{
-			Host:       cfg.SMTPHost,
-			Port:       cfg.SMTPPort,
-			Username:   cfg.SMTPUsername,
-			Password:   cfg.SMTPPassword,
-			From:       fromEmail,
-			TLSMode:    cfg.SMTPTLSMode,
-			SkipVerify: !cfg.SMTPTLSVerify,
-		})
-		log.Printf("notifications: using SMTP provider at %s:%s (tls=%s)", cfg.SMTPHost, orDefault(cfg.SMTPPort, "587"), orDefault(cfg.SMTPTLSMode, "auto"))
-	case cfg.ResendAPIKey != "" && cfg.NotificationsFromEmail != "":
-		notifProv = notifications.NewResendProvider(cfg.ResendAPIKey, cfg.NotificationsFromEmail)
-		log.Printf("notifications: using Resend provider")
-	default:
-		log.Printf("notifications: using log provider (set SMTP_HOST or RESEND_API_KEY + NOTIFICATIONS_FROM_EMAIL to enable email)")
-	}
-	notifSvc := notifications.New(pool, notifProv, cfg.AppBaseDomain)
+	// Phase 12 — notifications. The provider + service were constructed before
+	// the Redis block (the abandoned-cart sweep reuses them). Here we wire the
+	// event-bus subscribers and mount the notification-log routes. A failed
+	// send never fails checkout.
 	notifSvc.Subscribe(bus)
 	notifications.RegisterRoutes(v1, pool, cfg.JWTSecret)
 
@@ -270,6 +284,28 @@ func purgeIdempotencyHandler(pool *pgxpool.Pool) func(context.Context, *asynq.Ta
 		}
 		if n > 0 {
 			log.Printf("idempotency purge removed %d expired keys", n)
+		}
+		return nil
+	}
+}
+
+// cartAbandonmentHandler is the Asynq task for the hourly abandoned-cart sweep
+// (Phase 17). The cart package owns the candidate selection; the notifications
+// service renders + sends each recovery email. Send failures never fail the
+// sweep — the sweep stamps recovery_sent_at either way, so a cart is emailed
+// at most once.
+func cartAbandonmentHandler(pool *pgxpool.Pool, notifSvc *notifications.Service) func(context.Context, *asynq.Task) error {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		n, err := cart.SweepAbandonedCarts(ctx, pool, func(c context.Context, tenantID, cartID string) error {
+			notifSvc.SendCartAbandoned(c, tenantID, cartID)
+			return nil
+		})
+		if err != nil {
+			log.Printf("cart abandonment sweep failed: %v", err)
+			return err
+		}
+		if n > 0 {
+			log.Printf("cart abandonment sweep emailed %d carts", n)
 		}
 		return nil
 	}
