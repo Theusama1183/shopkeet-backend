@@ -88,6 +88,7 @@ type orderRow struct {
 	paymentMethod     string
 	paymentStatus     string
 	status            string
+	source            string // 'storefront' (checkout) | 'draft' (merchant-created, Phase 15)
 	totalCents        int
 	currency          string
 	createdAt         time.Time
@@ -100,7 +101,7 @@ const orderSelect = `
 	       shipping_postal_code, shipping_country, shipping_method, shipping_cost_cents,
 	       discount_code, discount_cents,
 	       tax_cents, internal_note,
-	       payment_method, payment_status, status, total_cents, currency, created_at
+	       payment_method, payment_status, status, source, total_cents, currency, created_at
 	FROM orders`
 
 // loadOrder hydrates one order plus its items.
@@ -112,7 +113,7 @@ func loadOrder(c *fiber.Ctx, tx pgx.Tx, where string, args ...any) (*orderRow, e
 			&o.line1, &o.line2, &o.city, &o.state, &o.postalCode, &o.country,
 			&o.shippingMethod, &o.shippingCostCents, &o.discountCode, &o.discountCents,
 			&o.taxCents, &o.internalNote,
-			&o.paymentMethod, &o.paymentStatus, &o.status, &o.totalCents, &o.currency, &o.createdAt)
+			&o.paymentMethod, &o.paymentStatus, &o.status, &o.source, &o.totalCents, &o.currency, &o.createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -170,7 +171,7 @@ func orderJSON(o *orderRow, includeInternalNote bool) fiber.Map {
 		"discount_code": strp(o.discountCode), "discount_cents": o.discountCents,
 		"tax_cents":      o.taxCents,
 		"payment_method": o.paymentMethod, "payment_status": o.paymentStatus,
-		"status": o.status, "total_cents": o.totalCents, "currency": o.currency,
+		"status": o.status, "source": o.source, "total_cents": o.totalCents, "currency": o.currency,
 		"created_at": o.createdAt.Format(time.RFC3339), "items": items,
 	}
 	if includeInternalNote {
@@ -496,7 +497,7 @@ func (s *Service) ListOrders(c *fiber.Ctx) error {
 			&o.line1, &o.line2, &o.city, &o.state, &o.postalCode, &o.country,
 			&o.shippingMethod, &o.shippingCostCents, &o.discountCode, &o.discountCents,
 			&o.taxCents, &o.internalNote,
-			&o.paymentMethod, &o.paymentStatus, &o.status, &o.totalCents, &o.currency, &o.createdAt); err != nil {
+			&o.paymentMethod, &o.paymentStatus, &o.status, &o.source, &o.totalCents, &o.currency, &o.createdAt); err != nil {
 			return httperr.ErrInternalServerError
 		}
 		found = append(found, o)

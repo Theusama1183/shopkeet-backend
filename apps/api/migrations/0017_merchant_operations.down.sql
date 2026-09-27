@@ -1,0 +1,4 @@
+DROP TABLE IF EXISTS return_items;
+DROP TABLE IF EXISTS returns;
+
+ALTER TABLE orders DROP COLUMN IF EXISTS source;

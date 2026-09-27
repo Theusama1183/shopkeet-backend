@@ -361,6 +361,60 @@ func PublicOrAdminMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 	}
 }
 
+// MerchantOrCustomerMW serves merchant-or-customer endpoints (Phase 15:
+// POST /orders/:id/returns) on a single route. A valid merchant Bearer token
+// opens the TenantMW identity path (actor=merchant); a customer Bearer token
+// or no token at all opens the RLS-scoped request transaction from the token's
+// tenant or the X-Tenant-ID header (actor=customer) — there the handler's
+// order lookup by phone/email is the real gate, exactly like GET /orders/:id.
+// Invalid Bearer tokens fail closed with 401 so the customer path can't be
+// bypassed with a bad token.
+func MerchantOrCustomerMW(pool *pgxpool.Pool, secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		ctx := c.Context()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return httperr.ErrInternalServerError
+		}
+		defer tx.Rollback(ctx)
+
+		actor := "customer"
+		tid := c.Get("X-Tenant-ID")
+		if h := c.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+			claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
+			if err != nil {
+				return httperr.C(fiber.StatusUnauthorized, "invalid token")
+			}
+			switch claims.Scope {
+			case "merchant":
+				actor = "merchant"
+				tid = claims.TenantID
+				c.Locals("user_id", claims.UserID)
+				c.Locals("role", claims.Role)
+			case "customer":
+				tid = claims.TenantID
+			default:
+				return httperr.C(fiber.StatusForbidden, "unknown token scope")
+			}
+		}
+		if tid == "" {
+			return httperr.C(fiber.StatusBadRequest, "missing X-Tenant-ID header")
+		}
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			return httperr.ErrInternalServerError
+		}
+
+		c.Locals("tx", tx)
+		c.Locals("tenant_id", tid)
+		c.Locals("actor", actor)
+		if err := c.Next(); err != nil {
+			return err
+		}
+		return commitAndFlush(c, tx, ctx)
+	}
+}
+
 // parseMerchantWithOptional resolves a merchant token if a Bearer header is
 // present (invalid/customer tokens are still refused — fail closed), and
 // returns nil claims when there is no Authorization header at all.

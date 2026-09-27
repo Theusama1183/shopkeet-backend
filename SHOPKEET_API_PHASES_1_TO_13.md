@@ -23,10 +23,11 @@
 11. [Customer Accounts (Phase 11)](#customer-accounts-phase-11)
 12. [Notifications (Phase 12)](#notifications-phase-12)
 13. [Store Settings, Order Notes & Tax (Phase 13)](#store-settings-order-notes--tax-phase-13)
-14. [Database Schema Summary](#database-schema-summary)
-15. [Auth Scopes & Middleware](#auth-scopes--middleware)
-16. [Error Shape](#error-shape)
-17. [Env Vars & Config](#env-vars--config)
+14. [Merchant Operations: Draft Orders & Returns (Phase 15)](#merchant-operations-draft-orders--returns-phase-15)
+15. [Database Schema Summary](#database-schema-summary)
+16. [Auth Scopes & Middleware](#auth-scopes--middleware)
+17. [Error Shape](#error-shape)
+18. [Env Vars & Config](#env-vars--config)
 
 ---
 
@@ -522,6 +523,56 @@ total_cents = (subtotal - discount_cents) + shipping_cost_cents + tax_cents
 
 ---
 
+## Merchant Operations: Draft Orders & Returns (Phase 15)
+
+Merchants take phone/WhatsApp orders outside the storefront, and customers (or
+merchants on their behalf) file returns that restock inventory once received.
+
+### Draft Orders
+
+Phone/WhatsApp sales entered by a merchant. A draft is a **real order**: it runs
+the same Phase 4 `FOR UPDATE` stock guard, snapshots line prices, resolves
+shipping/tax exactly like checkout, and **decrements inventory the same way a
+storefront order does**.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/orders/draft` | Admin | Create a merchant-entered order. Idempotency-guarded (Phase 14). Body matches checkout (same required shipping fields + rate) plus `customer_id?` (attach an existing Phase 11 customer) and `lines:[{variant_id, quantity, unit_price_cents?}]`. `unit_price_cents` 0/omitted = live variant price; otherwise the merchant override is snapshotted. |
+
+Order is stored with `source='draft'` (checkout orders are `source='storefront'`),
+status `pending`, payment `cod` by default. `order.created` is emitted with
+`source: "draft"`. `GET /orders` (Admin) surfaces `source` on every order.
+
+### Returns & Restock
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/orders/:id/returns` | Customer or Admin | File a return. A customer is verified by `?phone=` (and optional `?email=`) exactly like `GET /orders/:id` — a wrong phone on a random order id sees nothing. A merchant bearer token bypasses the phone check. Body: `{reason?, restock?, items:[{order_item_id, quantity}]}` (restock defaults `true`). Return is born `status='requested'`. |
+| GET | `/returns` | Admin | List the tenant's returns, newest first, with items and their product/variant. |
+| PATCH | `/returns/:id/status` | Admin | Walk `requested → approved → received → refunded`; `requested/approved` may instead be `rejected`. |
+
+**Marking a return `received` with `restock=true` increments the returned
+quantities on the correct `order_items.variant_id`** (never the product as a
+whole), refreshes the products aggregates and drops the Redis product detail
+cache — the Phase 15 acceptance criterion.
+
+```sql
+-- Phase 15
+-- orders: source TEXT NOT NULL DEFAULT 'storefront'  ('storefront' | 'draft')
+returns            (id, tenant_id, order_id, reason, status, restock, created_at, updated_at)
+return_items       (id, tenant_id, return_id, order_item_id, quantity)
+```
+
+### Auth
+
+`POST /orders/:id/returns` mounts a single route under `MerchantOrCustomerMW`:
+a merchant Bearer token takes the `TenantMW` identity path (`actor=merchant`);
+a customer token or no token opens the RLS-scoped transaction (`actor=customer`)
+where the phone/email order lookup is the gate. Invalid Bearer tokens fail
+closed with 401.
+
+---
+
 ## Database Schema Summary (All Phases)
 
 ```sql
@@ -579,6 +630,11 @@ notification_log
 -- Phase 13
 -- tenants: logo_media_asset_id, default_currency, timezone, support_email, support_phone, tax_rate_percent
 -- orders: tax_cents, internal_note
+
+-- Phase 15
+-- orders: source TEXT NOT NULL DEFAULT 'storefront' ('storefront' | 'draft')
+returns
+return_items
 ```
 
 **Every tenant-scoped table has:**
@@ -700,7 +756,7 @@ Default codes by status:
 - Merchant signup does **not** emit `customers.signup`; only customer account signup does.
 - Guest cart/checkout rides `X-Customer-Session` header (e.g. `sess-e2e-1`).
 - Order status transitions are strictly linear: `pending → confirmed → shipped → delivered` (or cancel from pending/confirmed); jumping straight to `delivered` → `400 invalid status transition`.
-- Coolify auto-deploy webhook has not been observed firing; after a push, force deploy: `POST /api/v1/applications/l6modsyezs1vlrv6ly1oqz4i/start?force=true`.
+- Coolify auto-deploy webhook has not been observed firing; after a push, force deploy via the **verified** endpoint: `POST /api/v1/deploy?uuid=l6modsyezs1vlrv6ly1oqz4i&force=true` (NOT `/applications/{uuid}/start` or `/applications/{uuid}/deploy` — both 404).
 
 ### Migration runbook
 
@@ -727,6 +783,8 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 13 | 11 | ✓ | Customers |
 | 14 | 12 | ✓ | Notifications |
 | 15 | 13 | ✓ | Settings + Tax + Notes |
+| 16 | 14 | ✓ | Idempotency |
+| 17 | 15 | ✓ | Merchant Operations: `orders.source` + `returns` + `return_items` |
 
 ---
 
@@ -752,6 +810,8 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestRateLimitWindow` | `internal/platform/ratelimit` | 14 |
 | `TestRedisSetGetRoundTrip`, `TestRedisDelPrefix`, `TestInvalidateProduct` | `internal/platform/cache` | 14 |
 | `TestProductCacheAside` | `internal/catalog` | 14 |
+| `TestDraftOrderDecrementsStock` | `internal/orders` | 15 |
+| `TestReturnRestocksCorrectVariant` | `internal/orders` | 15 |
 
 Run:  
 ```bash
