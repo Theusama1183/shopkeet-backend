@@ -709,7 +709,7 @@ Default codes by status:
 | Resource | Identifier | Status |
 |----------|-----------|--------|
 | Coolify app `shopkeet-api` | uuid `l6modsyezs1vlrv6ly1oqz4i` | **running:healthy** |
-| Live commit | `e44aa8c` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-091956308564` (deploy `zpi5qoydsct0t437raguropt`, cache-aside) + `dh57abexrchf2t388j9fjigk` (REDIS_URL fix) |
+| Live commit | `0cf8112` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-090720660839` (deploy `uf0oter0melzd2puvkk8zy4c`, Phase 15 merchant ops, 2026-09-27); prior: `e44aa8c` + `dh57abexrchf2t388j9fjigk` (REDIS_URL fix) |
 | Domain | `https://api.shopkeet.com` | 200 (`/healthz` → `{"status":"ok"}`), TLS via Coolify proxy |
 | Source | `Theusama1183/shopkeet-backend`, branch `main` | build pack `dockerfile`, `base_directory /apps/api`, `dockerfile_location /Dockerfile`, `ports_exposes 3001` |
 | Auto-deploy | `is_auto_deploy_enabled=true` | pushes to `main` trigger builds (webhook; fallback: `POST /api/v1/deploy?uuid={uuid}&force=true` — do **not** use `/applications/{uuid}/start` or `/applications/{uuid}/deploy`, both 404; `/applications/{uuid}/restart` restarts without rebuild) |
@@ -726,9 +726,19 @@ Default codes by status:
 - Phase 12 E2E matrix previously verified against Mailpit (customers.signup → `customer_welcome`, checkout → `order_confirmation`, status → `delivered` → `order_delivered`; all `notification_log` rows `status=sent`) — provider-agnostic, still valid.
 - Two latent bugs fixed en route: (1) event payload is typed `fiber.Map`, so handlers asserting `map[string]any` never fired — now assert `fiber.Map`; (2) events were emitted inside the request tx but async handlers read on a fresh connection, racing the commit — now emitted via `auth.AfterCommit` after `tx.Commit`.
 
+### Phase 15 merchant operations, live 2026-09-27 (commit `0cf8112`)
+
+- **Deployed:** `0cf8112` (merge `aa1bb6f..0cf8112 main -> main`), Coolify deploy `uf0oter0melzd2puvkk8zy4c` → finished, new container `l6modsyezs1vlrv6ly1oqz4i-090720660839` healthy. Migration `0017` applied to prod DB before the deploy (`schema_migrations` = 17).
+- **Live smoke passed end-to-end** against `https://api.shopkeet.com` (throwaway tenant, then cleaned — zero leftover `p15*` subdomains):
+  - `POST /orders/draft` (merchant JWT): `source=draft`, total `2900` (2×1000 + 20% tax + 500 shipping) with `tax_rate_percent=20` set; variant inventory 8 → 6.
+  - `POST /orders/:id/returns` (merchant): `status=requested`, listed in `GET /returns`; `PATCH /returns/:id/status` `approved` → `received` restocked the **correct** variant (6 → 7); downgrade back to `requested` → **400**.
+  - Customer-actor path: `POST /orders/:id/returns?phone=…` with `X-Tenant-ID` and **no** bearer → create `requested` (phone gate works); merchant `PATCH` to `received` with `restock=false` → inventory **stayed 7** (no incorrect restock).
+  - DB assertions via `shopkeet-postgres`: `orders.source=draft`, `product_variants.inventory_count=7`, `returns.status=received`, `return_items` sum = 1.
+- Smoke utility pattern: docker client over host network (`docker run --rm --network host postgres:16-alpine psql -h 10.0.1.10 …`) since the default docker bridge can't reach the `10.0.1.x` postgres bridge; cleanup must `SELECT set_config('app.current_tenant', $tid, true)` inside the tx or FORCE-RLS hides all tenant rows from `shopkeet_app`.
+
 ### Data layer (still manual containers, attached to `coolify` network)
 
-- `shopkeet-postgres` (postgres:16-alpine) → volume `infra_postgres_data` — **the real DB**, migrations 0001–0015.
+- `shopkeet-postgres` (postgres:16-alpine) → volume `infra_postgres_data` — **the real DB**, migrations 0001–0017 (`schema_migrations` at version 17; 0016 idempotency keys, 0017 merchant operations = `orders.source` + `returns`/`return_items`).
 - `shopkeet-redis` (redis:7-alpine) → volume `infra_redis_data` — cart reservation + product cache-aside + rate limiting + Asynq queues (all verified live 2026-09-26: rate-limit key `shopkeet:rl:...` observed with 429s, cache key `shopkeet:cache:product:{tid}/{id}/public` observed + TTL'd).
 - App connects via hostname **`shopkeet-postgres`** / **`shopkeet-redis`**. ⚠️ Do NOT use host `postgres` — or `redis` — on the coolify network: `coolify-db`/`coolify-redis` own those aliases and they point at Coolify's own auth'd instances (the `NOAUTH` incident on 2026-09-26).
 - Old manual `shopkeet-api` compose container: **stopped and removed** (Coolify is now the only API).
