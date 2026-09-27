@@ -22,8 +22,8 @@ import (
 	"github.com/shopkeet/api/internal/notifications"
 	"github.com/shopkeet/api/internal/orders"
 	"github.com/shopkeet/api/internal/payments"
-	"github.com/shopkeet/api/internal/platform/config"
 	"github.com/shopkeet/api/internal/platform/cache"
+	"github.com/shopkeet/api/internal/platform/config"
 	"github.com/shopkeet/api/internal/platform/db"
 	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
@@ -31,6 +31,7 @@ import (
 	"github.com/shopkeet/api/internal/platform/observe"
 	"github.com/shopkeet/api/internal/platform/queue"
 	"github.com/shopkeet/api/internal/platform/ratelimit"
+	"github.com/shopkeet/api/internal/reviews"
 	"github.com/shopkeet/api/internal/shipping"
 	"github.com/shopkeet/api/internal/tenants"
 )
@@ -188,6 +189,13 @@ func main() {
 	// customer-scoped JWT. Checkout under CustomerOrGuestMW links orders to the
 	// account when the caller is signed in, and stays fully guest otherwise.
 	customers.RegisterRoutes(v1, pool, cfg.JWTSecret, customers.New(pool, cfg.JWTSecret, bus), rl)
+
+	// Phase 16 — product reviews. Customers create reviews (verified link when a
+	// delivered order contains the product); the merchant publishes/rejects from
+	// the admin list; products.rating_average/rating_count update on publish.
+	reviewsSvc := reviews.New(pool)
+	reviewsSvc.SetCache(cca)
+	reviews.RegisterRoutes(v1, pool, cfg.JWTSecret, reviewsSvc)
 
 	// Phase 12 — notifications. Subscribe to the internal event bus; sends
 	// order confirmations, delivery updates, and welcome emails. Provider

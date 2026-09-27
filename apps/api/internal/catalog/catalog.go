@@ -158,6 +158,8 @@ type productRow struct {
 	status          string
 	metaTitle       *string
 	metaDescription *string
+	ratingAverage   float64
+	ratingCount     int
 	createdAt       time.Time
 	images          []imageRow
 	categories      []categoryRow
@@ -212,6 +214,8 @@ func productJSON(p *productRow) fiber.Map {
 		"currency": p.currency, "inventory_count": p.inventoryCount,
 		"status": p.status, "meta_title": strp(p.metaTitle),
 		"meta_description": strp(p.metaDescription),
+		"rating_average":   p.ratingAverage,
+		"rating_count":     p.ratingCount,
 		"created_at":       p.createdAt.Format(time.RFC3339),
 		"images":           images,
 		"categories":       cats,
@@ -226,12 +230,14 @@ func productJSON(p *productRow) fiber.Map {
 func (s *Service) queryProduct(ctx *fiber.Ctx, tx pgx.Tx, where string, args ...any) (*productRow, error) {
 	row := tx.QueryRow(ctx.Context(), fmt.Sprintf(`
 		SELECT p.id, p.name, p.slug, p.description, p.price_cents, p.currency,
-		       p.inventory_count, p.status, p.meta_title, p.meta_description, p.created_at
+		       p.inventory_count, p.status, p.meta_title, p.meta_description,
+		       p.rating_average, p.rating_count, p.created_at
 		FROM products p
 		WHERE %s`, where), args...)
 	var p productRow
 	err := row.Scan(&p.id, &p.name, &p.slug, &p.description, &p.priceCents, &p.currency,
-		&p.inventoryCount, &p.status, &p.metaTitle, &p.metaDescription, &p.createdAt)
+		&p.inventoryCount, &p.status, &p.metaTitle, &p.metaDescription,
+		&p.ratingAverage, &p.ratingCount, &p.createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -546,7 +552,8 @@ func (s *Service) ListProducts(c *fiber.Ctx) error {
 
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
 		SELECT p.id, p.name, p.slug, p.description, p.price_cents, p.currency,
-		       p.inventory_count, p.status, p.meta_title, p.meta_description, p.created_at
+		       p.inventory_count, p.status, p.meta_title, p.meta_description,
+		       p.rating_average, p.rating_count, p.created_at
 		FROM products p
 		WHERE %s
 		ORDER BY p.created_at DESC, p.id`, strings.Join(conds, " AND ")), args...)
@@ -559,7 +566,8 @@ func (s *Service) ListProducts(c *fiber.Ctx) error {
 	for rows.Next() {
 		var p productRow
 		if err := rows.Scan(&p.id, &p.name, &p.slug, &p.description, &p.priceCents, &p.currency,
-			&p.inventoryCount, &p.status, &p.metaTitle, &p.metaDescription, &p.createdAt); err != nil {
+			&p.inventoryCount, &p.status, &p.metaTitle, &p.metaDescription,
+			&p.ratingAverage, &p.ratingCount, &p.createdAt); err != nil {
 			return httperr.ErrInternalServerError
 		}
 		found = append(found, p)

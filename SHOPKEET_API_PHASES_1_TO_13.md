@@ -573,6 +573,35 @@ closed with 401.
 
 ---
 
+## Product Reviews (Phase 16)
+
+Judge.me replacement shipping inside the product surface. A signed-in customer
+submits a review; the merchant publishes/rejects it from the admin list; the
+product's rating aggregates are recomputed **the moment a review is published**
+(never on a pending create).
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/products/:id/reviews` | Customer | Create a review. `{rating (1–5, required), title?, body?, photo_media_asset_ids?}`. If the customer has a **delivered** order containing the product, the most recent one is auto-linked as `order_id` → `verified: true`. One review per (product, order, customer); unverified reviews dedupe per (product, customer). A duplicate → `409`. Review is born `status='pending'`. |
+| GET | `/products/:id/reviews` | Public | Published reviews, newest first, plus the product's live `rating_average` / `rating_count`. |
+| GET | `/reviews` | Admin | All statuses (approve/reject worklist), newest first, optional `?status=` filter. |
+| PATCH | `/reviews/:id` | Admin | `{status}` where status is `published` or `rejected`. Any change recomputes the product aggregate and drops its Redis product-detail cache. |
+| DELETE | `/reviews/:id` | Admin | Delete a review; recomputes the product aggregate (`{"deleted": id}`). |
+
+```sql
+-- Phase 16
+product_reviews   (id, tenant_id, product_id, customer_id NULL, order_id NULL, rating 1–5, title, body,
+                   photo_media_asset_ids UUID[] DEFAULT '{}', status pending|published|rejected, created_at)
+products          + rating_average NUMERIC(2,1) DEFAULT 0, rating_count INTEGER DEFAULT 0
+```
+
+Order of operations (accepted live): create review (pending, verified from the
+delivered `orders`×`order_items` join) → merchant `PATCH /reviews/:id` published
+→ product rating updates immediately for the storefront → delete drops the
+review and recomputes back. Rejected reviews never affect the aggregate.
+
+---
+
 ## Database Schema Summary (All Phases)
 
 ```sql
@@ -795,6 +824,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 15 | 13 | ✓ | Settings + Tax + Notes |
 | 16 | 14 | ✓ | Idempotency |
 | 17 | 15 | ✓ | Merchant Operations: `orders.source` + `returns` + `return_items` |
+| 18 | 16 | ✓ | Product Reviews: `product_reviews` + `products.rating_average/rating_count` |
 
 ---
 
@@ -822,6 +852,8 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestProductCacheAside` | `internal/catalog` | 14 |
 | `TestDraftOrderDecrementsStock` | `internal/orders` | 15 |
 | `TestReturnRestocksCorrectVariant` | `internal/orders` | 15 |
+| `TestReviewLifecycleAndVerified` | `internal/reviews` | 16 |
+| `TestRejectAndDeleteRecompute` | `internal/reviews` | 16 |
 
 Run:  
 ```bash
