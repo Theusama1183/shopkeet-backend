@@ -138,6 +138,14 @@ func main() {
 	// onPublish saves the Puck layout verbatim through the admin endpoints.
 	content.RegisterRoutes(v1, pool, cfg.JWTSecret, content.New(pool))
 
+	// Phase 16 — product reviews. Registered ahead of catalog so their
+	// /products/:id/reviews sibling routes are not caught by the /products
+	// group's TenantMW (Fiber applies group middleware at request time by
+	// prefix; see internal/reviews/routes.go).
+	reviewsSvc := reviews.New(pool)
+	reviewsSvc.SetCache(cca)
+	reviews.RegisterRoutes(v1, pool, cfg.JWTSecret, reviewsSvc)
+
 	// Phase 3 — catalog. Storefront routes resolve the tenant from the
 	// X-Tenant-ID header (Next.js middleware per docs/03-architecture.md §2);
 	// admin routes use the JWT via TenantMW. RLS scopes everything.
@@ -189,13 +197,6 @@ func main() {
 	// customer-scoped JWT. Checkout under CustomerOrGuestMW links orders to the
 	// account when the caller is signed in, and stays fully guest otherwise.
 	customers.RegisterRoutes(v1, pool, cfg.JWTSecret, customers.New(pool, cfg.JWTSecret, bus), rl)
-
-	// Phase 16 — product reviews. Customers create reviews (verified link when a
-	// delivered order contains the product); the merchant publishes/rejects from
-	// the admin list; products.rating_average/rating_count update on publish.
-	reviewsSvc := reviews.New(pool)
-	reviewsSvc.SetCache(cca)
-	reviews.RegisterRoutes(v1, pool, cfg.JWTSecret, reviewsSvc)
 
 	// Phase 12 — notifications. Subscribe to the internal event bus; sends
 	// order confirmations, delivery updates, and welcome emails. Provider
