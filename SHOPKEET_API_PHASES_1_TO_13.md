@@ -738,7 +738,7 @@ Default codes by status:
 | Resource | Identifier | Status |
 |----------|-----------|--------|
 | Coolify app `shopkeet-api` | uuid `l6modsyezs1vlrv6ly1oqz4i` | **running:healthy** |
-| Live commit | `0cf8112` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-090720660839` (deploy `uf0oter0melzd2puvkk8zy4c`, Phase 15 merchant ops, 2026-09-27); prior: `e44aa8c` + `dh57abexrchf2t388j9fjigk` (REDIS_URL fix) |
+| Live commit | `c6353e0` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-150407835802` (deploy `jm4uyrdefpi2r9v3qolf9nfi`, Phase 16 reviews + route-order fix, 2026-09-27); prior: `ce29b16` (Phase 16 impl) → `0cf8112` (Phase 15) |
 | Domain | `https://api.shopkeet.com` | 200 (`/healthz` → `{"status":"ok"}`), TLS via Coolify proxy |
 | Source | `Theusama1183/shopkeet-backend`, branch `main` | build pack `dockerfile`, `base_directory /apps/api`, `dockerfile_location /Dockerfile`, `ports_exposes 3001` |
 | Auto-deploy | `is_auto_deploy_enabled=true` | pushes to `main` trigger builds (webhook; fallback: `POST /api/v1/deploy?uuid={uuid}&force=true` — do **not** use `/applications/{uuid}/start` or `/applications/{uuid}/deploy`, both 404; `/applications/{uuid}/restart` restarts without rebuild) |
@@ -755,6 +755,18 @@ Default codes by status:
 - Phase 12 E2E matrix previously verified against Mailpit (customers.signup → `customer_welcome`, checkout → `order_confirmation`, status → `delivered` → `order_delivered`; all `notification_log` rows `status=sent`) — provider-agnostic, still valid.
 - Two latent bugs fixed en route: (1) event payload is typed `fiber.Map`, so handlers asserting `map[string]any` never fired — now assert `fiber.Map`; (2) events were emitted inside the request tx but async handlers read on a fresh connection, racing the commit — now emitted via `auth.AfterCommit` after `tx.Commit`.
 
+### Phase 16 product reviews, live 2026-09-27 (commits `ce29b16` + `c6353e0`)
+
+- **Deployed:** `ce29b16` (feature: `product_reviews` + `products.rating_average/rating_count`, `internal/reviews`, catalog rating fields, acceptance tests) then `c6353e0` (route-registration fix). Migration `0018` applied to prod DB manually via cross-compiled `migrate-linux` (`DATABASE_URL=postgres://shopkeet_app:shopkeet_app@10.0.1.10:5432/shopkeet` → `schema_migrations` = 18). Hosting rebuilds on every Coolify deploy, so the DB was migrated once, then the API was force-deployed (deploy `jm4uyrdefpi2r9v3qolf9nfi` → finished, container `...-150407835802` healthy).
+- **Routing bug caught in live smoke:** `POST/GET /products/:id/reviews` were answered by a parseMerchant guard (403 "customer token not allowed here" / 401 "missing bearer token") instead of `CustomerAuthMW`/`PublicTenantMW`. Root cause: Fiber v2.52 applies a **group's middleware at request time by prefix**, so the catalog `/products` group's `TenantMW` leaked onto later-registered sibling routes. Unit tests couldn't catch it (they mount only reviews routes). **Fix: register reviews routes before catalog in `cmd/api/main.go`** (`c6353e0`); verified locally against the full route table, then re-deployed.
+- **Live smoke passed end-to-end** against `https://api.shopkeet.com` (throwaway tenant `p16smoke-*`, cleaned after — no leftover):
+  - Customer with a delivered order creates a review → `verified=true`; pending does *not* affect public count/aggregate.
+  - Guards: rating 0 → 400, duplicate → 409, merchant create → 403, customer on `PATCH /reviews/:id` → 403.
+  - Publish r1 → public count 1; publish unverified r2 (5★) → count 2, avg 4.5; `GET /products/:id` exposes `rating_average:4.5 rating_count:2`.
+  - Reject r3 → aggregate unchanged; admin worklist `GET /reviews?status=rejected` returns exactly r3; `DELETE r2` → recompute to 4.0/1.
+  - DB-level assertions via docker psql: `rating_count=1 rating_average=4.0`, 2 review rows, 1 verified+published.
+- Rate-limit note: live smoke hit the `/auth/signup` and `/customers/signup` Redis buckets (10/hr/IP keyed on the VPS bridge IP `10.0.1.9`); cleared for the run with `redis-cli del "shopkeet:rl:*:10.0.1.9"`.
+
 ### Phase 15 merchant operations, live 2026-09-27 (commit `0cf8112`)
 
 - **Deployed:** `0cf8112` (merge `aa1bb6f..0cf8112 main -> main`), Coolify deploy `uf0oter0melzd2puvkk8zy4c` → finished, new container `l6modsyezs1vlrv6ly1oqz4i-090720660839` healthy. Migration `0017` applied to prod DB before the deploy (`schema_migrations` = 17).
@@ -767,7 +779,7 @@ Default codes by status:
 
 ### Data layer (still manual containers, attached to `coolify` network)
 
-- `shopkeet-postgres` (postgres:16-alpine) → volume `infra_postgres_data` — **the real DB**, migrations 0001–0017 (`schema_migrations` at version 17; 0016 idempotency keys, 0017 merchant operations = `orders.source` + `returns`/`return_items`).
+- `shopkeet-postgres` (postgres:16-alpine) → volume `infra_postgres_data` — **the real DB**, migrations 0001–0018 (`schema_migrations` at version 18; 0016 idempotency keys, 0017 merchant operations = `orders.source` + `returns`/`return_items`, 0018 product reviews).
 - `shopkeet-redis` (redis:7-alpine) → volume `infra_redis_data` — cart reservation + product cache-aside + rate limiting + Asynq queues (all verified live 2026-09-26: rate-limit key `shopkeet:rl:...` observed with 429s, cache key `shopkeet:cache:product:{tid}/{id}/public` observed + TTL'd).
 - App connects via hostname **`shopkeet-postgres`** / **`shopkeet-redis`**. ⚠️ Do NOT use host `postgres` — or `redis` — on the coolify network: `coolify-db`/`coolify-redis` own those aliases and they point at Coolify's own auth'd instances (the `NOAUTH` incident on 2026-09-26).
 - Old manual `shopkeet-api` compose container: **stopped and removed** (Coolify is now the only API).
