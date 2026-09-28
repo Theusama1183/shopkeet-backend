@@ -18,6 +18,7 @@ import (
 	"github.com/shopkeet/api/internal/content"
 	"github.com/shopkeet/api/internal/customers"
 	"github.com/shopkeet/api/internal/discounts"
+	"github.com/shopkeet/api/internal/giftcards"
 	"github.com/shopkeet/api/internal/media"
 	"github.com/shopkeet/api/internal/notifications"
 	"github.com/shopkeet/api/internal/orders"
@@ -229,6 +230,10 @@ func main() {
 	// Phase 10 — discounts. Admin CRUD behind TenantMW; the cart apply endpoint
 	// lives in the cart package and checkout claims the usage atomically.
 	discounts.RegisterRoutes(v1, pool, cfg.JWTSecret, discounts.New(pool))
+
+	// Phase 18 — gift cards. Admin issue/list behind TenantMW; the customer
+	// apply endpoint lives in the cart package and checkout claims the balance.
+	giftcards.RegisterRoutes(v1, pool, cfg.JWTSecret, giftcards.New(pool))
 
 	// Phase 11 — customer accounts. Signup/login are storefront-public; the
 	// /me group (profile, order history, saved addresses) requires a

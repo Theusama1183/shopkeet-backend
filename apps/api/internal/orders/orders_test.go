@@ -722,3 +722,436 @@ func TestPostDiscountTax(t *testing.T) {
 			ord.ShippingCostCents, ord.TotalCents)
 	}
 }
+
+// TestGiftCardCheckoutSnapshot is the Phase 18 accounting rule: a gift card is
+// claimed against what the order owes after discount + shipping + tax
+// (amountDue), never more, and the applied code + amount are snapshotted onto
+// the order. A partial card reduces the total; a card larger than the order
+// zeros it and keeps the remainder on the card.
+func TestGiftCardCheckoutSnapshot(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL not set; skipping integration")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+
+	const secret = "test-secret"
+	sfx := randSuffix5()
+
+	var tid string
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO tenants (name, subdomain) VALUES ($1, $2) RETURNING id",
+		"gco", "gco-"+sfx).Scan(&tid); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+	if _, err := auth.Sign(secret, tid, tid[:8], "owner", time.Hour); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	execAs := func(sql string, args ...any) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		if _, err := tx.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+
+	var variantID string
+	execAs(`INSERT INTO products (tenant_id, name, slug, price_cents, currency, inventory_count, status)
+		VALUES ($1, 'gc', 'gc-' || $2, 2000, 'usd', 10, 'active')`, tid, sfx)
+	{
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin variant: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO product_variants (tenant_id, product_id, price_cents, inventory_count, status)
+			SELECT tenant_id, id, price_cents, inventory_count, 'active' FROM products
+			WHERE tenant_id = $1 AND slug = $2
+			RETURNING id`, tid, "gc-"+sfx).Scan(&variantID); err != nil {
+			t.Fatalf("seed variant: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit variant: %v", err)
+		}
+	}
+	execAs(`INSERT INTO gift_cards (tenant_id, code, initial_balance_cents, balance_cents, status)
+		VALUES ($1, 'GC-PARTIAL', 1000, 1000, 'active')`, tid)
+	execAs(`INSERT INTO gift_cards (tenant_id, code, initial_balance_cents, balance_cents, status)
+		VALUES ($1, 'GC-FULL', 4000, 4000, 'active')`, tid)
+	var rateID string
+	{
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin rate: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO shipping_zones (tenant_id, name, countries, regions)
+			VALUES ($1, 'PK', '{"PK"}', '{}')`, tid); err != nil {
+			t.Fatalf("seed zone: %v", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO shipping_rates (tenant_id, zone_id, name, rate_cents, sort_order)
+			SELECT $1, id, 'Standard', 500, 0 FROM shipping_zones
+			WHERE tenant_id = $1 AND name = 'PK'
+			RETURNING id`, tid).Scan(&rateID); err != nil {
+			t.Fatalf("seed rate: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit rate: %v", err)
+		}
+	}
+
+	bus := events.NewBus()
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
+	v1 := app.Group("/api/v1")
+	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
+
+	do := func(method, path, session, body string, want int) *http.Response {
+		t.Helper()
+		var req *http.Request
+		if body == "" {
+			req = httptest.NewRequest(method, path, nil)
+		} else {
+			req = httptest.NewRequest(method, path, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("X-Tenant-ID", tid)
+		if session != "" {
+			req.Header.Set("X-Customer-Session", session)
+		}
+		res, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode != want {
+			t.Fatalf("%s %s: status %d, want %d (body=%s)", method, path, res.StatusCode, want, raw)
+		}
+		res.Body = io.NopCloser(strings.NewReader(string(raw)))
+		return res
+	}
+
+	// Partial card: 2000 subtotal + 500 shipping = 2500 due; card covers 1000.
+	s1 := "sess-gc1-" + sfx
+	do("POST", "/api/v1/cart", s1, `{"variant_id":"`+variantID+`","quantity":1}`, fiber.StatusOK)
+	res := do("POST", "/api/v1/cart/gift-card", s1, `{"code":"GC-PARTIAL"}`, fiber.StatusOK)
+	var cartP struct {
+		Cart struct {
+			GiftCardCode  string `json:"gift_card_code"`
+			GiftCardCents int    `json:"gift_card_cents"`
+		} `json:"cart"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&cartP); err != nil {
+		t.Fatalf("decode cart: %v", err)
+	}
+	res.Body.Close()
+	if cartP.Cart.GiftCardCode != "GC-PARTIAL" || cartP.Cart.GiftCardCents != 1000 {
+		t.Fatalf("cart should show GC-PARTIAL predicting 1000, got %+v", cartP.Cart)
+	}
+
+	res = do("POST", "/api/v1/checkout", s1,
+		`{"customer_name":"GC","customer_phone":"+1-555-`+sfx+`","customer_email":"gc@example.com",`+
+			`"shipping_address_line1":"1 Main St","shipping_city":"Lahore","shipping_country":"PK",`+
+			`"shipping_state":"Punjab","shipping_rate_id":"`+rateID+`"}`,
+		fiber.StatusCreated)
+	var ord1 struct {
+		TotalCents    int `json:"total_cents"`
+		GiftCardCode  string `json:"gift_card_code"`
+		GiftCardCents int `json:"gift_card_cents"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&ord1); err != nil {
+		t.Fatalf("decode order 1: %v", err)
+	}
+	res.Body.Close()
+	if ord1.GiftCardCode != "GC-PARTIAL" || ord1.GiftCardCents != 1000 || ord1.TotalCents != 1500 {
+		t.Fatalf("expected snapshot GC-PARTIAL/1000 total 1500 (2000+500-1000), got %+v", ord1)
+	}
+
+	// Applying the now-exhausted card must be rejected.
+	do("POST", "/api/v1/cart/gift-card", s1, `{"code":"GC-PARTIAL"}`, fiber.StatusBadRequest)
+
+	// Full card: 2500 due, covered by a 4000 card -> total 0, 1500 stays.
+	s2 := "sess-gc2-" + sfx
+	do("POST", "/api/v1/cart", s2, `{"variant_id":"`+variantID+`","quantity":1}`, fiber.StatusOK)
+	do("POST", "/api/v1/cart/gift-card", s2, `{"code":"GC-FULL"}`, fiber.StatusOK)
+	res = do("POST", "/api/v1/checkout", s2,
+		`{"customer_name":"GC","customer_phone":"+1-556-`+sfx+`","customer_email":"gc2@example.com",`+
+			`"shipping_address_line1":"1 Main St","shipping_city":"Lahore","shipping_country":"PK",`+
+			`"shipping_state":"Punjab","shipping_rate_id":"`+rateID+`"}`,
+		fiber.StatusCreated)
+	var ord2 struct {
+		TotalCents    int    `json:"total_cents"`
+		GiftCardCode  string `json:"gift_card_code"`
+		GiftCardCents int    `json:"gift_card_cents"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&ord2); err != nil {
+		t.Fatalf("decode order 2: %v", err)
+	}
+	res.Body.Close()
+	if ord2.GiftCardCode != "GC-FULL" || ord2.GiftCardCents != 2500 || ord2.TotalCents != 0 {
+		t.Fatalf("expected GC-FULL/2500 total 0, got %+v", ord2)
+	}
+
+	// Balances after: GC-PARTIAL 0, GC-FULL 1500.
+	scopedRead := func(sql string, args ...any) int {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin read: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		var v int
+		if err := tx.QueryRow(ctx, sql, args...).Scan(&v); err != nil {
+			t.Fatalf("scoped read: %v", err)
+		}
+		return v
+	}
+	if b := scopedRead("SELECT balance_cents FROM gift_cards WHERE code = $1", "GC-PARTIAL"); b != 0 {
+		t.Fatalf("GC-PARTIAL should be spent (0), got %d", b)
+	}
+	if b := scopedRead("SELECT balance_cents FROM gift_cards WHERE code = $1", "GC-FULL"); b != 1500 {
+		t.Fatalf("GC-FULL should keep 1500, got %d", b)
+	}
+}
+
+// TestGiftCardConcurrentDoubleSpend is the Phase 18 acceptance criterion: two
+// concurrent checkouts both trying to spend the last $5 of a $5 gift card —
+// exactly one succeeds. The FOR UPDATE claim locks the card row inside each
+// order transaction, so the second checkout sees balance 0 and is refused.
+func TestGiftCardConcurrentDoubleSpend(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL not set; skipping integration")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+
+	const secret = "test-secret"
+	sfx := randSuffix5()
+
+	var tid string
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO tenants (name, subdomain) VALUES ($1, $2) RETURNING id",
+		"gcc", "gcc-"+sfx).Scan(&tid); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+
+	execAs := func(sql string, args ...any) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		if _, err := tx.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+
+	var variantID string
+	execAs(`INSERT INTO products (tenant_id, name, slug, price_cents, currency, inventory_count, status)
+		VALUES ($1, 'cd', 'cd-' || $2, 1000, 'usd', 100, 'active')`, tid, sfx)
+	{
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin variant: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO product_variants (tenant_id, product_id, price_cents, inventory_count, status)
+			SELECT tenant_id, id, price_cents, inventory_count, 'active' FROM products
+			WHERE tenant_id = $1 AND slug = $2
+			RETURNING id`, tid, "cd-"+sfx).Scan(&variantID); err != nil {
+			t.Fatalf("seed variant: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit variant: %v", err)
+		}
+	}
+	execAs(`INSERT INTO gift_cards (tenant_id, code, initial_balance_cents, balance_cents, status)
+		VALUES ($1, 'GC-LAST', 500, 500, 'active')`, tid)
+	var rateID string
+	{
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin rate: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO shipping_zones (tenant_id, name, countries, regions)
+			VALUES ($1, 'PK', '{"PK"}', '{}')`, tid); err != nil {
+			t.Fatalf("seed zone: %v", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO shipping_rates (tenant_id, zone_id, name, rate_cents, sort_order)
+			SELECT $1, id, 'Standard', 500, 0 FROM shipping_zones
+			WHERE tenant_id = $1 AND name = 'PK'
+			RETURNING id`, tid).Scan(&rateID); err != nil {
+			t.Fatalf("seed rate: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit rate: %v", err)
+		}
+	}
+
+	bus := events.NewBus()
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
+	v1 := app.Group("/api/v1")
+	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
+
+	setup := func(session string) {
+		t.Helper()
+		var req *http.Request
+		req = httptest.NewRequest("POST", "/api/v1/cart", strings.NewReader(`{"variant_id":"`+variantID+`","quantity":5}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-ID", tid)
+		req.Header.Set("X-Customer-Session", session)
+		res, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("add item: %v", err)
+		}
+		res.Body.Close()
+		if res.StatusCode != fiber.StatusOK {
+			t.Fatalf("add item: status %d", res.StatusCode)
+		}
+		req = httptest.NewRequest("POST", "/api/v1/cart/gift-card", strings.NewReader(`{"code":"GC-LAST"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-ID", tid)
+		req.Header.Set("X-Customer-Session", session)
+		res, err = app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("apply gift card: %v", err)
+		}
+		res.Body.Close()
+		if res.StatusCode != fiber.StatusOK {
+			t.Fatalf("apply gift card: status %d", res.StatusCode)
+		}
+	}
+
+	body := `{"customer_name":"CD","customer_phone":"+1-557-` + sfx + `","customer_email":"cd@example.com",` +
+		`"shipping_address_line1":"1 Main St","shipping_city":"Lahore","shipping_country":"PK",` +
+		`"shipping_state":"Punjab","shipping_rate_id":"` + rateID + `"}`
+
+	// Five-item cart: 5000 subtotal + 500 shipping = 5500 due; the 500-card
+	// covers exactly 500 (total 5000) — so only one checkout can take it.
+	sA, sB := "sess-cdA-"+sfx, "sess-cdB-"+sfx
+	setup(sA)
+	setup(sB)
+
+	type result struct {
+		status int
+		body   string
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	checkout := func(session string) {
+		defer wg.Done()
+		<-start
+		req := httptest.NewRequest("POST", "/api/v1/checkout", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-ID", tid)
+		req.Header.Set("X-Customer-Session", session)
+		res, err := app.Test(req, -1)
+		if err != nil {
+			results <- result{status: 0, body: err.Error()}
+			return
+		}
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		results <- result{status: res.StatusCode, body: string(raw)}
+	}
+	wg.Add(2)
+	go checkout(sA)
+	go checkout(sB)
+	close(start)
+	wg.Wait()
+	close(results)
+
+	got := map[int]int{}
+	for r := range results {
+		if r.status == 0 {
+			t.Fatalf("checkout errored: %s", r.body)
+		}
+		got[r.status]++
+	}
+	if got[fiber.StatusCreated] != 1 || got[fiber.StatusBadRequest] != 1 {
+		t.Fatalf("want exactly one 201 and one 400, got %+v", got)
+	}
+
+	// Exactly one order exists and the card is spent.
+	scopedRead := func(sql string, args ...any) int {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin read: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		var v int
+		if err := tx.QueryRow(ctx, sql, args...).Scan(&v); err != nil {
+			t.Fatalf("scoped read: %v", err)
+		}
+		return v
+	}
+	if orderCount := scopedRead("SELECT count(*) FROM orders"); orderCount != 1 {
+		t.Fatalf("want exactly 1 order, got %d", orderCount)
+	}
+	if bal := scopedRead("SELECT balance_cents FROM gift_cards WHERE code = 'GC-LAST'"); bal != 0 {
+		t.Fatalf("card should be spent down to 0, got %d", bal)
+	}
+}

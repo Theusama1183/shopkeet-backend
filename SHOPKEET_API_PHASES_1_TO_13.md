@@ -717,6 +717,11 @@ product_reviews
 -- Phase 17
 -- carts: customer_email TEXT, last_activity_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 --        recovery_sent_at TIMESTAMPTZ
+
+-- Phase 18
+gift_cards
+-- carts:  gift_card_code TEXT
+-- orders: gift_card_code TEXT, gift_card_cents INTEGER NOT NULL DEFAULT 0
 ```
 
 **Every tenant-scoped table has:**
@@ -755,6 +760,46 @@ Default codes by status:
 - 409 → `conflict`
 - 502 → `upstream_error`
 - 5xx → `internal_error`
+
+---
+
+## Gift Cards (Phase 18)
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/gift-cards` | Admin | List cards, newest first (code + balances + status + expiry). |
+| POST | `/gift-cards` | Admin | Issue: `{code?, amount_cents, expires_at?}`. `amount_cents` > 0 required. Empty code → generated `GC-XXXXXXXX`. Duplicate code in tenant → 409. Idempotency-guarded. |
+| POST | `/cart/gift-card` | Customer | Apply to cart. Body: `{code}`. Code uppercased/trimmed; validated and recorded on the cart. Rate-limited 20/hr. Idempotency-guarded. |
+
+There is no customer "remove" endpoint — applying another code replaces it. Re-applying an
+exhausted/disabled/expired card is 400, so the cart keeps its previous code.
+
+### Cart JSON (gift card fields)
+
+```json
+{ "gift_card_code": "GC-1A2B3C4D", "gift_card_cents": 1000 }
+```
+
+`gift_card_cents` on the cart is a *preview*: `min(balance, max(subtotal - discount + shipping + tax, 0))`.
+
+### Checkout Integration
+
+- `amountDue = subtotal - discount_cents + shipping_cost_cents + tax_cents`; the claim is
+  `min(balance, amountDue)`.
+- `total_cents = amountDue - gift_card_cents`, **floored at 0** — a card larger than the order
+  pays it in full and the remainder stays on the card.
+- The claim runs **inside the order transaction**: `SELECT ... FOR UPDATE` on the card row, then
+  `UPDATE ... SET balance_cents = balance_cents - $1`. Row lock ⇒ serialised claims.
+- Order snapshots `gift_card_code` + `gift_card_cents`; later balance changes never re-open a
+  placed order. Checkout is the only writer of `orders.gift_card_cents`.
+- **Acceptance (concurrent double-spend):** two checkouts racing for the last $5 of a $5 card —
+  exactly one succeeds, the other 400s. Covered by `TestGiftCardConcurrentDoubleSpend`.
+
+### Table
+
+- `gift_cards` (id, tenant_id, code, initial_balance_cents, balance_cents, status, expires_at, created_at) — UNIQUE (tenant_id, code), CHECKs: `initial_balance_cents > 0`, `balance_cents >= 0`, `status IN ('active','disabled')`. FORCE RLS + tenant policy + `OWNER TO shopkeet_app`, same as every tenant table.
 
 ---
 
@@ -907,6 +952,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 17 | 15 | ✓ | Merchant Operations: `orders.source` + `returns` + `return_items` |
 | 18 | 16 | ✓ | Product Reviews: `product_reviews` + `products.rating_average/rating_count` |
 | 19 | 17 | ✓ | Abandoned Cart Recovery: `carts.customer_email` + `last_activity_at` + `recovery_sent_at` (+ partial scan index) |
+| 20 | 18 | pending | Gift Cards: `gift_cards` + `carts.gift_card_code` + `orders.gift_card_code`/`gift_card_cents` |
 
 ---
 
@@ -938,6 +984,10 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestRejectAndDeleteRecompute` | `internal/reviews` | 16 |
 | `TestCartRecoverySweep` | `internal/cart` | 17 |
 | `TestSendCartAbandoned` | `internal/notifications` | 17 |
+| `TestGiftCardsAdmin` | `internal/giftcards` | 18 |
+| `TestResolveValidations` | `internal/giftcards` | 18 |
+| `TestGiftCardCheckoutSnapshot` | `internal/orders` | 18 |
+| `TestGiftCardConcurrentDoubleSpend` | `internal/orders` | 18 |
 
 Run:  
 ```bash

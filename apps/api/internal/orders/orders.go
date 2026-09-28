@@ -11,6 +11,7 @@ import (
 
 	"github.com/shopkeet/api/internal/auth"
 	"github.com/shopkeet/api/internal/discounts"
+	"github.com/shopkeet/api/internal/giftcards"
 	"github.com/shopkeet/api/internal/payments"
 	"github.com/shopkeet/api/internal/platform/cache"
 	"github.com/shopkeet/api/internal/platform/events"
@@ -83,6 +84,8 @@ type orderRow struct {
 	shippingCostCents int
 	discountCode      *string
 	discountCents     int
+	giftCardCode      *string // Phase 18
+	giftCardCents     int     // Phase 18
 	taxCents          int     // Phase 13
 	internalNote      *string // Phase 13: merchant-only, not shown to customers
 	paymentMethod     string
@@ -99,7 +102,7 @@ const orderSelect = `
 	SELECT id, customer_id, customer_name, customer_phone, customer_email, shipping_address,
 	       shipping_address_line1, shipping_address_line2, shipping_city, shipping_state,
 	       shipping_postal_code, shipping_country, shipping_method, shipping_cost_cents,
-	       discount_code, discount_cents,
+	       discount_code, discount_cents, gift_card_code, gift_card_cents,
 	       tax_cents, internal_note,
 	       payment_method, payment_status, status, source, total_cents, currency, created_at
 	FROM orders`
@@ -112,6 +115,7 @@ func loadOrder(c *fiber.Ctx, tx pgx.Tx, where string, args ...any) (*orderRow, e
 		Scan(&o.id, &o.customerID, &o.customerName, &o.customerPhone, &o.customerEmail, &o.shippingAddress,
 			&o.line1, &o.line2, &o.city, &o.state, &o.postalCode, &o.country,
 			&o.shippingMethod, &o.shippingCostCents, &o.discountCode, &o.discountCents,
+			&o.giftCardCode, &o.giftCardCents,
 			&o.taxCents, &o.internalNote,
 			&o.paymentMethod, &o.paymentStatus, &o.status, &o.source, &o.totalCents, &o.currency, &o.createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -169,6 +173,7 @@ func orderJSON(o *orderRow, includeInternalNote bool) fiber.Map {
 		"shipping_postal_code": strp(o.postalCode), "shipping_country": strp(o.country),
 		"shipping_method": strp(o.shippingMethod), "shipping_cost_cents": o.shippingCostCents,
 		"discount_code": strp(o.discountCode), "discount_cents": o.discountCents,
+		"gift_card_code": strp(o.giftCardCode), "gift_card_cents": o.giftCardCents,
 		"tax_cents":      o.taxCents,
 		"payment_method": o.paymentMethod, "payment_status": o.paymentStatus,
 		"status": o.status, "source": o.source, "total_cents": o.totalCents, "currency": o.currency,
@@ -241,10 +246,10 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		customerID = &cid
 	}
 
-	var cartID, discountCode string
+	var cartID, discountCode, giftCardCode string
 	if err := tx.QueryRow(ctx,
-		"SELECT id, COALESCE(discount_code, '') FROM carts WHERE customer_session = $1",
-		session).Scan(&cartID, &discountCode); errors.Is(err, pgx.ErrNoRows) {
+		"SELECT id, COALESCE(discount_code, ''), COALESCE(gift_card_code, '') FROM carts WHERE customer_session = $1",
+		session).Scan(&cartID, &discountCode, &giftCardCode); errors.Is(err, pgx.ErrNoRows) {
 		return httperr.C(fiber.StatusBadRequest, "cart is empty")
 	}
 
@@ -354,23 +359,44 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	// Tax is calculated on the discounted subtotal — the amount the customer
 	// actually pays for goods — then shipping is added (Phase 13).
 	taxCents := (subtotal - discountCents) * taxRatePercent / 100
-	total := subtotal - discountCents + quote.CostCents + taxCents
+
+	// Apply the applied gift card (Phase 18): re-validated inside this
+	// transaction and claimed via FOR UPDATE, so an expired / disabled /
+	// exhausted / deleted card is rejected at checkout even when it applied to
+	// the cart earlier, and two concurrent checkouts spending the last dollar
+	// of a card can never double-spend it. Claims at most what the order owes
+	// (min(balance, amountDue)); unused balance stays on the card and the
+	// total never goes below zero.
+	amountDue := subtotal - discountCents + quote.CostCents + taxCents
+	giftCardCents := 0
+	if giftCardCode != "" {
+		q, err := giftcards.Claim(ctx, tx, giftCardCode, amountDue)
+		if err != nil {
+			var ce *giftcards.CodeError
+			if errors.As(err, &ce) {
+				return httperr.C(ce.Status, ce.Message)
+			}
+			return httperr.ErrInternalServerError
+		}
+		giftCardCents = q.Cents
+	}
+	total := amountDue - giftCardCents
 
 	var orderID string
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO orders (tenant_id, customer_id, customer_name, customer_phone, customer_email,
 			shipping_address_line1, shipping_address_line2, shipping_city, shipping_state,
 			shipping_postal_code, shipping_country, shipping_method, shipping_cost_cents,
-			discount_code, discount_cents, tax_cents,
+			discount_code, discount_cents, gift_card_code, gift_card_cents, tax_cents,
 			payment_method, payment_status, status, total_cents, currency)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'pending', $19, $20)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, 'pending', $21, $22)
 		RETURNING id`,
 		tid, customerID, req.CustomerName, req.CustomerPhone, nullableStr(req.CustomerEmail),
 		nullableStr(req.ShippingAddressLine1), nullableStr(req.ShippingAddressLine2),
 		nullableStr(req.ShippingCity), nullableStr(req.ShippingState),
 		nullableStr(req.ShippingPostalCode), nullableStr(req.ShippingCountry),
 		nullableStr(quote.Method), quote.CostCents,
-		nullableStr(discountCode), discountCents, taxCents,
+		nullableStr(discountCode), discountCents, nullableStr(giftCardCode), giftCardCents, taxCents,
 		req.PaymentMethod, res.PaymentStatus, total, currency).Scan(&orderID); err != nil {
 		return httperr.ErrInternalServerError
 	}
@@ -496,6 +522,7 @@ func (s *Service) ListOrders(c *fiber.Ctx) error {
 		if err := rows.Scan(&o.id, &o.customerID, &o.customerName, &o.customerPhone, &o.customerEmail, &o.shippingAddress,
 			&o.line1, &o.line2, &o.city, &o.state, &o.postalCode, &o.country,
 			&o.shippingMethod, &o.shippingCostCents, &o.discountCode, &o.discountCents,
+			&o.giftCardCode, &o.giftCardCents,
 			&o.taxCents, &o.internalNote,
 			&o.paymentMethod, &o.paymentStatus, &o.status, &o.source, &o.totalCents, &o.currency, &o.createdAt); err != nil {
 			return httperr.ErrInternalServerError

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/discounts"
+	"github.com/shopkeet/api/internal/giftcards"
 	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
@@ -63,19 +64,22 @@ type cartPayload struct {
 	currency      string
 	discountCode  string
 	discountCents int
+	giftCardCode  string
+	giftCardCents int
 	email         string
 }
 
 // loadCart returns the customer's cart with its items (product info joined in)
 // and totals, plus the applied discount_code and its predicted discount_cents
-// (best-effort — checkout re-validates authoritatively). Returns (nil, nil)
+// and the applied gift_card_code with a predicted gift_card_cents (both
+// best-effort — checkout re-validates authoritatively). Returns (nil, nil)
 // when the session has no cart yet.
 func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 	ctx := c.Context()
-	var cartID, discountCode, email string
+	var cartID, discountCode, giftCardCode, email string
 	err := tx.QueryRow(ctx,
-		"SELECT id, COALESCE(discount_code, ''), COALESCE(customer_email, '') FROM carts WHERE customer_session = $1",
-		session).Scan(&cartID, &discountCode, &email)
+		"SELECT id, COALESCE(discount_code, ''), COALESCE(gift_card_code, ''), COALESCE(customer_email, '') FROM carts WHERE customer_session = $1",
+		session).Scan(&cartID, &discountCode, &giftCardCode, &email)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -112,10 +116,26 @@ func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 		return nil, err
 	}
 	cp.discountCode = discountCode
+	cp.giftCardCode = giftCardCode
 	cp.email = email
 	if discountCode != "" {
 		if q, err := discounts.Resolve(ctx, tx, discountCode, cp.total); err == nil {
 			cp.discountCents = q.DiscountCents
+		}
+	}
+	if giftCardCode != "" {
+		// Best-effort preview: what the card would cover against the goods total
+		// (no shipping/tax yet — checkout is authoritative). An invalid card
+		// still shows its code with 0 predicted cents, exactly like a bad code.
+		if q, err := giftcards.Resolve(ctx, tx, giftCardCode); err == nil {
+			avail := cp.total - cp.discountCents
+			if avail < 0 {
+				avail = 0
+			}
+			if q.Cents < avail {
+				avail = q.Cents
+			}
+			cp.giftCardCents = avail
 		}
 	}
 	return cp, nil
@@ -140,13 +160,15 @@ func cartJSON(cp *cartPayload) fiber.Map {
 		})
 	}
 	return fiber.Map{"cart": fiber.Map{
-		"id":             cp.id,
-		"items":          items,
-		"total_cents":    cp.total,
-		"currency":       cp.currency,
-		"discount_code":  cp.discountCode,
-		"discount_cents": cp.discountCents,
-		"email":          cp.email,
+		"id":              cp.id,
+		"items":           items,
+		"total_cents":     cp.total,
+		"currency":        cp.currency,
+		"discount_code":   cp.discountCode,
+		"discount_cents":  cp.discountCents,
+		"gift_card_code":  cp.giftCardCode,
+		"gift_card_cents": cp.giftCardCents,
+		"email":           cp.email,
 	}}
 }
 
@@ -377,6 +399,64 @@ func (s *Service) ApplyDiscount(c *fiber.Ctx) error {
 // unexpected error is a 500.
 func translateDiscountErr(err error) error {
 	var ce *discounts.CodeError
+	if errors.As(err, &ce) {
+		return httperr.C(ce.Status, ce.Message)
+	}
+	return httperr.ErrInternalServerError
+}
+
+type giftCardRequest struct {
+	Code string `json:"code"`
+}
+
+// ApplyGiftCard handles POST /cart/gift-card (Customer, Phase 18). Validates
+// the card at apply-time (exists, active, unexpired, still has balance) via
+// giftcards.Resolve and stores it on the cart. Checkout re-validates and claims
+// the balance inside the order transaction — the apply here is never
+// authoritative.
+func (s *Service) ApplyGiftCard(c *fiber.Ctx) error {
+	var req giftCardRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
+	}
+	code := strings.ToUpper(strings.TrimSpace(req.Code))
+	if code == "" {
+		return httperr.C(fiber.StatusBadRequest, "code required")
+	}
+	tx, ok := txFrom(c)
+	if !ok {
+		return httperr.ErrInternalServerError
+	}
+	ctx := c.Context()
+	tid, _ := c.Locals("tenant_id").(string)
+	session := customerSession(c)
+
+	if _, err := giftcards.Resolve(ctx, tx, code); err != nil {
+		return translateGiftCardErr(err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO carts (tenant_id, customer_session)
+		VALUES ($1, $2)
+		ON CONFLICT (tenant_id, customer_session) DO NOTHING`, tid, session); err != nil {
+		return httperr.ErrInternalServerError
+	}
+	if _, err := tx.Exec(ctx,
+		"UPDATE carts SET gift_card_code = $1, last_activity_at = now() WHERE customer_session = $2",
+		code, session); err != nil {
+		return httperr.ErrInternalServerError
+	}
+	cp, err := loadCart(c, tx, session)
+	if err != nil {
+		return httperr.ErrInternalServerError
+	}
+	return c.JSON(cartJSON(cp))
+}
+
+// translateGiftCardErr maps a giftcards.CodeError to the JSON error shape; any
+// unexpected error is a 500.
+func translateGiftCardErr(err error) error {
+	var ce *giftcards.CodeError
 	if errors.As(err, &ce) {
 		return httperr.C(ce.Status, ce.Message)
 	}

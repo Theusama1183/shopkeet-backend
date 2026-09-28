@@ -30,6 +30,15 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, svc *Service, limit
 		}),
 		idempotency.Middleware("POST /cart/discount"),
 		svc.ApplyDiscount)
+	g.Post("/gift-card",
+		limiter.Middleware(ratelimit.Entry{
+			Route:   "POST /cart/gift-card",
+			Limit:   20,
+			Window:  time.Hour,
+			KeyFunc: ratelimit.BySession(),
+		}),
+		idempotency.Middleware("POST /cart/gift-card"),
+		svc.ApplyGiftCard)
 	g.Patch("/items/:id", svc.UpdateItemQuantity)
 	g.Delete("/items/:id", svc.RemoveItem)
 	g.Post("/email", svc.CaptureEmail)
