@@ -791,7 +791,7 @@ Default codes by status:
 | Resource | Identifier | Status |
 |----------|-----------|--------|
 | Coolify app `shopkeet-api` | uuid `l6modsyezs1vlrv6ly1oqz4i` | **running:healthy** |
-| Live commit | `c6353e0` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-150407835802` (deploy `jm4uyrdefpi2r9v3qolf9nfi`, Phase 16 reviews + route-order fix, 2026-09-27); prior: `ce29b16` (Phase 16 impl) → `0cf8112` (Phase 15) |
+| Live commit | `512cad0` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-020157878918` (deploy `rjdmdv0x7ayitoqass4hio9n`, Phase 17 recovery fix, 2026-09-28); prior: `46390e2` (Phase 17 abandoned-cart recovery, deploy `dwid6sl0plevyzhm6lbsqmbs`, 2026-09-27); before that: `c6353e0` (Phase 16 reviews + route-order fix) |
 | Domain | `https://api.shopkeet.com` | 200 (`/healthz` → `{"status":"ok"}`), TLS via Coolify proxy |
 | Source | `Theusama1183/shopkeet-backend`, branch `main` | build pack `dockerfile`, `base_directory /apps/api`, `dockerfile_location /Dockerfile`, `ports_exposes 3001` |
 | Auto-deploy | `is_auto_deploy_enabled=true` | pushes to `main` trigger builds (webhook; fallback: `POST /api/v1/deploy?uuid={uuid}&force=true` — do **not** use `/applications/{uuid}/start` or `/applications/{uuid}/deploy`, both 404; `/applications/{uuid}/restart` restarts without rebuild) |
@@ -820,6 +820,22 @@ Default codes by status:
   - DB-level assertions via docker psql: `rating_count=1 rating_average=4.0`, 2 review rows, 1 verified+published.
 - Rate-limit note: live smoke hit the `/auth/signup` and `/customers/signup` Redis buckets (10/hr/IP keyed on the VPS bridge IP `10.0.1.9`); cleared for the run with `redis-cli del "shopkeet:rl:*:10.0.1.9"`.
 
+### Phase 17 abandoned-cart recovery, live 2026-09-27 (commit `46390e2`)
+
+- **Deployed:** `46390e2` (feature: `carts.customer_email/last_activity_at/recovery_sent_at`, `POST /cart/email`, hourly Asynq `cart:abandonment` sweep, `cart_abandoned` notification type + sender, acceptance tests). Migration `0019` applied to prod DB via cross-compiled `migrate-linux` (`schema_migrations` = 19), then Coolify force-deploy `dwid6sl0plevyzhm6lbsqmbs` → finished, container `l6modsyezs1vlrv6ly1oqz4i-153417386013` healthy (image tag `46390e2d…`); logs confirm `notifications: using Resend provider`.
+- **Live smoke passed** against `https://api.shopkeet.com` (throwaway tenant `p17smoke-*`, parked one kept for the hourly-job verification then cleaned — see below):
+  - `POST /cart` (active product+variant) → 1 item; `POST /cart/email` echoes `cart.email`; bad email → 400.
+  - Backdated `last_activity_at` 2h via DB → candidate scan (`customer_email NOT NULL`, `recovery_sent_at IS NULL`, `last_activity_at < now()-1h`, has items) finds **exactly 1** cart.
+  - Stamping `recovery_sent_at` (the job's write) → scan re-run finds **0** — the once-only guarantee.
+  - One smoke cart was left **parked** (idle 2h, email set, not stamped) while a detached VPS watcher waited for the next hourly tick to hit `notification_log` with `cart_abandoned|sent|<email>` + the `cart abandonment sweep emailed N carts` log line — confirming the real 60-minute path end-to-end. The tick at 16:38:41 UTC **did** fire ("emailed 1 carts", `recovery_sent_at` stamped on the parked cart, Resend `status=sent` for our smoke address) **but the `notification_log` row was misattributed** to tenant `00810252-...` (the first tenant in `ORDER BY id`) instead of `3d5571dd-...` — the sweep's recovery path leaned entirely on the RLS GUC (`app.current_tenant` via `set_config`) rather than the `tenant_id` column, and a scoped read under a pooled connection could resolve against the wrong tenant's scope. No customer data was exposed; the misattributed row was a phantom record under the wrong tenant.
+- **Fix (`512cad0`, deployed 2026-09-28):** scope every recovery-path query explicitly by `tenant_id` so the sweep is correct-by-construction, independent of GUC/RLS mechanics:
+  - Sweep candidates `WHERE tenant_id = $1 ...` (loop's `tid`), the mark `UPDATE ... WHERE id = $1 AND tenant_id = $2`, `SendCartAbandoned` email load `WHERE id = $1 AND tenant_id = $2`, item load `WHERE ci.cart_id = $1 AND ci.tenant_id = $2`.
+  - Cross-tenant regression test in `cart_recovery_test.go`: two idle+email+item carts in different tenants, each swept under its **own** tenant id (spy filtered by tenant).
+  - Full suite run as `shopkeet_app` (the FORCE-RLS owner role; the bootstrap test role is a superuser that bypasses RLS) — **all packages pass**.
+- **Live re-verify after `512cad0` (fix deploy `rjdmdv0x7ayitoqass4hio9n`, container `l6modsyezs1vlrv6ly1oqz4i-020157878918`):** armed **two** candidates in two tenants (re-armed parked `3d5571dd` cart + a fresh tenant `c6ec6c18-...` cart), then enqueued `cart:abandonment` on-demand (`redis://shopkeet-redis:6379` inside the `coolify` docker network via a cross-compiled static enqueue binary) → sweep fired "emailed 2 carts"; **both `notification_log` rows landed under their own tenant** (`3d5571dd` → `3d5571dd`, `c6ec6c18` → `c6ec6c18`), both `status=sent`, both carts stamped. Deployed binary strings confirm the `AND tenant_id = $N` clauses are in the image.
+- **Converted carts are structurally immune:** checkout deletes the cart + items in the order transaction (`orders.go` ~lines 408/412), so once an order exists the cart no longer exists to sweep. Covered by `TestCartRecoverySweep` (deletes the cart, sweep sends nothing).
+- Cleanup after verification: all throwaway `p17smoke*` tenants removed (posts/sections/templates/redirects included — created at signup by Phase 6 content seeding and blocked tenant FKs on the first cleanup pass); only prod-facing data remains.
+
 ### Phase 15 merchant operations, live 2026-09-27 (commit `0cf8112`)
 
 - **Deployed:** `0cf8112` (merge `aa1bb6f..0cf8112 main -> main`), Coolify deploy `uf0oter0melzd2puvkk8zy4c` → finished, new container `l6modsyezs1vlrv6ly1oqz4i-090720660839` healthy. Migration `0017` applied to prod DB before the deploy (`schema_migrations` = 17).
@@ -832,7 +848,7 @@ Default codes by status:
 
 ### Data layer (still manual containers, attached to `coolify` network)
 
-- `shopkeet-postgres` (postgres:16-alpine) → volume `infra_postgres_data` — **the real DB**, migrations 0001–0018 (`schema_migrations` at version 18; 0016 idempotency keys, 0017 merchant operations = `orders.source` + `returns`/`return_items`, 0018 product reviews).
+- `shopkeet-postgres` (postgres:16-alpine) → volume `infra_postgres_data` — **the real DB**, migrations 0001–0019 (`schema_migrations` at version 19; 0016 idempotency keys, 0017 merchant operations = `orders.source` + `returns`/`return_items`, 0018 product reviews, 0019 abandoned-cart recovery columns).
 - `shopkeet-redis` (redis:7-alpine) → volume `infra_redis_data` — cart reservation + product cache-aside + rate limiting + Asynq queues (all verified live 2026-09-26: rate-limit key `shopkeet:rl:...` observed with 429s, cache key `shopkeet:cache:product:{tid}/{id}/public` observed + TTL'd).
 - App connects via hostname **`shopkeet-postgres`** / **`shopkeet-redis`**. ⚠️ Do NOT use host `postgres` — or `redis` — on the coolify network: `coolify-db`/`coolify-redis` own those aliases and they point at Coolify's own auth'd instances (the `NOAUTH` incident on 2026-09-26).
 - Old manual `shopkeet-api` compose container: **stopped and removed** (Coolify is now the only API).
@@ -890,7 +906,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 16 | 14 | ✓ | Idempotency |
 | 17 | 15 | ✓ | Merchant Operations: `orders.source` + `returns` + `return_items` |
 | 18 | 16 | ✓ | Product Reviews: `product_reviews` + `products.rating_average/rating_count` |
-| 19 | 17 | | Abandoned Cart Recovery: `carts.customer_email` + `last_activity_at` + `recovery_sent_at` (+ partial scan index) |
+| 19 | 17 | ✓ | Abandoned Cart Recovery: `carts.customer_email` + `last_activity_at` + `recovery_sent_at` (+ partial scan index) |
 
 ---
 
