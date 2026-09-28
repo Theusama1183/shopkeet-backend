@@ -4,10 +4,18 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"io"
+	"net/http"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
 func randSuffix4() string {
@@ -137,4 +145,92 @@ func logCount(t *testing.T, pool *pgxpool.Pool, tid, cartID, email string) int {
 		t.Fatalf("commit: %v", err)
 	}
 	return n
+}
+
+// TestListLogRoute exercises GET /notifications/log end-to-end through the real
+// middleware. It guards a regression where the handler type-asserted Locals("tx")
+// against an inline interface instead of pgx.Tx; Go requires identical method
+// signatures, so that assertion never matched and the endpoint answered 500 for
+// every caller, on every tenant, in both an empty and a populated state.
+func TestListLogRoute(t *testing.T) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		t.Skip("DATABASE_URL not set; skipping integration")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+
+	const secret = "notif-log-test-secret"
+	sfx := randSuffix4()
+	tid, cartID, email := seedRecoveryCart(t, pool, sfx)
+
+	// No rows yet: the route must still answer 200 with an empty list.
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
+	RegisterRoutes(app.Group("/api/v1"), pool, secret)
+
+	merchantID := seedMerchantUser(t, pool, tid, sfx)
+	token, err := auth.Sign(secret, tid, merchantID, "owner", time.Hour)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	call := func() (int, string) {
+		t.Helper()
+		req, _ := http.NewRequest("GET", "/api/v1/notifications/log", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := app.Test(req, 5000)
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
+	}
+
+	if code, body := call(); code != 200 {
+		t.Fatalf("empty log: want 200, got %d (%s)", code, body)
+	}
+
+	// One row, written inside its own tenant-scoped tx the way the senders do.
+	New(pool, nil, "shopkeet.com").SendCartAbandoned(ctx, tid, cartID)
+
+	code, body := call()
+	if code != 200 {
+		t.Fatalf("populated log: want 200, got %d (%s)", code, body)
+	}
+	if !strings.Contains(body, email) {
+		t.Fatalf("log body missing recipient %s: %s", email, body)
+	}
+	if strings.Contains(body, `"notifications":null`) {
+		t.Fatalf("log serialised null instead of a list: %s", body)
+	}
+}
+
+func seedMerchantUser(t *testing.T, pool *pgxpool.Pool, tid, sfx string) string {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+		t.Fatalf("set tenant: %v", err)
+	}
+	var id string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO merchant_users (tenant_id, email, password_hash, role)
+		VALUES ($1, $2, 'x', 'owner') RETURNING id`,
+		tid, "notif-"+sfx+"@example.com").Scan(&id); err != nil {
+		t.Fatalf("seed merchant user: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	return id
 }

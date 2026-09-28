@@ -1,9 +1,11 @@
 package notifications
 
 import (
-	"context"
+	"log"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/auth"
@@ -16,13 +18,10 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string) {
 }
 
 func listLog(c *fiber.Ctx) error {
-	tx, ok := c.Locals("tx").(interface {
-		Query(context.Context, string, ...any) (interface {
-			Next() bool
-			Scan(...any) error
-			Close()
-		}, error)
-	})
+	// Must be the pgx.Tx assertion: a structurally-identical anonymous interface
+	// never matches, because pgx.Tx.Query returns the concrete pgx.Rows type and
+	// Go method sets require identical signatures, not assignable ones.
+	tx, ok := c.Locals("tx").(pgx.Tx)
 	if !ok {
 		return httperr.ErrInternalServerError
 	}
@@ -33,15 +32,24 @@ func listLog(c *fiber.Ctx) error {
 		ORDER BY sent_at DESC
 		LIMIT 100`)
 	if err != nil {
+		log.Printf("[notifications] log query failed: %v", err)
 		return httperr.ErrInternalServerError
 	}
 	defer rows.Close()
 
-	var out []fiber.Map
+	var out = []fiber.Map{}
 	for rows.Next() {
-		var id, typ, recipient, status, sentAt string
+		// sent_at is timestamptz: pgx cannot scan that into a string, so it is
+		// decoded as time.Time and formatted the same way as the other endpoints.
+		var id, typ, recipient, status string
+		var sentAt time.Time
 		var orderID *string
 		if err := rows.Scan(&id, &typ, &recipient, &orderID, &status, &sentAt); err != nil {
+			log.Printf("[notifications] log scan failed: %v", err)
+			return httperr.ErrInternalServerError
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("[notifications] log rows failed: %v", err)
 			return httperr.ErrInternalServerError
 		}
 		m := fiber.Map{
@@ -49,7 +57,7 @@ func listLog(c *fiber.Ctx) error {
 			"notification_type": typ,
 			"recipient":         recipient,
 			"status":            status,
-			"sent_at":           sentAt,
+			"sent_at":           sentAt.Format(time.RFC3339),
 		}
 		if orderID != nil {
 			m["order_id"] = *orderID
