@@ -836,11 +836,12 @@ exhausted/disabled/expired card is 400, so the cart keeps its previous code.
 | Resource | Identifier | Status |
 |----------|-----------|--------|
 | Coolify app `shopkeet-api` | uuid `l6modsyezs1vlrv6ly1oqz4i` | **running:healthy** |
-| Live commit | `512cad0` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-020157878918` (deploy `rjdmdv0x7ayitoqass4hio9n`, Phase 17 recovery fix, 2026-09-28); prior: `46390e2` (Phase 17 abandoned-cart recovery, deploy `dwid6sl0plevyzhm6lbsqmbs`, 2026-09-27); before that: `c6353e0` (Phase 16 reviews + route-order fix) |
+| Live commit | `19fb065` (`main`) | container `l6modsyezs1vlrv6ly1oqz4i-045123182894` (deploy `6wm4bohw4wdk96lmzmvaxpme`, Phase 18 tenant-scope fix, 2026-09-28); prior: `a5a0dd3` (Phase 18 gift cards, deploy `e0sdsfzqfk7g0t9ksfsfqo41`); before that `512cad0` (Phase 17 recovery fix, deploy `rjdmdv0x7ayitoqass4hio9n`); `46390e2` (Phase 17 abandoned-cart recovery, deploy `dwid6sl0plevyzhm6lbsqmbs`); before that `c6353e0` (Phase 16 reviews + route-order fix) |
 | Domain | `https://api.shopkeet.com` | 200 (`/healthz` → `{"status":"ok"}`), TLS via Coolify proxy |
 | Source | `Theusama1183/shopkeet-backend`, branch `main` | build pack `dockerfile`, `base_directory /apps/api`, `dockerfile_location /Dockerfile`, `ports_exposes 3001` |
 | Auto-deploy | `is_auto_deploy_enabled=true` | pushes to `main` trigger builds (webhook; fallback: `POST /api/v1/deploy?uuid={uuid}&force=true` — do **not** use `/applications/{uuid}/start` or `/applications/{uuid}/deploy`, both 404; `/applications/{uuid}/restart` restarts without rebuild) |
 | Env | 12 vars incl. `DATABASE_URL`, `REDIS_URL`, JWT/R2/METRICS + `APP_BASE_DOMAIN=shopkeet.com` + `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL` | `PORT` unset → default 3001; `SMTP_*` vars **removed** (2026-09-26) so Resend is the active provider |
+| ⚠️ `DATABASE_URL` role | **`postgres://shopkeet:shopkeet@shopkeet-postgres:5432/shopkeet?sslmode=disable`** | `shopkeet` is a **SUPERUSER** (`rolsuper = t`) → **`FORCE ROW LEVEL SECURITY` is bypassed in production and every `tenant_isolation` policy is inert**. Migrations correctly run as `shopkeet_app`, but the API itself does not. Tenant isolation therefore depends on explicit `tenant_id` predicates in every query (enforced by the Phase 18 fix `19fb065`), not on RLS. Switching the live role to `shopkeet_app` would make the RLS guarantee real again — recommended, but deliberately left as a separate decision. |
 | `REDIS_URL` | **`redis://shopkeet-redis:6379`** (fixed 2026-09-26) | was wrongly `redis://redis:6379` → resolved to Coolify's own auth'd `coolify-redis` on the `coolify` network, all Asynq ops `NOAUTH` + cache/rate-limit silently dead; fixed via `PATCH /api/v1/applications/{uuid}/envs` |
 
 ### Notifications & email (Phase 12, live via Resend 2026-09-26)
@@ -881,6 +882,25 @@ exhausted/disabled/expired card is 400, so the cart keeps its previous code.
 - **Converted carts are structurally immune:** checkout deletes the cart + items in the order transaction (`orders.go` ~lines 408/412), so once an order exists the cart no longer exists to sweep. Covered by `TestCartRecoverySweep` (deletes the cart, sweep sends nothing).
 - Cleanup after verification: all throwaway `p17smoke*` tenants removed (posts/sections/templates/redirects included — created at signup by Phase 6 content seeding and blocked tenant FKs on the first cleanup pass); only prod-facing data remains.
 
+### Phase 18 gift cards, live 2026-09-28 (commits `a5a0dd3` + `19fb065`)
+
+- **Deployed:** `a5a0dd3` (feature: `gift_cards` + `carts.gift_card_code` + `orders.gift_card_code`/`gift_card_cents`, `internal/giftcards`, `POST /cart/gift-card`, checkout claim, tests). Migration `0020` applied to prod DB via cross-compiled `migrate-linux` (`schema_migrations` = 20, clean; verified table + CHECKs + FORCE RLS + `OWNER shopkeet_app` + all 3 new columns). Coolify deploy `e0sdsfzqfk7g0t9ksfsfqo41` → finished, container `l6modsyezs1vlrv6ly1oqz4i-022536680437` healthy on image `a5a0dd3183d7…`.
+- **Live smoke found a cross-tenant leak, then a deeper root cause.** Tenant B applied tenant A's `GC-PARTIAL` and got **200**. The gift-card lookup filtered on `code` only, relying on the RLS GUC to add the tenant.
+- **Root cause of the root cause: production connects as a SUPERUSER.** Live env `DATABASE_URL = postgres://shopkeet:shopkeet@shopkeet-postgres:5432/shopkeet?sslmode=disable`, and `shopkeet` has `rolsuper = t`. Superusers **bypass `FORCE ROW LEVEL SECURITY` entirely**, so in production every `tenant_isolation` policy is inert and `set_config('app.current_tenant', …)` scopes nothing on its own. Confirmed directly: as `shopkeet` with the GUC set to a different tenant, `SELECT … FROM gift_cards` still returned the other tenant's rows. This is the same mechanism behind the Phase 17 misattribution, and it means the documented RLS guarantee has not been enforced in prod at all. **Recommended follow-up (not done — config decision, needs its own change):** point live `DATABASE_URL` at `shopkeet_app` to make RLS real; the full suite passes as that role, and after `19fb065` no code path depends on the bypass.
+- **Fix (`19fb065`): every tenant predicate is now explicit, so isolation holds by construction** regardless of DB role — the Phase 17 principle generalised:
+  - `gift_cards`: `Resolve`/`Claim` take `tenantID` and use `WHERE tenant_id = $1 AND code = $2` (`+ FOR UPDATE`); the debit is `WHERE id = $2 AND tenant_id = $3`; `GET /gift-cards` lists `WHERE tenant_id = $1`.
+  - `discounts` (same class, pre-existing since Phase 10): `Resolve`/`Claim` + `List`/`Get`/`Update`/`Delete` all carry `tenant_id`.
+  - `carts`: `customer_session` is client-supplied and only unique per tenant (`UNIQUE (tenant_id, customer_session)`), so every cart query now filters `tenant_id` too — `loadCart`, item add/update/delete, discount apply, gift-card apply, `POST /cart/email`. **The checkout cart lookup was the worst case:** a guest could have named another tenant's `customer_session` and checked out that tenant's cart.
+  - Regression test `TestTenantScopeWithoutRLS` connects as a **superuser** to reproduce the production condition (RLS would otherwise mask the bug) and asserts: other tenant's `Resolve`/`Claim` → 404, the owner's balance is not debited, and the owner still resolves normally.
+- **Live re-verify after `19fb065`** (deploy `6wm4bohw4wdk96lmzmvaxpme` → finished, container `l6modsyezs1vlrv6ly1oqz4i-045123182894` healthy on image `19fb06515c01…`; binary strings confirm `FROM gift_cards WHERE tenant_id = $1 AND code = $2` and the carts/discounts predicates):
+  - Guards: unknown code 404 · `amount_cents` 0/negative 400 · no bearer 401 · duplicate code 409 · lowercase `gc-full` normalised to `GC-FULL` · empty code auto-generates `GC-XXXXXXXX` · `GET /gift-cards` newest-first.
+  - Partial card: 2000 + 500 shipping = 2500 due, `GC-PARTIAL` (1000) → order `gift_card_cents=1000`, `total_cents=1500`; card balance → 0; re-applying it then 400 `gift card has no remaining balance`.
+  - Oversized card: 2500 due, `GC-FULL` (4000) → `gift_card_cents=2500`, **`total_cents=0`** (floor holds), **1500 left on the card**.
+  - **Acceptance criterion live:** two concurrent checkouts racing for the last 500 of a 500 card → **exactly one 201 and one 400 `gift card has no remaining balance`**; card balance 0, exactly one order.
+  - **Cross-tenant probe:** a second tenant applying either code → **404**; its cart carries no code; its `GET /gift-cards` → `[]`; DB confirms it owns 0 orders, 0 cards, 0 carts with a code.
+  - Per-order snapshots verified in the DB (`GC-PARTIAL|1000|1500`, `GC-FULL|2500|0`, `GC-5B6DCEC0|500|10000`); no gift-card order exists outside the smoke tenants.
+  - Cleanup: all 6 `p18*` smoke tenants removed (orders before tenants for the FK); `tenants|0`, `gift_cards|0`, no orphans. Real data untouched (506 tenants, 135 orders, `schema_migrations|20`).
+
 ### Phase 15 merchant operations, live 2026-09-27 (commit `0cf8112`)
 
 - **Deployed:** `0cf8112` (merge `aa1bb6f..0cf8112 main -> main`), Coolify deploy `uf0oter0melzd2puvkk8zy4c` → finished, new container `l6modsyezs1vlrv6ly1oqz4i-090720660839` healthy. Migration `0017` applied to prod DB before the deploy (`schema_migrations` = 17).
@@ -893,7 +913,7 @@ exhausted/disabled/expired card is 400, so the cart keeps its previous code.
 
 ### Data layer (still manual containers, attached to `coolify` network)
 
-- `shopkeet-postgres` (postgres:16-alpine) → volume `infra_postgres_data` — **the real DB**, migrations 0001–0019 (`schema_migrations` at version 19; 0016 idempotency keys, 0017 merchant operations = `orders.source` + `returns`/`return_items`, 0018 product reviews, 0019 abandoned-cart recovery columns).
+- `shopkeet-postgres` (postgres:16-alpine) → volume `infra_postgres_data` — **the real DB**, migrations 0001–0020 (`schema_migrations` at version 20; 0016 idempotency keys, 0017 merchant operations = `orders.source` + `returns`/`return_items`, 0018 product reviews, 0019 abandoned-cart recovery columns, 0020 gift cards).
 - `shopkeet-redis` (redis:7-alpine) → volume `infra_redis_data` — cart reservation + product cache-aside + rate limiting + Asynq queues (all verified live 2026-09-26: rate-limit key `shopkeet:rl:...` observed with 429s, cache key `shopkeet:cache:product:{tid}/{id}/public` observed + TTL'd).
 - App connects via hostname **`shopkeet-postgres`** / **`shopkeet-redis`**. ⚠️ Do NOT use host `postgres` — or `redis` — on the coolify network: `coolify-db`/`coolify-redis` own those aliases and they point at Coolify's own auth'd instances (the `NOAUTH` incident on 2026-09-26).
 - Old manual `shopkeet-api` compose container: **stopped and removed** (Coolify is now the only API).
@@ -922,6 +942,7 @@ exhausted/disabled/expired card is 400, so the cart keeps its previous code.
 - Guest cart/checkout rides `X-Customer-Session` header (e.g. `sess-e2e-1`).
 - Order status transitions are strictly linear: `pending → confirmed → shipped → delivered` (or cancel from pending/confirmed); jumping straight to `delivered` → `400 invalid status transition`.
 - Coolify auto-deploy webhook has not been observed firing; after a push, force deploy via the **verified** endpoint: `POST /api/v1/deploy?uuid=l6modsyezs1vlrv6ly1oqz4i&force=true` (NOT `/applications/{uuid}/start` or `/applications/{uuid}/deploy` — both 404).
+- ⚠️ **Never rely on the RLS GUC to scope a query in this codebase.** The live API connects as a superuser, so `set_config('app.current_tenant', …)` filters nothing on its own. Every tenant predicate must be explicit (`WHERE tenant_id = $N`) — two live cross-tenant bugs (Phase 17 recovery, Phase 18 gift cards) came from that assumption. Corollary for ad-hoc prod debugging: `psql` as `shopkeet` + `set_config(...)` also shows *all* tenants' rows, so DB verification must filter `tenant_id` explicitly too.
 
 ### Migration runbook
 
@@ -952,7 +973,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 17 | 15 | ✓ | Merchant Operations: `orders.source` + `returns` + `return_items` |
 | 18 | 16 | ✓ | Product Reviews: `product_reviews` + `products.rating_average/rating_count` |
 | 19 | 17 | ✓ | Abandoned Cart Recovery: `carts.customer_email` + `last_activity_at` + `recovery_sent_at` (+ partial scan index) |
-| 20 | 18 | pending | Gift Cards: `gift_cards` + `carts.gift_card_code` + `orders.gift_card_code`/`gift_card_cents` |
+| 20 | 18 | ✓ | Gift Cards: `gift_cards` + `carts.gift_card_code` + `orders.gift_card_code`/`gift_card_cents` |
 
 ---
 
@@ -986,6 +1007,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestSendCartAbandoned` | `internal/notifications` | 17 |
 | `TestGiftCardsAdmin` | `internal/giftcards` | 18 |
 | `TestResolveValidations` | `internal/giftcards` | 18 |
+| `TestTenantScopeWithoutRLS` | `internal/giftcards` | 18 |
 | `TestGiftCardCheckoutSnapshot` | `internal/orders` | 18 |
 | `TestGiftCardConcurrentDoubleSpend` | `internal/orders` | 18 |
 
