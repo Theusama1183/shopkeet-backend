@@ -241,14 +241,25 @@ func (s *Service) CreateZone(c *fiber.Ctx) error {
 		return httperr.ErrInternalServerError
 	}
 	var id string
+	// countries/regions are NOT NULL with a '{}' default. Passing a Go nil slice
+	// sends an explicit NULL, which bypasses the default and trips the NOT NULL
+	// constraint — so an omitted array must become an empty array, not nil.
+	countries := req.Countries
+	if countries == nil {
+		countries = []string{}
+	}
+	regions := req.Regions
+	if regions == nil {
+		regions = []string{}
+	}
 	if err := tx.QueryRow(c.Context(), `
 		INSERT INTO shipping_zones (tenant_id, name, countries, regions)
 		VALUES ($1, $2, $3, $4) RETURNING id`,
-		tenantID(c), req.Name, req.Countries, req.Regions).Scan(&id); err != nil {
+		tenantID(c), req.Name, countries, regions).Scan(&id); err != nil {
 		return httperr.ErrInternalServerError
 	}
 	return c.Status(fiber.StatusCreated).JSON(ZoneJSON{
-		ID: id, Name: req.Name, Countries: req.Countries, Regions: req.Regions,
+		ID: id, Name: req.Name, Countries: countries, Regions: regions,
 	})
 }
 

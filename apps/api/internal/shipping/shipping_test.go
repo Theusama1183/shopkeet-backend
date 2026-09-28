@@ -128,6 +128,23 @@ func TestShippingRLSIsolation(t *testing.T) {
 		t.Fatalf("region-restricted zone not persisted: %+v", zA2)
 	}
 
+	// Omitting both arrays must be accepted: countries/regions are NOT NULL with
+	// a '{}' default, and sending a Go nil slice would insert an explicit NULL
+	// and fail the constraint (this endpoint used to answer 500).
+	zoneMinimal := do("POST", "/api/v1/shipping/zones", aID, aTok,
+		`{"name":"No Arrays"}`, fiber.StatusCreated)
+	var zMin payload
+	json.NewDecoder(zoneMinimal.Body).Decode(&zMin)
+	if zMin.ID == "" {
+		t.Fatalf("zone without arrays not created: %+v", zMin)
+	}
+	if zMin.Countries == nil || zMin.Regions == nil {
+		t.Fatalf("omitted arrays should come back empty, not null: %+v", zMin)
+	}
+	if len(zMin.Countries) != 0 || len(zMin.Regions) != 0 {
+		t.Fatalf("omitted arrays should be empty: %+v", zMin)
+	}
+
 	zoneB := do("POST", "/api/v1/shipping/zones", bID, bTok,
 		`{"name":"B Zone","countries":["PK"],"regions":[]}`, fiber.StatusCreated)
 	var zB payload
