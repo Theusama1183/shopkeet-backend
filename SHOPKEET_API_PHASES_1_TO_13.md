@@ -1,7 +1,7 @@
 # Shopkeet API — Complete Reference (Phases 1–13)
 
-**Last updated:** 2026-09-25  
-**DB version:** 15 (migrations 0001–0015 applied on VPS)  
+**Last updated:** 2026-09-28  
+**DB version:** 21 (migrations 0001–0021 applied on VPS)  
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthy)  
 **All acceptance tests:** PASS  
 **Stack:** Go 1.27 · Fiber · pgx/pgxpool · PostgreSQL 16 (RLS + FORCE) · Redis 7 · golang-migrate (embedded)
@@ -24,7 +24,11 @@
 12. [Notifications (Phase 12)](#notifications-phase-12)
 13. [Store Settings, Order Notes & Tax (Phase 13)](#store-settings-order-notes--tax-phase-13)
 14. [Merchant Operations: Draft Orders & Returns (Phase 15)](#merchant-operations-draft-orders--returns-phase-15)
-15. [Database Schema Summary](#database-schema-summary)
+15. [Product Reviews (Phase 16)](#product-reviews-phase-16)
+16. [Abandoned Cart Recovery & Lifecycle Emails (Phase 17)](#abandoned-cart-recovery--lifecycle-emails-phase-17)
+17. [Gift Cards (Phase 18)](#gift-cards-phase-18)
+18. [Pre-orders & Back-in-Stock Alerts (Phase 19)](#phase-19--pre-orders--back-in-stock-alerts)
+19. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
 18. [Env Vars & Config](#env-vars--config)
@@ -722,6 +726,12 @@ product_reviews
 gift_cards
 -- carts:  gift_card_code TEXT
 -- orders: gift_card_code TEXT, gift_card_cents INTEGER NOT NULL DEFAULT 0
+
+-- Phase 19
+-- product_variants: allow_preorder BOOLEAN DEFAULT false, preorder_ships_at TIMESTAMPTZ
+-- order_items: is_preorder BOOLEAN DEFAULT false
+back_in_stock_subscriptions
+-- notification_log: type 'back_in_stock'
 ```
 
 **Every tenant-scoped table has:**
@@ -760,6 +770,103 @@ Default codes by status:
 - 409 → `conflict`
 - 502 → `upstream_error`
 - 5xx → `internal_error`
+
+---
+
+## Phase 19 — Pre-orders & Back-in-Stock Alerts
+
+Pre-orderable variants can be checked out with zero stock; shoppers can subscribe to
+out-of-stock, non-preorderable variants and receive exactly one email when the
+merchant restocks.
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/products/:id/variants/:variantId/notify-me` | Public | Subscribe to restock alert. Body: `{email}`. 201 created, 409 "already subscribed" (per-variant, case-insensitive email). 400 if variant is preorderable, in stock, or not found. |
+| POST | `/products` | Admin | Create product. Body now accepts `allow_preorder` (bool) and `preorder_ships_at` (RFC3339, optional) on the initial variant. |
+| POST | `/products/:id/variants` | Admin | Create variant. Body: `{..., allow_preorder?, preorder_ships_at?}`. |
+| PATCH | `/products/:id/variants/:variantId` | Admin | Update variant. Body: `{..., allow_preorder?, preorder_ships_at?}`. Restock (0 → positive inventory) emits `variant.restocked` event after commit. |
+| POST | `/checkout` | Customer | Guest or customer JWT. If line has `allow_preorder=true` and stock < quantity, line is marked `is_preorder=true`, no stock decrement, order proceeds. |
+
+### Variant JSON (detail)
+
+```json
+{
+  "id": "...",
+  "option_values": [{"option_id": "...", "value_id": "..."}],
+  "sku": "ABC-123",
+  "price_cents": 1999,
+  "inventory_count": 0,
+  "weight_grams": 200,
+  "status": "active",
+  "allow_preorder": true,
+  "preorder_ships_at": "2026-11-01T09:00:00Z"
+}
+```
+
+### Checkout pre-order behavior
+
+- If `variant.allow_preorder` AND `inventory < quantity` → line becomes a **pre-order** (`order_items.is_preorder = true`).
+- Pre-order lines **do not decrement** `product_variants.inventory_count`.
+- Non-preorder lines with insufficient stock → 409 as before.
+- `order_items` snapshots `is_preorder` at checkout time.
+
+### Back-in-stock flow
+
+1. Shopper POSTs `/products/:id/variants/:variantId/notify-me` (public) with email → 201 subscription recorded in `back_in_stock_subscriptions` (FORCE RLS, owner `shopkeet_app`).
+2. Merchant PATCHes variant with `inventory_count > 0` (was 0) → restock detected, `variant.restocked` event emitted via `auth.AfterCommit`.
+3. Notifications subscriber (`onVariantRestocked`) runs `deliverBackInStock` goroutine:
+   - Claims each unnotified subscription with `UPDATE ... SET notified_at = now() WHERE id = $1 AND notified_at IS NULL` (rows_affected == 1 ⇒ exactly once).
+   - Sends email via provider (`notification_type = 'back_in_stock'`).
+   - Logs `notification_log` row (`status = 'sent'` or `'failed'` — failed still stamps claim, never re-emails).
+3. Subscriber with notified_at stamp is removed from future alerts; restocked variant now rejects notify-me (400 "variant is in stock").
+
+### Tables
+
+```sql
+-- Phase 19
+ALTER TABLE product_variants
+  ADD COLUMN allow_preorder BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN preorder_ships_at TIMESTAMPTZ;
+
+ALTER TABLE order_items
+  ADD COLUMN is_preorder BOOLEAN NOT NULL DEFAULT false;
+
+CREATE TABLE back_in_stock_subscriptions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL REFERENCES tenants(id),
+  variant_id UUID NOT NULL REFERENCES product_variants(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  notified_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE back_in_stock_subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE back_in_stock_subscriptions FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON back_in_stock_subscriptions
+  USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
+ALTER TABLE back_in_stock_subscriptions OWNER TO shopkeet_app;
+CREATE UNIQUE INDEX back_in_stock_subscriptions_email_key
+  ON back_in_stock_subscriptions (tenant_id, variant_id, lower(email));
+-- notification_log: type 'back_in_stock' added
+```
+
+### Events (internal bus)
+
+| Event | Trigger | Payload |
+|-------|---------|---------|
+| `variant.restocked` | PATCH moves inventory 0 → positive | `{variant_id, product_id, tenant_id}` |
+
+Handler: `notifications.onVariantRestocked` → `deliverBackInStock`.
+
+### Acceptance criteria (live smoke passed 2026-09-28, commit `1eb5c4f`)
+
+- Preorder variant (0 stock, `allow_preorder=true`) → checkout 201, `is_preorder=true`, inventory stays 0.
+- Out-of-stock non-preorder variant → notify-me 201 (dup 409, second email 201).
+- Cross-tenant notify-me on variant → 404.
+- Restock PATCH → `variant.restocked` → subs `notified_at` stamped, `notification_log` rows `back_in_stock|failed` (Resend rejects `example.com` in smoke; real emails use valid domains → `sent`).
+- Notify-me on restocked variant → 400 "variant is in stock".
+- Exactly-once verified: concurrent restock events → each sub emailed once (claim UPDATE guard).
 
 ---
 
@@ -979,6 +1086,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 18 | 16 | ✓ | Product Reviews: `product_reviews` + `products.rating_average/rating_count` |
 | 19 | 17 | ✓ | Abandoned Cart Recovery: `carts.customer_email` + `last_activity_at` + `recovery_sent_at` (+ partial scan index) |
 | 20 | 18 | ✓ | Gift Cards: `gift_cards` + `carts.gift_card_code` + `orders.gift_card_code`/`gift_card_cents` |
+| 21 | 19 | ✓ | Pre-orders & Back-in-Stock: `product_variants.allow_preorder`/`preorder_ships_at`, `order_items.is_preorder`, `back_in_stock_subscriptions` + `notification_log` type `back_in_stock` |
 
 ---
 
@@ -1015,6 +1123,10 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestTenantScopeWithoutRLS` | `internal/giftcards` | 18 |
 | `TestGiftCardCheckoutSnapshot` | `internal/orders` | 18 |
 | `TestGiftCardConcurrentDoubleSpend` | `internal/orders` | 18 |
+| `TestPreorderCheckout` | `internal/orders` | 19 |
+| `TestNotifyMe` | `internal/catalog` | 19 |
+| `TestVariantPreorderFields` | `internal/catalog` | 19 |
+| `TestDeliverBackInStockExactlyOnce` | `internal/notifications` | 19 |
 
 Run:  
 ```bash
