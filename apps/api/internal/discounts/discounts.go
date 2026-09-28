@@ -124,10 +124,16 @@ func scanDiscount(row pgx.Row) (discountRow, error) {
 	return d, err
 }
 
-// Resolve validates a code against a subtotal without writing. Used by the
-// cart apply/read path where checkout remains authoritative.
-func Resolve(ctx context.Context, tx pgx.Tx, code string, subtotalCents int) (*Quote, error) {
-	d, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE code = $1", code))
+// Resolve validates a code against a subtotal without writing, scoped to
+// tenantID. Used by the cart apply/read path where checkout remains
+// authoritative.
+//
+// The explicit tenant_id predicate is load-bearing, not redundant with RLS:
+// production's DATABASE_URL connects as a superuser role, which bypasses FORCE
+// ROW LEVEL SECURITY, so a code-only predicate would resolve another tenant's
+// discount.
+func Resolve(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents int) (*Quote, error) {
+	d, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE tenant_id = $1 AND code = $2", tenantID, code))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalid(fiber.StatusNotFound, "discount code not found")
 	}
@@ -141,10 +147,11 @@ func Resolve(ctx context.Context, tx pgx.Tx, code string, subtotalCents int) (*Q
 }
 
 // Claim re-validates a code and, if valid, atomically increments times_used
-// inside the caller's (checkout) transaction. The FOR UPDATE lock serializes
-// concurrent checkouts so a usage_limit=1 code is consumed exactly once.
-func Claim(ctx context.Context, tx pgx.Tx, code string, subtotalCents int) (*Quote, error) {
-	d, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE code = $1 FOR UPDATE", code))
+// inside the caller's (checkout) transaction, scoped to tenantID. The FOR UPDATE
+// lock serializes concurrent checkouts so a usage_limit=1 code is consumed
+// exactly once.
+func Claim(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents int) (*Quote, error) {
+	d, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE tenant_id = $1 AND code = $2 FOR UPDATE", tenantID, code))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalid(fiber.StatusNotFound, "discount code not found")
 	}
@@ -155,7 +162,7 @@ func Claim(ctx context.Context, tx pgx.Tx, code string, subtotalCents int) (*Quo
 		return nil, err
 	}
 	if _, err := tx.Exec(ctx,
-		"UPDATE discounts SET times_used = times_used + 1 WHERE id = $1", d.id); err != nil {
+		"UPDATE discounts SET times_used = times_used + 1 WHERE id = $1 AND tenant_id = $2", d.id, tenantID); err != nil {
 		return nil, err
 	}
 	return &Quote{Code: d.code, DiscountCents: d.discount(subtotalCents)}, nil
@@ -247,13 +254,15 @@ func validateFields(code, dType string, valuePercent, valueCents, minSubtotal, u
 
 // --- admin handlers --------------------------------------------------------------
 
-// ListDiscounts handles GET /discounts (Admin). Newest first.
+// ListDiscounts handles GET /discounts (Admin). Newest first. Scoped to the
+// caller's tenant explicitly.
 func (s *Service) ListDiscounts(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
 		return httperr.ErrInternalServerError
 	}
-	rows, err := tx.Query(c.Context(), discountSelect+" ORDER BY created_at DESC, id")
+	rows, err := tx.Query(c.Context(),
+		discountSelect+" WHERE tenant_id = $1 ORDER BY created_at DESC, id", tenantID(c))
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
@@ -342,7 +351,7 @@ func (s *Service) GetDiscount(c *fiber.Ctx) error {
 		return httperr.ErrInternalServerError
 	}
 	d, err := scanDiscount(tx.QueryRow(c.Context(),
-		discountSelect+" WHERE id = $1", c.Params("id")))
+		discountSelect+" WHERE id = $1 AND tenant_id = $2", c.Params("id"), tenantID(c)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return httperr.C(fiber.StatusNotFound, "discount not found")
 	}
@@ -365,7 +374,8 @@ func (s *Service) UpdateDiscount(c *fiber.Ctx) error {
 		return httperr.ErrInternalServerError
 	}
 	ctx := c.Context()
-	cur, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE id = $1 FOR SHARE", c.Params("id")))
+	cur, err := scanDiscount(tx.QueryRow(ctx,
+		discountSelect+" WHERE id = $1 AND tenant_id = $2 FOR SHARE", c.Params("id"), tenantID(c)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return httperr.C(fiber.StatusNotFound, "discount not found")
 	}
@@ -423,11 +433,11 @@ func (s *Service) UpdateDiscount(c *fiber.Ctx) error {
 	d, err := scanDiscount(tx.QueryRow(ctx, `
 		UPDATE discounts SET code = $1, type = $2, value_percent = $3, value_cents = $4,
 			min_subtotal_cents = $5, starts_at = $6, ends_at = $7, usage_limit = $8, status = $9
-		WHERE id = $10
+		WHERE id = $10 AND tenant_id = $11
 		RETURNING id, code, type, value_percent, value_cents, min_subtotal_cents,
 			starts_at, ends_at, usage_limit, times_used, status, created_at`,
 		code, dType, valuePercent, valueCents, minSubtotal, start, end, usageLimit, status,
-		c.Params("id")))
+		c.Params("id"), tenantID(c)))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return httperr.C(fiber.StatusConflict, "discount code already exists")
@@ -444,7 +454,8 @@ func (s *Service) DeleteDiscount(c *fiber.Ctx) error {
 	if !ok {
 		return httperr.ErrInternalServerError
 	}
-	tag, err := tx.Exec(c.Context(), "DELETE FROM discounts WHERE id = $1", c.Params("id"))
+	tag, err := tx.Exec(c.Context(), "DELETE FROM discounts WHERE id = $1 AND tenant_id = $2",
+		c.Params("id"), tenantID(c))
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}

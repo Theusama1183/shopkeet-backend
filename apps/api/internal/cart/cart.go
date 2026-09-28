@@ -74,12 +74,19 @@ type cartPayload struct {
 // and the applied gift_card_code with a predicted gift_card_cents (both
 // best-effort — checkout re-validates authoritatively). Returns (nil, nil)
 // when the session has no cart yet.
+//
+// Every query is scoped by tenant_id explicitly. customer_session is a
+// client-supplied string that is only unique per tenant (UNIQUE (tenant_id,
+// customer_session)), so a session-only predicate could read another tenant's
+// cart whenever the role the API connects as bypasses RLS.
 func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 	ctx := c.Context()
+	tid, _ := c.Locals("tenant_id").(string)
 	var cartID, discountCode, giftCardCode, email string
 	err := tx.QueryRow(ctx,
-		"SELECT id, COALESCE(discount_code, ''), COALESCE(gift_card_code, ''), COALESCE(customer_email, '') FROM carts WHERE customer_session = $1",
-		session).Scan(&cartID, &discountCode, &giftCardCode, &email)
+		`SELECT id, COALESCE(discount_code, ''), COALESCE(gift_card_code, ''), COALESCE(customer_email, '')
+		FROM carts WHERE tenant_id = $1 AND customer_session = $2`,
+		tid, session).Scan(&cartID, &discountCode, &giftCardCode, &email)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -93,8 +100,8 @@ func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 		FROM cart_items ci
 		JOIN products p ON p.id = ci.product_id
 		JOIN product_variants v ON v.id = ci.variant_id
-		WHERE ci.cart_id = $1
-		ORDER BY p.name`, cartID)
+		WHERE ci.cart_id = $1 AND ci.tenant_id = $2
+		ORDER BY p.name`, cartID, tid)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +126,7 @@ func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 	cp.giftCardCode = giftCardCode
 	cp.email = email
 	if discountCode != "" {
-		if q, err := discounts.Resolve(ctx, tx, discountCode, cp.total); err == nil {
+		if q, err := discounts.Resolve(ctx, tx, tid, discountCode, cp.total); err == nil {
 			cp.discountCents = q.DiscountCents
 		}
 	}
@@ -127,7 +134,7 @@ func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 		// Best-effort preview: what the card would cover against the goods total
 		// (no shipping/tax yet — checkout is authoritative). An invalid card
 		// still shows its code with 0 predicted cents, exactly like a bad code.
-		if q, err := giftcards.Resolve(ctx, tx, giftCardCode); err == nil {
+		if q, err := giftcards.Resolve(ctx, tx, tid, giftCardCode); err == nil {
 			avail := cp.total - cp.discountCents
 			if avail < 0 {
 				avail = 0
@@ -239,7 +246,7 @@ func (s *Service) AddItem(c *fiber.Ctx) error {
 	}
 	var cartID string
 	if err := tx.QueryRow(ctx,
-		"SELECT id FROM carts WHERE customer_session = $1", session).Scan(&cartID); err != nil {
+		"SELECT id FROM carts WHERE tenant_id = $1 AND customer_session = $2", tid, session).Scan(&cartID); err != nil {
 		return httperr.ErrInternalServerError
 	}
 	if _, err := tx.Exec(ctx, `
@@ -257,7 +264,8 @@ func (s *Service) AddItem(c *fiber.Ctx) error {
 	// Phase 17 — cart activity: an add-to-cart is a sign of intent; refresh the
 	// recovery clock so the abandoned-cart sweep starts over for active carts.
 	if _, err := tx.Exec(ctx,
-		"UPDATE carts SET last_activity_at = now() WHERE customer_session = $1", session); err != nil {
+		"UPDATE carts SET last_activity_at = now() WHERE tenant_id = $1 AND customer_session = $2",
+		tid, session); err != nil {
 		return httperr.ErrInternalServerError
 	}
 
@@ -285,11 +293,12 @@ func (s *Service) UpdateItemQuantity(c *fiber.Ctx) error {
 	if !ok {
 		return httperr.ErrInternalServerError
 	}
+	tid, _ := c.Locals("tenant_id").(string)
 	tag, err := tx.Exec(c.Context(), `
 		UPDATE cart_items ci SET quantity = $1
 		FROM carts c
-		WHERE ci.id = $2 AND ci.cart_id = c.id AND c.customer_session = $3`,
-		req.Quantity, c.Params("id"), customerSession(c))
+		WHERE ci.id = $2 AND ci.cart_id = c.id AND c.tenant_id = $3 AND c.customer_session = $4`,
+		req.Quantity, c.Params("id"), tid, customerSession(c))
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
@@ -297,8 +306,8 @@ func (s *Service) UpdateItemQuantity(c *fiber.Ctx) error {
 		return httperr.C(fiber.StatusNotFound, "cart item not found")
 	}
 	if _, err := tx.Exec(c.Context(),
-		"UPDATE carts SET last_activity_at = now() WHERE customer_session = $1",
-		customerSession(c)); err != nil {
+		"UPDATE carts SET last_activity_at = now() WHERE tenant_id = $1 AND customer_session = $2",
+		tid, customerSession(c)); err != nil {
 		return httperr.ErrInternalServerError
 	}
 	cp, err := loadCart(c, tx, customerSession(c))
@@ -314,11 +323,12 @@ func (s *Service) RemoveItem(c *fiber.Ctx) error {
 	if !ok {
 		return httperr.ErrInternalServerError
 	}
+	tid, _ := c.Locals("tenant_id").(string)
 	tag, err := tx.Exec(c.Context(), `
 		DELETE FROM cart_items ci
 		USING carts c
-		WHERE ci.id = $1 AND ci.cart_id = c.id AND c.customer_session = $2`,
-		c.Params("id"), customerSession(c))
+		WHERE ci.id = $1 AND ci.cart_id = c.id AND c.tenant_id = $2 AND c.customer_session = $3`,
+		c.Params("id"), tid, customerSession(c))
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
@@ -326,8 +336,8 @@ func (s *Service) RemoveItem(c *fiber.Ctx) error {
 		return httperr.C(fiber.StatusNotFound, "cart item not found")
 	}
 	if _, err := tx.Exec(c.Context(),
-		"UPDATE carts SET last_activity_at = now() WHERE customer_session = $1",
-		customerSession(c)); err != nil {
+		"UPDATE carts SET last_activity_at = now() WHERE tenant_id = $1 AND customer_session = $2",
+		tid, customerSession(c)); err != nil {
 		return httperr.ErrInternalServerError
 	}
 	cp, err := loadCart(c, tx, customerSession(c))
@@ -373,7 +383,7 @@ func (s *Service) ApplyDiscount(c *fiber.Ctx) error {
 	if cp != nil {
 		subtotal = cp.total
 	}
-	if _, err := discounts.Resolve(ctx, tx, code, subtotal); err != nil {
+	if _, err := discounts.Resolve(ctx, tx, tid, code, subtotal); err != nil {
 		return translateDiscountErr(err)
 	}
 
@@ -383,9 +393,10 @@ func (s *Service) ApplyDiscount(c *fiber.Ctx) error {
 		ON CONFLICT (tenant_id, customer_session) DO NOTHING`, tid, session); err != nil {
 		return httperr.ErrInternalServerError
 	}
-	if _, err := tx.Exec(ctx,
-		"UPDATE carts SET discount_code = $1, last_activity_at = now() WHERE customer_session = $2",
-		code, session); err != nil {
+	if _, err := tx.Exec(ctx, `
+		UPDATE carts SET discount_code = $1, last_activity_at = now()
+		WHERE tenant_id = $2 AND customer_session = $3`,
+		code, tid, session); err != nil {
 		return httperr.ErrInternalServerError
 	}
 	cp, err = loadCart(c, tx, session)
@@ -431,7 +442,7 @@ func (s *Service) ApplyGiftCard(c *fiber.Ctx) error {
 	tid, _ := c.Locals("tenant_id").(string)
 	session := customerSession(c)
 
-	if _, err := giftcards.Resolve(ctx, tx, code); err != nil {
+	if _, err := giftcards.Resolve(ctx, tx, tid, code); err != nil {
 		return translateGiftCardErr(err)
 	}
 
@@ -441,9 +452,10 @@ func (s *Service) ApplyGiftCard(c *fiber.Ctx) error {
 		ON CONFLICT (tenant_id, customer_session) DO NOTHING`, tid, session); err != nil {
 		return httperr.ErrInternalServerError
 	}
-	if _, err := tx.Exec(ctx,
-		"UPDATE carts SET gift_card_code = $1, last_activity_at = now() WHERE customer_session = $2",
-		code, session); err != nil {
+	if _, err := tx.Exec(ctx, `
+		UPDATE carts SET gift_card_code = $1, last_activity_at = now()
+		WHERE tenant_id = $2 AND customer_session = $3`,
+		code, tid, session); err != nil {
 		return httperr.ErrInternalServerError
 	}
 	cp, err := loadCart(c, tx, session)
@@ -496,7 +508,7 @@ func (s *Service) CaptureEmail(c *fiber.Ctx) error {
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE carts SET customer_email = $1, last_activity_at = now()
-		WHERE customer_session = $2`, email, session); err != nil {
+		WHERE tenant_id = $2 AND customer_session = $3`, email, tid, session); err != nil {
 		return httperr.ErrInternalServerError
 	}
 	cp, err := loadCart(c, tx, session)

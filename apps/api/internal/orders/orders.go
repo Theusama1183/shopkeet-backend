@@ -248,8 +248,9 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 
 	var cartID, discountCode, giftCardCode string
 	if err := tx.QueryRow(ctx,
-		"SELECT id, COALESCE(discount_code, ''), COALESCE(gift_card_code, '') FROM carts WHERE customer_session = $1",
-		session).Scan(&cartID, &discountCode, &giftCardCode); errors.Is(err, pgx.ErrNoRows) {
+		`SELECT id, COALESCE(discount_code, ''), COALESCE(gift_card_code, '')
+		FROM carts WHERE tenant_id = $1 AND customer_session = $2`,
+		tid, session).Scan(&cartID, &discountCode, &giftCardCode); errors.Is(err, pgx.ErrNoRows) {
 		return httperr.C(fiber.StatusBadRequest, "cart is empty")
 	}
 
@@ -263,9 +264,9 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		FROM cart_items ci
 		JOIN product_variants v ON v.id = ci.variant_id
 		JOIN products p ON p.id = v.product_id
-		WHERE ci.cart_id = $1
+		WHERE ci.cart_id = $1 AND ci.tenant_id = $2
 		ORDER BY v.id
-		FOR UPDATE OF v, p`, cartID)
+		FOR UPDATE OF v, p`, cartID, tid)
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
@@ -345,7 +346,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	// the cart earlier, and concurrent checkouts never over-consume a cap.
 	discountCents := 0
 	if discountCode != "" {
-		q, err := discounts.Claim(ctx, tx, discountCode, subtotal)
+		q, err := discounts.Claim(ctx, tx, tid, discountCode, subtotal)
 		if err != nil {
 			var ce *discounts.CodeError
 			if errors.As(err, &ce) {
@@ -370,7 +371,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	amountDue := subtotal - discountCents + quote.CostCents + taxCents
 	giftCardCents := 0
 	if giftCardCode != "" {
-		q, err := giftcards.Claim(ctx, tx, giftCardCode, amountDue)
+		q, err := giftcards.Claim(ctx, tx, tid, giftCardCode, amountDue)
 		if err != nil {
 			var ce *giftcards.CodeError
 			if errors.As(err, &ce) {

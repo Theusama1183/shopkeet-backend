@@ -26,8 +26,9 @@ import (
 )
 
 // Service implements the admin gift-cards surface. Handlers execute inside the
-// RLS-scoped request transaction opened by TenantMW, so every query is bound to
-// the resolved tenant.
+// request transaction opened by TenantMW, and every query also carries an
+// explicit `tenant_id` predicate so isolation never depends on the RLS GUC (or on
+// the database role the API connects as).
 type Service struct {
 	pool *pgxpool.Pool
 }
@@ -93,10 +94,28 @@ func scanGiftCard(row pgx.Row) (giftCardRow, error) {
 	return g, err
 }
 
-// Resolve validates a code without writing. Used by the cart apply/read path
-// where checkout remains authoritative.
-func Resolve(ctx context.Context, tx pgx.Tx, code string) (*Quote, error) {
-	g, err := scanGiftCard(tx.QueryRow(ctx, giftCardSelect+" WHERE code = $1", code))
+// giftCardByCode scopes a gift-card lookup by tenant explicitly. Every gift-card
+// query carries `tenant_id = $1` rather than leaning on the RLS GUC: the
+// isolation must hold by construction, not by which database role the API
+// happens to connect as. (Production's DATABASE_URL uses a superuser, which
+// bypasses FORCE RLS entirely — a GUC-only predicate would then match other
+// tenants' cards. Same lesson as the Phase 17 cart-recovery fix.)
+func giftCardByCode(ctx context.Context, tx pgx.Tx, tenantID, code, lock string) (pgx.Row, error) {
+	q := giftCardSelect + " WHERE tenant_id = $1 AND code = $2"
+	if lock != "" {
+		q += " " + lock
+	}
+	return tx.QueryRow(ctx, q, tenantID, code), nil
+}
+
+// Resolve validates a code without writing, scoped to tenantID. Used by the cart
+// apply/read path where checkout remains authoritative.
+func Resolve(ctx context.Context, tx pgx.Tx, tenantID, code string) (*Quote, error) {
+	row, err := giftCardByCode(ctx, tx, tenantID, code, "")
+	if err != nil {
+		return nil, err
+	}
+	g, err := scanGiftCard(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalid(fiber.StatusNotFound, "gift card not found")
 	}
@@ -110,12 +129,16 @@ func Resolve(ctx context.Context, tx pgx.Tx, code string) (*Quote, error) {
 }
 
 // Claim re-validates a code and, if valid, atomically draws from its balance
-// inside the caller's (checkout) transaction. The FOR UPDATE lock serializes
-// concurrent checkouts so the last dollars of a card are spent exactly once.
-// Claims at most amountDue cents; a fully-covered order leaves the remainder on
-// the card (total never goes below zero because applied = min(balance, amountDue)).
-func Claim(ctx context.Context, tx pgx.Tx, code string, amountDue int) (*Quote, error) {
-	g, err := scanGiftCard(tx.QueryRow(ctx, giftCardSelect+" WHERE code = $1 FOR UPDATE", code))
+// inside the caller's (checkout) transaction, scoped to tenantID. The FOR UPDATE
+// lock serializes concurrent checkouts so the last dollars of a card are spent
+// exactly once. Claims at most amountDue cents; a fully-covered order leaves the
+// remainder on the card (total never goes below zero because applied = min(balance, amountDue)).
+func Claim(ctx context.Context, tx pgx.Tx, tenantID, code string, amountDue int) (*Quote, error) {
+	row, err := giftCardByCode(ctx, tx, tenantID, code, "FOR UPDATE")
+	if err != nil {
+		return nil, err
+	}
+	g, err := scanGiftCard(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalid(fiber.StatusNotFound, "gift card not found")
 	}
@@ -130,8 +153,9 @@ func Claim(ctx context.Context, tx pgx.Tx, code string, amountDue int) (*Quote, 
 		applied = amountDue
 	}
 	if applied > 0 {
-		if _, err := tx.Exec(ctx,
-			"UPDATE gift_cards SET balance_cents = balance_cents - $1 WHERE id = $2", applied, g.id); err != nil {
+		if _, err := tx.Exec(ctx, `
+			UPDATE gift_cards SET balance_cents = balance_cents - $1
+			WHERE id = $2 AND tenant_id = $3`, applied, g.id, tenantID); err != nil {
 			return nil, err
 		}
 	}
@@ -195,13 +219,15 @@ func isUniqueViolation(err error) bool {
 
 // --- admin handlers --------------------------------------------------------------
 
-// ListGiftCards handles GET /gift-cards (Admin). Newest first.
+// ListGiftCards handles GET /gift-cards (Admin). Newest first. Scoped to the
+// caller's tenant explicitly.
 func (s *Service) ListGiftCards(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
 		return httperr.ErrInternalServerError
 	}
-	rows, err := tx.Query(c.Context(), giftCardSelect+" ORDER BY created_at DESC, id")
+	rows, err := tx.Query(c.Context(),
+		giftCardSelect+" WHERE tenant_id = $1 ORDER BY created_at DESC, id", tenantID(c))
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
