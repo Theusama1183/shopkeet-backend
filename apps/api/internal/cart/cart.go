@@ -469,11 +469,12 @@ func SweepAbandonedCarts(ctx context.Context, pool *pgxpool.Pool,
 		}
 		rows, err := tx.Query(ctx, `
 			SELECT id FROM carts
-			WHERE customer_email IS NOT NULL
+			WHERE tenant_id = $1
+			  AND customer_email IS NOT NULL
 			  AND recovery_sent_at IS NULL
 			  AND last_activity_at < now() - interval '1 hour'
 			  AND EXISTS (SELECT 1 FROM cart_items ci WHERE ci.cart_id = carts.id)
-			ORDER BY last_activity_at`)
+			ORDER BY last_activity_at`, tid)
 		if err != nil {
 			tx.Rollback(ctx)
 			return emailed, err
@@ -506,7 +507,7 @@ func SweepAbandonedCarts(ctx context.Context, pool *pgxpool.Pool,
 		}
 		for _, cartID := range candidates {
 			if _, err := tx.Exec(ctx,
-				"UPDATE carts SET recovery_sent_at = now() WHERE id = $1", cartID); err != nil {
+				"UPDATE carts SET recovery_sent_at = now() WHERE id = $1 AND tenant_id = $2", cartID, tid); err != nil {
 				tx.Rollback(ctx)
 				return emailed, err
 			}

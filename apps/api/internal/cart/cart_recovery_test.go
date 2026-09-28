@@ -133,14 +133,14 @@ func TestCartRecoverySweep(t *testing.T) {
 		}
 	}
 
-	recoverySet := func(session string) bool {
+	recoverySet := func(tenant, session string) bool {
 		t.Helper()
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
 		defer tx.Rollback(ctx)
-		if _, err := tx.Exec(ctx, "SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.current_tenant', $1, true)", tenant); err != nil {
 			t.Fatalf("set tenant: %v", err)
 		}
 		var at *time.Time
@@ -155,14 +155,16 @@ func TestCartRecoverySweep(t *testing.T) {
 		t.Helper()
 		var got []string
 		n, err := SweepAbandonedCarts(ctx, pool, func(c context.Context, tenantID, cartID string) error {
-			got = append(got, cartID)
+			if tenantID == tid {
+				got = append(got, cartID)
+			}
 			return nil
 		})
 		if err != nil {
 			t.Fatalf("sweep: %v", err)
 		}
-		if n != len(got) {
-			t.Fatalf("sweep reported %d but spy saw %d", n, len(got))
+		if n < len(got) {
+			t.Fatalf("sweep reported %d total but saw %d for this tenant", n, len(got))
 		}
 		return got
 	}
@@ -182,7 +184,7 @@ func TestCartRecoverySweep(t *testing.T) {
 	if len(got) != 1 || got[0] != abandonedCartID {
 		t.Fatalf("sweep should email exactly the idle cart %s, got %v", abandonedCartID, got)
 	}
-	if !recoverySet(abandonedSession) {
+	if !recoverySet(tid, abandonedSession) {
 		t.Fatal("recovery_sent_at should be stamped after first sweep")
 	}
 	// Idempotent: a second sweep must not email it again.
@@ -255,6 +257,71 @@ func TestCartRecoverySweep(t *testing.T) {
 		t.Fatalf("bad email should be 400, got %v %v", res.StatusCode, err)
 	} else {
 		res.Body.Close()
+	}
+
+	// --- Cross-tenant isolation (regression): an idle cart in tenant B must be
+	// sent + recorded under B's own tenant id, never confused with tenant A ---
+	otherTid := mkTenantID(t, pool, "recover-other-"+sfx)
+	var otherCartID string
+	txc, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin other: %v", err)
+	}
+	if _, err := txc.Exec(ctx, "SELECT set_config('app.current_tenant', $1, true)", otherTid); err != nil {
+		t.Fatalf("set other tenant: %v", err)
+	}
+	var opid, ovid string
+	if err := txc.QueryRow(ctx,
+		"INSERT INTO products (tenant_id, name, slug, price_cents, currency, inventory_count, status) VALUES ($1, 'Other T', $2, 1000, 'usd', 9, 'active') RETURNING id",
+		otherTid, "recover-other-"+randSuffix4()).Scan(&opid); err != nil {
+		t.Fatalf("seed other product: %v", err)
+	}
+	if err := txc.QueryRow(ctx,
+		"INSERT INTO product_variants (tenant_id, product_id, price_cents, inventory_count, status) VALUES ($1, $2, 1000, 9, 'active') RETURNING id",
+		otherTid, opid).Scan(&ovid); err != nil {
+		t.Fatalf("seed other variant: %v", err)
+	}
+	otherSession := "sess-other-" + sfx
+	if err := txc.QueryRow(ctx,
+		"INSERT INTO carts (tenant_id, customer_session, customer_email) VALUES ($1, $2, $3) RETURNING id",
+		otherTid, otherSession, "other@"+sfx+".example.com").Scan(&otherCartID); err != nil {
+		t.Fatalf("seed other cart: %v", err)
+	}
+	if _, err := txc.Exec(ctx,
+		"INSERT INTO cart_items (tenant_id, cart_id, product_id, quantity, variant_id) VALUES ($1, $2, $3, 1, $4)",
+		otherTid, otherCartID, opid, ovid); err != nil {
+		t.Fatalf("seed other item: %v", err)
+	}
+	if _, err := txc.Exec(ctx,
+		"UPDATE carts SET last_activity_at = now() - interval '2 hours' WHERE id = $1", otherCartID); err != nil {
+		t.Fatalf("backdate other: %v", err)
+	}
+	if err := txc.Commit(ctx); err != nil {
+		t.Fatalf("commit other: %v", err)
+	}
+
+	type spy struct{ sweptTid, cartID string }
+	var all []spy
+	if _, err := SweepAbandonedCarts(ctx, pool, func(c context.Context, tenantID2, cartID2 string) error {
+		all = append(all, spy{tenantID2, cartID2})
+		return nil
+	}); err != nil {
+		t.Fatalf("cross sweep: %v", err)
+	}
+	var relevant []spy
+	for _, s := range all {
+		if s.sweptTid == tid || s.sweptTid == otherTid {
+			relevant = append(relevant, s)
+		}
+	}
+	if len(relevant) != 1 {
+		t.Fatalf("cross sweep should email exactly tenant B's cart, got relevant=%v all=%v", relevant, all)
+	}
+	if relevant[0].cartID != otherCartID || relevant[0].sweptTid != otherTid {
+		t.Fatalf("other cart must be swept under its own tenant, got %+v", relevant[0])
+	}
+	if !recoverySet(otherTid, otherSession) {
+		t.Fatal("other cart should be stamped")
 	}
 }
 

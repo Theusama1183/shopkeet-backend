@@ -336,7 +336,7 @@ func (s *Service) SendCartAbandoned(ctx context.Context, tenantID, cartID string
 
 	var email string
 	if err := tx.QueryRow(ctx,
-		"SELECT customer_email FROM carts WHERE id = $1", cartID).Scan(&email); err != nil {
+		"SELECT customer_email FROM carts WHERE id = $1 AND tenant_id = $2", cartID, tenantID).Scan(&email); err != nil {
 		log.Printf("[notifications] load cart %s failed: %v", cartID, err)
 		return
 	}
@@ -355,8 +355,8 @@ func (s *Service) SendCartAbandoned(ctx context.Context, tenantID, cartID string
 		FROM cart_items ci
 		JOIN products p ON p.id = ci.product_id
 		JOIN product_variants v ON v.id = ci.variant_id
-		WHERE ci.cart_id = $1
-		ORDER BY p.name`, cartID)
+		WHERE ci.cart_id = $1 AND ci.tenant_id = $2
+		ORDER BY p.name`, cartID, tenantID)
 	if err != nil {
 		log.Printf("[notifications] load cart items %s failed: %v", cartID, err)
 		return
