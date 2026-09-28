@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/platform/cache"
+	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
@@ -24,6 +25,7 @@ import (
 type Service struct {
 	pool  *pgxpool.Pool
 	cache cache.Cache
+	bus   *events.Bus
 }
 
 // New builds a catalog Service with caching disabled until SetCache is called.
@@ -38,6 +40,22 @@ func New(pool *pgxpool.Pool) *Service {
 func (s *Service) SetCache(c cache.Cache) {
 	if c != nil {
 		s.cache = c
+	}
+}
+
+// SetBus wires the in-process event bus so restock transitions can emit
+// variant.restocked. Nil-safe: without a bus the restock email simply never
+// fires (the subscription still gets created and claimed in the DB).
+func (s *Service) SetBus(b *events.Bus) {
+	s.bus = b
+}
+
+func (s *Service) emit(ctx context.Context, e events.Event) {
+	if s.bus == nil {
+		return
+	}
+	if err := s.bus.Emit(ctx, e); err != nil {
+		_ = err // handlers are fire-and-forget by contract; never fail the caller
 	}
 }
 
@@ -137,13 +155,15 @@ type variantOptionRow struct {
 // variantRow is a concrete purchasable variant (price/stock/SKU) with its
 // option-value mapping.
 type variantRow struct {
-	id             string
-	sku            *string
-	priceCents     int
-	inventoryCount int
-	weightGrams    *int
-	status         string
-	optionValues   []variantOptionRow
+	id              string
+	sku             *string
+	priceCents      int
+	inventoryCount  int
+	weightGrams     *int
+	status          string
+	allowPreorder   bool
+	preorderShipsAt *time.Time
+	optionValues    []variantOptionRow
 }
 
 // productRow mirrors a products row plus its images/categories/options/variants.
@@ -202,10 +222,15 @@ func productJSON(p *productRow) fiber.Map {
 				"option_name": l.optionName, "value": l.value,
 			})
 		}
+		var shipsAt any
+		if v.preorderShipsAt != nil {
+			shipsAt = v.preorderShipsAt.UTC().Format(time.RFC3339)
+		}
 		variants = append(variants, fiber.Map{
 			"id": v.id, "sku": strp(v.sku), "price_cents": v.priceCents,
 			"inventory_count": v.inventoryCount, "weight_grams": v.weightGrams,
-			"status": v.status, "option_values": links,
+			"status": v.status, "allow_preorder": v.allowPreorder,
+			"preorder_ships_at": shipsAt, "option_values": links,
 		})
 	}
 	return fiber.Map{
@@ -357,7 +382,8 @@ func (s *Service) hydrateDetail(ctx *fiber.Ctx, tx pgx.Tx, p *productRow) error 
 	}
 
 	vr, err := tx.Query(ctx.Context(), `
-		SELECT v.id, v.sku, v.price_cents, v.inventory_count, v.weight_grams, v.status
+		SELECT v.id, v.sku, v.price_cents, v.inventory_count, v.weight_grams, v.status,
+		       v.allow_preorder, v.preorder_ships_at
 		FROM product_variants v
 		WHERE v.product_id = $1
 		ORDER BY v.created_at, v.id`, p.id)
@@ -367,7 +393,8 @@ func (s *Service) hydrateDetail(ctx *fiber.Ctx, tx pgx.Tx, p *productRow) error 
 	var variants []variantRow
 	for vr.Next() {
 		var v variantRow
-		if err := vr.Scan(&v.id, &v.sku, &v.priceCents, &v.inventoryCount, &v.weightGrams, &v.status); err != nil {
+		if err := vr.Scan(&v.id, &v.sku, &v.priceCents, &v.inventoryCount, &v.weightGrams, &v.status,
+			&v.allowPreorder, &v.preorderShipsAt); err != nil {
 			vr.Close()
 			return err
 		}

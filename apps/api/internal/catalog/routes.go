@@ -15,6 +15,7 @@ import (
 func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, svc *Service) {
 	router.Get("/products", auth.PublicTenantMW(pool), svc.ListProducts)
 	router.Get("/products/:id", auth.PublicOrAdminMW(pool, secret), svc.GetProduct)
+	router.Post("/products/:id/variants/:variantId/notify-me", auth.PublicTenantMW(pool), svc.NotifyMe)
 
 	admin := router.Group("/products", auth.TenantMW(pool, secret))
 	admin.Post("/", svc.CreateProduct)

@@ -21,7 +21,7 @@ import (
 // Notification is a single outbound message to a customer.
 type Notification struct {
 	TenantID  string
-	Type      string // order_confirmation, order_shipped, order_delivered, customer_welcome
+	Type      string // order_confirmation, order_shipped, order_delivered, customer_welcome, cart_abandoned, back_in_stock
 	Recipient string // email or phone
 	From      string // envelope/From override, e.g. "Shopkeet Support <support@shopkeet.com>"
 	ReplyTo   string // optional; when set, customer replies land here
@@ -121,6 +121,7 @@ func (s *Service) Subscribe(bus *events.Bus) {
 	bus.Subscribe("order.created", s.onOrderCreated)
 	bus.Subscribe("order.paid", s.onOrderPaid)
 	bus.Subscribe("customers.signup", s.onCustomerSignup)
+	bus.Subscribe("variant.restocked", s.onVariantRestocked)
 }
 
 func (s *Service) onOrderCreated(ctx context.Context, e events.Event) error {
@@ -167,6 +168,27 @@ func (s *Service) onCustomerSignup(ctx context.Context, e events.Event) error {
 	}
 	go func() {
 		s.deliverWelcome(ctx, tenantID, email)
+	}()
+	return nil
+}
+
+// onVariantRestocked handles variant.restocked (Phase 19): a merchant PATCH
+// moved a variant's inventory 0 -> positive, so every subscriber waiting on it
+// gets exactly one email. Runs in a goroutine like the other deliveries so a
+// slow provider never slows the PATCH.
+func (s *Service) onVariantRestocked(ctx context.Context, e events.Event) error {
+	m, ok := e.Data.(fiber.Map)
+	if !ok {
+		return nil
+	}
+	variantID, _ := m["variant_id"].(string)
+	productID, _ := m["product_id"].(string)
+	tenantID, _ := m["tenant_id"].(string)
+	if variantID == "" || productID == "" || tenantID == "" {
+		return nil
+	}
+	go func() {
+		s.deliverBackInStock(ctx, tenantID, variantID, productID)
 	}()
 	return nil
 }
@@ -307,6 +329,120 @@ func (s *Service) deliverWelcome(ctx context.Context, tenantID, email string) {
 		VALUES ($1, 'customer_welcome', $2, NULL, $3)`, tenantID, email, status); err != nil {
 		log.Printf("[notifications] log insert failed: %v", err)
 		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("[notifications] commit failed: %v", err)
+	}
+}
+
+// deliverBackInStock emails every subscriber waiting on a restocked variant
+// (Phase 19) and stamps notified_at exactly once per subscriber. The claim
+// UPDATE ... WHERE notified_at IS NULL is the concurrency guard: if two
+// restock events land together (or a restock happens while one is sending),
+// only the first tx wins each row, so no subscriber is ever emailed twice.
+// A failed provider send still stamps the claim (status 'failed' in the log),
+// matching the rest of the codebase — a subscriber is never re-mailed.
+func (s *Service) deliverBackInStock(ctx context.Context, tenantID, variantID, productID string) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		log.Printf("[notifications] begin failed: %v", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		"SELECT set_config('app.current_tenant', $1, true)", tenantID); err != nil {
+		log.Printf("[notifications] set tenant failed: %v", err)
+		return
+	}
+
+	var productName string
+	if err := tx.QueryRow(ctx, "SELECT name FROM products WHERE id = $1", productID).
+		Scan(&productName); err != nil {
+		productName = "An item"
+	}
+	var storeName, storeSubdomain string
+	_ = tx.QueryRow(ctx, `SELECT name, subdomain FROM tenants WHERE id = $1`, tenantID).
+		Scan(&storeName, &storeSubdomain)
+	if storeName == "" {
+		storeName = "Shopkeet"
+	}
+
+	type sub struct {
+		id    string
+		email string
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT id, email FROM back_in_stock_subscriptions
+		WHERE variant_id = $1 AND notified_at IS NULL
+		ORDER BY created_at, id`, variantID)
+	if err != nil {
+		log.Printf("[notifications] load back-in-stock subs failed: %v", err)
+		return
+	}
+	var subs []sub
+	for rows.Next() {
+		var x sub
+		if err := rows.Scan(&x.id, &x.email); err != nil {
+			rows.Close()
+			log.Printf("[notifications] scan back-in-stock sub failed: %v", err)
+			return
+		}
+		subs = append(subs, x)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		log.Printf("[notifications] back-in-stock subs rows failed: %v", err)
+		return
+	}
+	if len(subs) == 0 {
+		return
+	}
+
+	from := fmt.Sprintf("%s via Shopkeet <no-reply@%s>", storeName, s.storeHost(storeSubdomain))
+	replyTo := fmt.Sprintf("support@%s", s.storeHost(storeSubdomain))
+	storeURL := fmt.Sprintf("https://%s", s.storeHost(storeSubdomain))
+
+	for _, x := range subs {
+		tag, err := tx.Exec(ctx, `
+			UPDATE back_in_stock_subscriptions
+			SET notified_at = now()
+			WHERE id = $1 AND notified_at IS NULL`, x.id)
+		if err != nil {
+			log.Printf("[notifications] claim back-in-stock sub %s failed: %v", x.id, err)
+			continue
+		}
+		if tag.RowsAffected() == 0 {
+			continue // another tx claimed the row first; never email twice
+		}
+
+		subject := fmt.Sprintf("Back in stock at %s", storeName)
+		html := fmt.Sprintf(
+			"<p>Hi,</p><p><strong>%s</strong> is back in stock at <strong>%s</strong>.</p><p><a href=\"%s\">Shop now</a></p>",
+			productName, storeName, storeURL)
+
+		status := "sent"
+		sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := s.prov.Send(sendCtx, Notification{
+			TenantID:  tenantID,
+			Type:      "back_in_stock",
+			Recipient: x.email,
+			From:      from,
+			ReplyTo:   replyTo,
+			Subject:   subject,
+			Body:      html,
+		}); err != nil {
+			status = "failed"
+			log.Printf("[notifications] back_in_stock send failed for %s: %v", x.email, err)
+		}
+		cancel()
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO notification_log (tenant_id, notification_type, recipient, status)
+			VALUES ($1, 'back_in_stock', $2, $3)`, tenantID, x.email, status); err != nil {
+			log.Printf("[notifications] log insert failed: %v", err)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {

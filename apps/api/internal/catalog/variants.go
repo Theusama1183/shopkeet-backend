@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
 )
 
@@ -32,23 +35,28 @@ type createOptionRequest struct {
 }
 
 type createVariantRequest struct {
-	OptionValueIDs []string `json:"option_value_ids"`
-	SKU            string   `json:"sku"`
-	PriceCents     int      `json:"price_cents"`
-	InventoryCount int      `json:"inventory_count"`
-	WeightGrams    int      `json:"weight_grams"`
-	Status         string   `json:"status"`
+	OptionValueIDs  []string   `json:"option_value_ids"`
+	SKU             string     `json:"sku"`
+	PriceCents      int        `json:"price_cents"`
+	InventoryCount  int        `json:"inventory_count"`
+	WeightGrams     int        `json:"weight_grams"`
+	Status          string     `json:"status"`
+	AllowPreorder   bool       `json:"allow_preorder"`
+	PreorderShipsAt *time.Time `json:"preorder_ships_at"`
 }
 
 // updateVariantRequest uses pointers for SKU/weight_grams so the caller can
-// distinguish "unchanged" (nil) from "clear to NULL" (empty/0).
+// distinguish "unchanged" (nil) from "clear to NULL" (empty/0). allow_preorder
+// is also a pointer: nil means leave as-is, false is an explicit turn-off.
 type updateVariantRequest struct {
-	OptionValueIDs []string `json:"option_value_ids"`
-	SKU            *string  `json:"sku"`
-	PriceCents     int      `json:"price_cents"`
-	InventoryCount int      `json:"inventory_count"`
-	WeightGrams    *int     `json:"weight_grams"`
-	Status         string   `json:"status"`
+	OptionValueIDs  []string   `json:"option_value_ids"`
+	SKU             *string    `json:"sku"`
+	PriceCents      int        `json:"price_cents"`
+	InventoryCount  int        `json:"inventory_count"`
+	WeightGrams     *int       `json:"weight_grams"`
+	Status          string     `json:"status"`
+	AllowPreorder   *bool      `json:"allow_preorder"`
+	PreorderShipsAt *time.Time `json:"preorder_ships_at"`
 }
 
 func validVariantStatus(s string) bool {
@@ -235,10 +243,10 @@ func (s *Service) CreateVariant(c *fiber.Ctx) error {
 	variantID := uuid.NewString()
 	if err := savepoint(ctx, tx, func() error {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO product_variants (id, tenant_id, product_id, sku, price_cents, inventory_count, weight_grams, status)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			INSERT INTO product_variants (id, tenant_id, product_id, sku, price_cents, inventory_count, weight_grams, status, allow_preorder, preorder_ships_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 			variantID, tid, id, nullableStr(req.SKU), req.PriceCents, req.InventoryCount,
-			nullableWeight(req.WeightGrams), status)
+			nullableWeight(req.WeightGrams), status, req.AllowPreorder, req.PreorderShipsAt)
 		return err
 	}); err != nil {
 		if isUniqueViolation(err) {
@@ -287,6 +295,20 @@ func (s *Service) UpdateVariant(c *fiber.Ctx) error {
 		return httperr.ErrInternalServerError
 	}
 
+	// Phase 19 — a restock happens when the PATCH moves inventory 0 -> positive.
+	// Grab the current count before the update so the transition is observable;
+	// the bus event lets the notifications service email waiting subscribers.
+	restocked := false
+	if req.InventoryCount > 0 {
+		var current int
+		if err := tx.QueryRow(ctx,
+			"SELECT inventory_count FROM product_variants WHERE id = $1 AND product_id = $2",
+			variantID, productID).Scan(&current); err != nil {
+			return httperr.ErrInternalServerError
+		}
+		restocked = current == 0
+	}
+
 	var sets []string
 	var args []any
 	set := func(col string, v any) {
@@ -307,6 +329,12 @@ func (s *Service) UpdateVariant(c *fiber.Ctx) error {
 	}
 	if req.Status != "" {
 		set("status", req.Status)
+	}
+	if req.AllowPreorder != nil {
+		set("allow_preorder", *req.AllowPreorder)
+	}
+	if req.PreorderShipsAt != nil {
+		set("preorder_ships_at", *req.PreorderShipsAt)
 	}
 	if len(sets) > 0 {
 		args = append(args, variantID)
@@ -340,6 +368,17 @@ func (s *Service) UpdateVariant(c *fiber.Ctx) error {
 
 	if err := s.recomputeCache(ctx, tx, tid, productID); err != nil {
 		return httperr.ErrInternalServerError
+	}
+
+	if restocked {
+		auth.AfterCommit(c, func() {
+			s.emit(context.Background(), events.Event{
+				Name: "variant.restocked",
+				Data: fiber.Map{
+					"variant_id": variantID, "product_id": productID, "tenant_id": tid,
+				},
+			})
+		})
 	}
 
 	return s.respondProduct(c, tx, productID)

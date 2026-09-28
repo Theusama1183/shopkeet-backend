@@ -218,6 +218,10 @@ func main() {
 		log.Printf("event order.paid: %+v", e.Data)
 		return nil
 	})
+	// Phase 19 — restock transitions (inventory 0 -> positive via variant
+	// PATCH) emit variant.restocked; the notifications subscriber rides this
+	// same bus to email back-in-stock subscribers exactly once.
+	catalogSvc.SetBus(bus)
 	ordersSvc := orders.New(pool, bus, payments.NewRegistry())
 	ordersSvc.SetCache(cca)
 	orders.RegisterRoutes(v1, pool, cfg.JWTSecret,

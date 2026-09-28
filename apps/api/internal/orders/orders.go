@@ -260,7 +260,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	// already-decremented inventory.
 	rows, err := tx.Query(ctx, `
 		SELECT ci.variant_id, ci.product_id, ci.quantity, v.price_cents, p.currency,
-		       v.inventory_count, v.status, p.status
+		       v.inventory_count, v.status, p.status, v.allow_preorder
 		FROM cart_items ci
 		JOIN product_variants v ON v.id = ci.variant_id
 		JOIN products p ON p.id = v.product_id
@@ -271,11 +271,13 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		return httperr.ErrInternalServerError
 	}
 	type line struct {
-		variantID string
-		productID string
-		quantity  int
-		price     int
-		currency  string
+		variantID     string
+		productID     string
+		quantity      int
+		price         int
+		currency      string
+		allowPreorder bool
+		preorder      bool
 	}
 	var lines []line
 	for rows.Next() {
@@ -283,7 +285,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		var inventory int
 		var variantStatus, productStatus string
 		if err := rows.Scan(&l.variantID, &l.productID, &l.quantity, &l.price, &l.currency,
-			&inventory, &variantStatus, &productStatus); err != nil {
+			&inventory, &variantStatus, &productStatus, &l.allowPreorder); err != nil {
 			rows.Close()
 			return httperr.ErrInternalServerError
 		}
@@ -291,7 +293,12 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 			rows.Close()
 			return httperr.C(fiber.StatusConflict, "a product in your cart is no longer available")
 		}
-		if inventory < l.quantity {
+		// Phase 19 — a preorderable variant may sell beyond its current stock.
+		// The whole line becomes a preorder (is_preorder=true, no inventory
+		// decrement) only when available stock can't cover it; otherwise it's
+		// a normal sale.
+		l.preorder = l.allowPreorder && inventory < l.quantity
+		if !l.preorder && inventory < l.quantity {
 			rows.Close()
 			return httperr.C(fiber.StatusConflict, "insufficient stock")
 		}
@@ -403,13 +410,16 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	}
 	for _, l := range lines {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO order_items (tenant_id, order_id, product_id, variant_id, quantity, unit_price_cents)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			tid, orderID, l.productID, l.variantID, l.quantity, l.price); err != nil {
+			INSERT INTO order_items (tenant_id, order_id, product_id, variant_id, quantity, unit_price_cents, is_preorder)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			tid, orderID, l.productID, l.variantID, l.quantity, l.price, l.preorder); err != nil {
 			return httperr.ErrInternalServerError
 		}
 	}
 	for _, l := range lines {
+		if l.preorder {
+			continue // Phase 19 — preorder lines sell before stock exists.
+		}
 		if _, err := tx.Exec(ctx,
 			"UPDATE product_variants SET inventory_count = inventory_count - $1 WHERE id = $2",
 			l.quantity, l.variantID); err != nil {
