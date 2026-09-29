@@ -868,6 +868,19 @@ Handler: `notifications.onVariantRestocked` → `deliverBackInStock`.
 - Notify-me on restocked variant → 400 "variant is in stock".
 - Exactly-once verified: concurrent restock events → each sub emailed once (claim UPDATE guard).
 
+**Hardening deploy (2026-09-29, commit `c7f61fa`) — live event-path string corruption fixed.** Root
+cause: `tenant_id` values stored into `AfterCommit` event payloads came from `c.Get("X-Tenant-ID")` /
+`c.Params(...)`, which alias fasthttp's per-request header/buffer memory that is reused once the
+request completes. The bus goroutines read those strings milliseconds later and could see silently
+mutated values — live evidence was a tenant UUID that arrived as `gzip480e-...`, so the post-commit
+`order_confirmation` notification-log insert threw `invalid input syntax for type uuid`. Fix:
+`strings.Clone` at every tenant-id read in the auth middlewares (`TenantMW`, `publicTenantMW`,
+`PublicOrAdminMW`, `MerchantOrCustomerMW`, `CustomerMW`, `CustomerAuthMW`, `CustomerOrGuestMW`) and at the
+`order.paid` / `variant.restocked` emit sites. Re-verified live on the `c7f61fa` image: guest COD
+checkout → `order_confirmation` **`sent` with the exact smoke-tenant UUID** (no corruption), restock
+PATCH → both subscribers' `back_in_stock` rows **`sent` once** with `notified_at` stamped and
+`tenant_id` correct; smoke tenants purged, prod data untouched.
+
 ---
 
 ## Gift Cards (Phase 18)
