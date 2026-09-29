@@ -3,6 +3,7 @@ package orders
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -633,10 +634,11 @@ func (s *Service) UpdateStatus(c *fiber.Ctx) error {
 
 	if target == "delivered" {
 		tid, _ := c.Locals("tenant_id").(string)
+		orderID := strings.Clone(c.Params("id"))
 		auth.AfterCommit(c, func() {
 			s.bus.Emit(context.Background(), events.Event{
 				Name: "order.paid",
-				Data: fiber.Map{"order_id": c.Params("id"), "tenant_id": tid},
+				Data: fiber.Map{"order_id": orderID, "tenant_id": tid},
 			})
 		})
 	}

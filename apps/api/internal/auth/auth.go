@@ -64,6 +64,15 @@ func RegisterTenantCreatedHook(h TenantCreatedHook) {
 
 // --- helpers -----------------------------------------------------------------
 
+// stable returns a copy of s that owns its own bytes. c.Get("X-Tenant-ID") and
+// c.Params return strings that alias fasthttp's per-request buffers, which are
+// reused after the request completes; any such value stored in an AfterCommit
+// event and read later by a goroutine must be copied here first. Live evidence:
+// a subscription-delivery span once produced a tenant UUID like
+// "gzip480e-...-7917f27099a1" (4 bytes rewritten to "gzip") because the header
+// buffer had been reused by a subsequent request.
+func stable(s string) string { return strings.Clone(s) }
+
 // isUniqueViolation reports whether err is a Postgres 23505 (unique_violation),
 // used by signup to return a clean 409 instead of a 500.
 func isUniqueViolation(err error) bool {
@@ -272,7 +281,7 @@ func TenantMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 		}
 
 		c.Locals("tx", tx)
-		c.Locals("tenant_id", claims.TenantID)
+		c.Locals("tenant_id", stable(claims.TenantID))
 		c.Locals("user_id", claims.UserID)
 		c.Locals("role", claims.Role)
 
@@ -292,7 +301,7 @@ func TenantMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 // PublicOrAdminMW instead.
 func publicTenantMW(pool *pgxpool.Pool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		tid := c.Get("X-Tenant-ID")
+		tid := stable(c.Get("X-Tenant-ID"))
 		if tid == "" {
 			return httperr.C(fiber.StatusBadRequest, "missing X-Tenant-ID header")
 		}
@@ -349,7 +358,7 @@ func PublicOrAdminMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 			return httperr.ErrInternalServerError
 		}
 		c.Locals("tx", tx)
-		c.Locals("tenant_id", claims.TenantID)
+		c.Locals("tenant_id", stable(claims.TenantID))
 		c.Locals("user_id", claims.UserID)
 		c.Locals("role", claims.Role)
 		c.Locals("admin", true)
@@ -379,7 +388,7 @@ func MerchantOrCustomerMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 		defer tx.Rollback(ctx)
 
 		actor := "customer"
-		tid := c.Get("X-Tenant-ID")
+		tid := stable(c.Get("X-Tenant-ID"))
 		if h := c.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 			claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
 			if err != nil {
@@ -438,7 +447,7 @@ func parseMerchantWithOptional(c *fiber.Ctx, secret string) (*Claims, int, strin
 // rows by tenant; customer_session scoping happens in the cart queries.
 func CustomerMW(pool *pgxpool.Pool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		tid := c.Get("X-Tenant-ID")
+		tid := stable(c.Get("X-Tenant-ID"))
 		if tid == "" {
 			return httperr.C(fiber.StatusBadRequest, "missing X-Tenant-ID header")
 		}
@@ -513,7 +522,7 @@ func CustomerAuthMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 		}
 
 		c.Locals("tx", tx)
-		c.Locals("tenant_id", claims.TenantID)
+		c.Locals("tenant_id", stable(claims.TenantID))
 		c.Locals("customer_id", claims.CustomerID)
 		if err := c.Next(); err != nil {
 			return err
@@ -565,7 +574,7 @@ func CustomerOrGuestMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 				return httperr.ErrInternalServerError
 			}
 			c.Locals("tx", tx)
-			c.Locals("tenant_id", claims.TenantID)
+			c.Locals("tenant_id", stable(claims.TenantID))
 			c.Locals("customer_session", session)
 			c.Locals("customer_id", claims.CustomerID)
 			if err := c.Next(); err != nil {

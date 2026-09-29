@@ -371,6 +371,11 @@ func (s *Service) UpdateVariant(c *fiber.Ctx) error {
 	}
 
 	if restocked {
+		// variant_id/product_id/tenant_id are request-derived strings that
+		// alias fasthttp's reusable buffers; clones keep the event payload
+		// stable for the goroutine that delivers the restock emails AFTER this
+		// request has been returned to the pool.
+		variantID, productID, tid := strings.Clone(variantID), strings.Clone(productID), strings.Clone(tid)
 		auth.AfterCommit(c, func() {
 			s.emit(context.Background(), events.Event{
 				Name: "variant.restocked",

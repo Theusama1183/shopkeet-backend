@@ -145,8 +145,13 @@ func TestPreorderCheckout(t *testing.T) {
 		defer tx.Rollback(ctx)
 		_, _ = tx.Exec(ctx, "SELECT set_config('app.current_tenant', $1, true)", tid)
 		var isPre bool
-		if err := tx.QueryRow(ctx,
-			"SELECT is_preorder FROM order_items WHERE variant_id = $1 ORDER BY id DESC LIMIT 1", vid).
+		// order_items.id is a random UUID, so "newest" must come from the
+		// order's monotonic created_at, not the id column.
+		if err := tx.QueryRow(ctx, `
+			SELECT oi.is_preorder FROM order_items oi
+			JOIN orders o ON o.id = oi.order_id
+			WHERE oi.variant_id = $1
+			ORDER BY o.created_at DESC LIMIT 1`, vid).
 			Scan(&isPre); err != nil {
 			t.Fatalf("read order item: %v", err)
 		}
