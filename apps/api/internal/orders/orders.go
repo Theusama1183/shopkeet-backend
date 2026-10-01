@@ -348,12 +348,45 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 			"shipping rate does not match the destination")
 	}
 
-	// Apply the applied discount code (Phase 10): re-validated inside this
-	// transaction and claimed via FOR UPDATE, so expired / over-limit / deleted
-	// codes are rejected at checkout even when they were fine when applied to
-	// the cart earlier, and concurrent checkouts never over-consume a cap.
-	discountCents := 0
+	// Apply discounts (Phases 10 + 21). The entered code is validated read-only
+	// first, the best automatic discount (requires_code=false) is picked under
+	// FOR UPDATE locks, and v1 applies exactly one of them — whichever saves the
+	// shopper more — so a code and a store-wide promo never stack. Only the
+	// winner is claimed (times_used bumped), so a beaten code is never burned.
+	// Codes are re-validated inside this transaction, so an expired / over-limit
+	// / deleted code is rejected at checkout even when it applied fine to the
+	// cart earlier.
+	codeCents := 0
 	if discountCode != "" {
+		q, err := discounts.Resolve(ctx, tx, tid, discountCode, subtotal)
+		if err != nil {
+			var ce *discounts.CodeError
+			if errors.As(err, &ce) {
+				return httperr.C(ce.Status, ce.Message)
+			}
+			return httperr.ErrInternalServerError
+		}
+		codeCents = q.DiscountCents
+	}
+	auto, err := discounts.AutoPick(ctx, tx, tid, subtotal, quote.CostCents)
+	if err != nil {
+		return httperr.ErrInternalServerError
+	}
+
+	// The winner reduces the goods subtotal (order scope) or the shipping cost
+	// (shipping scope) — never both, so tax is computed on the true taxable
+	// base. An automatic shipping discount must not shrink the taxable subtotal,
+	// and the order keeps the original rate cost in shipping_cost_cents while
+	// discount_cents records the total savings (goods + shipping).
+	discountCents, shippingDiscountCents := 0, 0
+	if auto != nil && auto.DiscountCents > codeCents {
+		if auto.AppliesTo == "shipping" {
+			shippingDiscountCents = auto.DiscountCents
+		} else {
+			discountCents = auto.DiscountCents
+		}
+		discountCode = "" // automatic — nothing to snapshot as a code
+	} else if codeCents > 0 {
 		q, err := discounts.Claim(ctx, tx, tid, discountCode, subtotal)
 		if err != nil {
 			var ce *discounts.CodeError
@@ -364,10 +397,15 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		}
 		discountCents = q.DiscountCents
 	}
+	// goodsDiscount reduces the taxable base; the shipping discount cuts only
+	// the shipping cost. discount_cents on the order records the total savings
+	// (goods + shipping) while shipping_cost_cents keeps the original rate.
+	goodsDiscount := discountCents
+	discountCents += shippingDiscountCents
 
 	// Tax is calculated on the discounted subtotal — the amount the customer
 	// actually pays for goods — then shipping is added (Phase 13).
-	taxCents := (subtotal - discountCents) * taxRatePercent / 100
+	taxCents := (subtotal - goodsDiscount) * taxRatePercent / 100
 
 	// Apply the applied gift card (Phase 18): re-validated inside this
 	// transaction and claimed via FOR UPDATE, so an expired / disabled /
@@ -376,7 +414,8 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	// of a card can never double-spend it. Claims at most what the order owes
 	// (min(balance, amountDue)); unused balance stays on the card and the
 	// total never goes below zero.
-	amountDue := subtotal - discountCents + quote.CostCents + taxCents
+	shippingNet := quote.CostCents - shippingDiscountCents
+	amountDue := subtotal - goodsDiscount + shippingNet + taxCents
 	giftCardCents := 0
 	if giftCardCode != "" {
 		q, err := giftcards.Claim(ctx, tx, tid, giftCardCode, amountDue)

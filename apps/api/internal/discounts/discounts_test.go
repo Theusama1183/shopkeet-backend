@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -432,6 +433,446 @@ func TestDiscountsAcceptance(t *testing.T) {
 	// PATCH on a percentage code: switching type without its value is rejected.
 	var sweetID = findID("SWEET")
 	adminPost("PATCH", "/api/v1/discounts/"+sweetID, `{"type":"fixed_amount"}`, fiber.StatusBadRequest)
+}
+
+// TestAutomaticDiscounts is the Phase 21 acceptance criterion family:
+//   - a requires_code=false 'shipping' discount (free shipping over $X) applies
+//     with no code entered once the cart clears min_subtotal_cents;
+//   - the single best automatic discount is picked deterministically (tie =
+//     lowest discount id), never more than one, and never stacked with an
+//     entered code — the higher-value of {entered code, best auto} is applied,
+//     only the winner's times_used is bumped;
+//   - an automatic discount's own usage cap is respected;
+//   - admin rejects the reserved 'product'/BOGO scope for now.
+func TestAutomaticDiscounts(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL not set; skipping integration")
+	}
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+
+	const secret = "test-secret"
+	sfx := hex.EncodeToString(func() []byte {
+		b := make([]byte, 4)
+		_, _ = rand.Read(b)
+		return b
+	}())
+
+	mkTenant := func(name string) (tid, token string) {
+		err := pool.QueryRow(ctx,
+			"INSERT INTO tenants (name, subdomain) VALUES ($1, $2) RETURNING id",
+			name, "autodisc-"+name+"-"+sfx).Scan(&tid)
+		if err != nil {
+			t.Fatalf("seed tenant %s: %v", name, err)
+		}
+		token, err = auth.Sign(secret, tid, tid[:8], "owner", time.Hour)
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		return tid, token
+	}
+	tid, token := mkTenant("alpha")
+
+	seedProduct := func(price, inv int) (variantID string) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin product: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		var prodID string
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO products (tenant_id, name, slug, price_cents, currency, inventory_count, status)
+			VALUES ($1, 'ap', 'ap-'+replace(gen_random_uuid()::text,'-',''), $2, 'usd', $3, 'active') RETURNING id`,
+			tid, price, inv).Scan(&prodID); err != nil {
+			t.Fatalf("seed product: %v", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO product_variants (tenant_id, product_id, price_cents, inventory_count, status)
+			VALUES ($1, $2, $3, $4, 'active') RETURNING id`,
+			tid, prodID, price, inv).Scan(&variantID); err != nil {
+			t.Fatalf("seed variant: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit product: %v", err)
+		}
+		return variantID
+	}
+
+	seedRate := func() (rateID string) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin rate: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		var zoneID string
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO shipping_zones (tenant_id, name, countries, regions)
+			VALUES ($1, 'PK', '{PK}', '{}') RETURNING id`, tid).Scan(&zoneID); err != nil {
+			t.Fatalf("seed zone: %v", err)
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO shipping_rates (tenant_id, zone_id, name, rate_cents, free_over_cents, sort_order)
+			VALUES ($1, $2, 'Standard', 500, NULL, 0) RETURNING id`, tid, zoneID).Scan(&rateID); err != nil {
+			t.Fatalf("seed rate: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit rate: %v", err)
+		}
+		return rateID
+	}
+
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
+	v1 := app.Group("/api/v1")
+	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	discounts.RegisterRoutes(v1, pool, secret, discounts.New(pool))
+	bus := events.NewBus()
+	orders.RegisterRoutes(v1, pool, secret, orders.New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
+	shipping.RegisterRoutes(v1, pool, secret, shipping.New(pool))
+
+	do := func(method, path, session, body string, want int) *http.Response {
+		t.Helper()
+		var req *http.Request
+		if body == "" {
+			req = httptest.NewRequest(method, path, nil)
+		} else {
+			req = httptest.NewRequest(method, path, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("X-Tenant-ID", tid)
+		if session != "" {
+			req.Header.Set("X-Customer-Session", session)
+		}
+		res, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode != want {
+			t.Fatalf("%s %s: status %d, want %d (body=%s)", method, path, res.StatusCode, want, raw)
+		}
+		res.Body = io.NopCloser(strings.NewReader(string(raw)))
+		return res
+	}
+	admin := func(method, path, body string, want int) *http.Response {
+		t.Helper()
+		var req *http.Request
+		if body == "" {
+			req = httptest.NewRequest(method, path, nil)
+		} else {
+			req = httptest.NewRequest(method, path, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("X-Tenant-ID", tid)
+		req.Header.Set("Authorization", "Bearer "+token)
+		res, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("admin %s %s: %v", method, path, err)
+		}
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode != want {
+			t.Fatalf("admin %s %s: status %d, want %d (body=%s)", method, path, res.StatusCode, want, raw)
+		}
+		res.Body = io.NopCloser(strings.NewReader(string(raw)))
+		return res
+	}
+
+	v2000 := seedProduct(2000, 30)
+	v1000 := seedProduct(1000, 30)
+	rateID := seedRate()
+
+	checkout := func(session string, want int) *http.Response {
+		return do("POST", "/api/v1/checkout", session,
+			`{"customer_name":"Ada","customer_phone":"+1-555-`+sfx+`",`+
+				`"shipping_address_line1":"1 Main St","shipping_city":"Lahore","shipping_country":"PK",`+
+				`"shipping_rate_id":"`+rateID+`"}`,
+			want)
+	}
+	add := func(session, variant string, qty int) {
+		do("POST", "/api/v1/cart", session,
+			`{"variant_id":"`+variant+`","quantity":`+itoa(qty)+`}`, fiber.StatusOK)
+	}
+	decode := func(res *http.Response, v any) {
+		t.Helper()
+		if err := json.NewDecoder(res.Body).Decode(v); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		res.Body.Close()
+	}
+	autoUsages := func() map[string]int {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin usages: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+			t.Fatalf("set tenant: %v", err)
+		}
+		rows, err := tx.Query(ctx,
+			"SELECT id, times_used FROM discounts WHERE requires_code = false ORDER BY id")
+		if err != nil {
+			t.Fatalf("query usages: %v", err)
+		}
+		defer rows.Close()
+		m := map[string]int{}
+		for rows.Next() {
+			var id string
+			var n int
+			if err := rows.Scan(&id, &n); err != nil {
+				t.Fatalf("scan usages: %v", err)
+			}
+			m[id] = n
+		}
+		return m
+	}
+
+	// --- admin guards for the reserved BOGO scope ---
+	admin("POST", "/api/v1/discounts", `{"applies_to":"product","type":"percentage","value_percent":50}`, fiber.StatusBadRequest)
+	admin("POST", "/api/v1/discounts", `{"buy_quantity":2,"get_quantity":1,"type":"percentage","value_percent":100}`, fiber.StatusBadRequest)
+
+	// --- free shipping over 1500 (automatic, no code) ---
+	createAuto := func(name string, min, limit int, percent int) {
+		lim := "null"
+		if limit > 0 {
+			lim = itoa(limit)
+		}
+		body := `{"applies_to":"shipping","requires_code":false,"type":"percentage","value_percent":` + itoa(percent) +
+			`,"min_subtotal_cents":` + itoa(min) + `,"usage_limit":` + lim + `}`
+		res := admin("POST", "/api/v1/discounts", body, fiber.StatusCreated)
+		var d struct {
+			ID           string  `json:"id"`
+			Code         *string `json:"code"`
+			AppliesTo    string  `json:"applies_to"`
+			RequiresCode bool    `json:"requires_code"`
+		}
+		decode(res, &d)
+		if d.AppliesTo != "shipping" || !d.RequiresCode || d.Code != nil {
+			t.Fatalf("auto discount invalid echo: %+v", d)
+		}
+	}
+
+	createAuto("FS1", 1500, 0, 100)
+	createAuto("FS2", 1500, 0, 100)
+
+	// 2000 > 1500 -> automatic free shipping applies: shipping charged 0,
+	// discount_cents records the 500 savings, order totals 2000 - 0 + 0.
+	s1 := "sess-a1-" + sfx
+	add(s1, v2000, 1)
+	res := checkout(s1, fiber.StatusCreated)
+	var ord orderPayload
+	decode(res, &ord)
+	if ord.DiscountCode != "" || ord.DiscountCents != 500 || ord.ShippingCost != 500 || ord.TotalCents != 2000 {
+		t.Fatalf("free-shipping order wrong: code=%q cents=%d ship=%d total=%d",
+			ord.DiscountCode, ord.DiscountCents, ord.ShippingCost, ord.TotalCents)
+	}
+
+	// 1000 < 1500 -> below threshold, no automatic discount.
+	s2 := "sess-a2-" + sfx
+	add(s2, v1000, 1)
+	res = checkout(s2, fiber.StatusCreated)
+	decode(res, &ord)
+	if ord.DiscountCents != 0 || ord.TotalCents != 1500 {
+		t.Fatalf("below-threshold order wrong: cents=%d total=%d", ord.DiscountCents, ord.TotalCents)
+	}
+
+	// deterministic tie: two identical autos, the lowest-id one absorbs usage.
+	u := autoUsages()
+	if len(u) != 2 {
+		t.Fatalf("expected 2 automatic discounts, got %d", len(u))
+	}
+	var lowID, highID string
+	for id := range u {
+		if lowID == "" || id < lowID {
+			highID, lowID = lowID, id
+		}
+	}
+	s3 := "sess-a3-" + sfx
+	add(s3, v2000, 1)
+	checkout(s3, fiber.StatusCreated)
+	u = autoUsages()
+	if u[lowID] != 2 || u[highID] != 0 {
+		t.Fatalf("tie should go to lowest id (%s=2, %s=0), got %s=%d %s=%d",
+			lowID, highID, lowID, u[lowID], highID, u[highID])
+	}
+
+	// --- no stacking, code wins: SAVE30 (600) beats free shipping (500) ---
+	admin("POST", "/api/v1/discounts", `{"code":"SAVE30","type":"percentage","value_percent":30}`, fiber.StatusCreated)
+	s4 := "sess-a4-" + sfx
+	add(s4, v2000, 1)
+	do("POST", "/api/v1/cart/discount", s4, `{"code":"SAVE30"}`, fiber.StatusOK)
+	res = checkout(s4, fiber.StatusCreated)
+	decode(res, &ord)
+	if ord.DiscountCode != "SAVE30" || ord.DiscountCents != 600 || ord.TotalCents != 1900 {
+		t.Fatalf("code-wins order wrong: code=%q cents=%d total=%d", ord.DiscountCode, ord.DiscountCents, ord.TotalCents)
+	}
+	if tu := timesUsed(t, pool, ctx, tid, "SAVE30"); tu != 1 {
+		t.Fatalf("SAVE30 should be claimed once, got %d", tu)
+	}
+	if u := autoUsages(); u[lowID] != 2 {
+		t.Fatalf("auto must NOT be claimed when a code wins, got %d", u[lowID])
+	}
+
+	// --- no stacking, auto wins: SMALL5 (100) loses to free shipping (500) ---
+	admin("POST", "/api/v1/discounts", `{"code":"SMALL5","type":"percentage","value_percent":5}`, fiber.StatusCreated)
+	s5 := "sess-a5-" + sfx
+	add(s5, v2000, 1)
+	do("POST", "/api/v1/cart/discount", s5, `{"code":"SMALL5"}`, fiber.StatusOK)
+	res = checkout(s5, fiber.StatusCreated)
+	decode(res, &ord)
+	if ord.DiscountCode != "" || ord.DiscountCents != 500 || ord.TotalCents != 2000 {
+		t.Fatalf("auto-wins order wrong: code=%q cents=%d total=%d", ord.DiscountCode, ord.DiscountCents, ord.TotalCents)
+	}
+	if tu := timesUsed(t, pool, ctx, tid, "SMALL5"); tu != 0 {
+		t.Fatalf("SMALL5 must NOT be claimed when auto wins, got %d", tu)
+	}
+	if u := autoUsages(); u[lowID] != 3 {
+		t.Fatalf("winning auto should be claimed, got %d", u[lowID])
+	}
+
+	// --- automatic discount honors its own usage cap (isolated tenant) ---
+	tidB, tokenB := mkTenant("beta")
+	vB := seedProductFor(t, pool, ctx, tidB, 2000)
+	rateB := seedRateFor(t, pool, ctx, tidB)
+	createAutoFor(t, app, tidB, tokenB)
+	sB1, sB2 := "sess-b1-"+sfx, "sess-b2-"+sfx
+	for _, s := range []string{sB1, sB2} {
+		req := httptest.NewRequest("POST", "/api/v1/cart", strings.NewReader(
+			`{"variant_id":"`+vB+`","quantity":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-ID", tidB)
+		req.Header.Set("X-Customer-Session", s)
+		res, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("B cart: %v", err)
+		}
+		res.Body.Close()
+		res, err = app.Test(httptest.NewRequest("POST", "/api/v1/checkout", strings.NewReader(
+			`{"customer_name":"Ada","customer_phone":"+1-555-B"+`+sfx+`",`+
+				`"shipping_address_line1":"1 Main St","shipping_city":"Lahore","shipping_country":"PK",`+
+				`"shipping_rate_id":"`+rateB+`"}`)), -1)
+		if err != nil {
+			t.Fatalf("B checkout: %v", err)
+		}
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		bods := orderPayload{}
+		_ = json.Unmarshal(raw, &bods)
+		var want int
+		if s == sB1 {
+			if bods.DiscountCents != 500 || bods.TotalCents != 2000 {
+				t.Fatalf("B first checkout should use the cap-1 auto, got %+v", bods)
+			}
+			want = fiber.StatusCreated
+		} else {
+			if bods.DiscountCents != 0 || bods.TotalCents != 2500 {
+				t.Fatalf("B second checkout should hit the cap and apply nothing, got %+v", bods)
+			}
+			want = fiber.StatusCreated
+		}
+		if res.StatusCode != want {
+			t.Fatalf("B checkout status %d, want %d", res.StatusCode, want)
+		}
+	}
+}
+
+// seedProductFor / seedRateFor / createAutoFor seed tenant-scoped data for the
+// isolated usage-cap scenario.
+func seedProductFor(t *testing.T, pool *pgxpool.Pool, ctx context.Context, tid string, price int) string {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin product: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+		t.Fatalf("set tenant: %v", err)
+	}
+	var prodID string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO products (tenant_id, name, slug, price_cents, currency, inventory_count, status)
+		VALUES ($1, 'bp', 'bp-'+replace(gen_random_uuid()::text,'-',''), $2, 'usd', 30, 'active') RETURNING id`,
+		tid, price).Scan(&prodID); err != nil {
+		t.Fatalf("seed product: %v", err)
+	}
+	var variantID string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO product_variants (tenant_id, product_id, price_cents, inventory_count, status)
+		VALUES ($1, $2, $3, 30, 'active') RETURNING id`,
+		tid, prodID, price).Scan(&variantID); err != nil {
+		t.Fatalf("seed variant: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit product: %v", err)
+	}
+	return variantID
+}
+
+func seedRateFor(t *testing.T, pool *pgxpool.Pool, ctx context.Context, tid string) string {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin rate: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		"SELECT set_config('app.current_tenant', $1, true)", tid); err != nil {
+		t.Fatalf("set tenant: %v", err)
+	}
+	var zoneID string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO shipping_zones (tenant_id, name, countries, regions)
+		VALUES ($1, 'PK', '{PK}', '{}') RETURNING id`, tid).Scan(&zoneID); err != nil {
+		t.Fatalf("seed zone: %v", err)
+	}
+	var rateID string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO shipping_rates (tenant_id, zone_id, name, rate_cents, free_over_cents, sort_order)
+		VALUES ($1, $2, 'Standard', 500, NULL, 0) RETURNING id`, tid, zoneID).Scan(&rateID); err != nil {
+		t.Fatalf("seed rate: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit rate: %v", err)
+	}
+	return rateID
+}
+
+func createAutoFor(t *testing.T, app *fiber.App, tid, token string) {
+	t.Helper()
+	body := `{"applies_to":"shipping","requires_code":false,"type":"percentage","value_percent":100,"usage_limit":1}`
+	req := httptest.NewRequest("POST", "/api/v1/discounts", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-ID", tid)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("create auto: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != fiber.StatusCreated {
+		t.Fatalf("create auto status %d", res.StatusCode)
+	}
+}
+
+func itoa(n int) string {
+	return strconv.Itoa(n)
 }
 
 // timesUsed reads times_used for a code inside the tenant's RLS scope.

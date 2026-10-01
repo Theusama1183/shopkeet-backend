@@ -1,8 +1,11 @@
-// Package discounts implements Phase 10 of the expansion spec: admin-managed
-// discount codes (percentage or fixed_amount, with a minimum subtotal, validity
-// window and optional usage cap), a POST /cart/discount apply endpoint, and the
-// checkout integration in internal/orders that re-validates the code and claims
-// one usage inside the order transaction. Codes are scoped by RLS exactly like
+// Package discounts implements Phase 10 of the expansion spec (admin-managed
+// discount codes: percentage or fixed_amount, with a minimum subtotal, validity
+// window and optional usage cap) and Phase 21 (advanced & automatic discounts:
+// requires_code=false store-wide promos, and applies_to='shipping' "free
+// shipping over $X"). It backs a POST /cart/discount apply endpoint and the
+// checkout integration in internal/orders that picks the single best discount —
+// the entered code or the best automatic one, never stacked — and claims one
+// usage inside the order transaction. Codes are scoped by RLS exactly like
 // every other tenant table; the discount is snapshotted onto the order so later
 // edits or deletions never change an existing order's total.
 package discounts
@@ -37,7 +40,7 @@ func New(pool *pgxpool.Pool) *Service {
 
 type discountRow struct {
 	id           string
-	code         string
+	code         *string
 	dType        string
 	valuePercent *int
 	valueCents   *int
@@ -48,11 +51,16 @@ type discountRow struct {
 	timesUsed    int
 	status       string
 	createdAt    time.Time
+	appliesTo    string
+	buyQuantity  *int
+	getQuantity  *int
+	requiresCode bool
 }
 
 const discountSelect = `
 	SELECT id, code, type, value_percent, value_cents, min_subtotal_cents,
-	       starts_at, ends_at, usage_limit, times_used, status, created_at
+	       starts_at, ends_at, usage_limit, times_used, status, created_at,
+	       applies_to, buy_quantity, get_quantity, requires_code
 	FROM discounts`
 
 // Quote is the resolved discount line for a cart or checkout: the snapshotted
@@ -120,7 +128,8 @@ func (d discountRow) discount(subtotalCents int) int {
 func scanDiscount(row pgx.Row) (discountRow, error) {
 	var d discountRow
 	err := row.Scan(&d.id, &d.code, &d.dType, &d.valuePercent, &d.valueCents,
-		&d.minSubtotal, &d.startsAt, &d.endsAt, &d.usageLimit, &d.timesUsed, &d.status, &d.createdAt)
+		&d.minSubtotal, &d.startsAt, &d.endsAt, &d.usageLimit, &d.timesUsed, &d.status, &d.createdAt,
+		&d.appliesTo, &d.buyQuantity, &d.getQuantity, &d.requiresCode)
 	return d, err
 }
 
@@ -132,6 +141,11 @@ func scanDiscount(row pgx.Row) (discountRow, error) {
 // production's DATABASE_URL connects as a superuser role, which bypasses FORCE
 // ROW LEVEL SECURITY, so a code-only predicate would resolve another tenant's
 // discount.
+//
+// Automatic discounts (requires_code=false) are deliberately not resolvable by
+// code — they are not-for-entry, so entering one behaves like an unknown code.
+// This also keeps them out of the checkout code-claim path where they would
+// otherwise be double-applied (once as a code, once by AutoPick).
 func Resolve(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents int) (*Quote, error) {
 	d, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE tenant_id = $1 AND code = $2", tenantID, code))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -140,16 +154,19 @@ func Resolve(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCent
 	if err != nil {
 		return nil, err
 	}
+	if !d.requiresCode {
+		return nil, invalid(fiber.StatusNotFound, "discount code not found")
+	}
 	if err := d.validate(subtotalCents); err != nil {
 		return nil, err
 	}
-	return &Quote{Code: d.code, DiscountCents: d.discount(subtotalCents)}, nil
+	return &Quote{Code: *d.code, DiscountCents: d.discount(subtotalCents)}, nil
 }
 
 // Claim re-validates a code and, if valid, atomically increments times_used
 // inside the caller's (checkout) transaction, scoped to tenantID. The FOR UPDATE
 // lock serializes concurrent checkouts so a usage_limit=1 code is consumed
-// exactly once.
+// exactly once. Automatic discounts are not claimable as codes (see Resolve).
 func Claim(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents int) (*Quote, error) {
 	d, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE tenant_id = $1 AND code = $2 FOR UPDATE", tenantID, code))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -158,6 +175,9 @@ func Claim(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents 
 	if err != nil {
 		return nil, err
 	}
+	if !d.requiresCode {
+		return nil, invalid(fiber.StatusNotFound, "discount code not found")
+	}
 	if err := d.validate(subtotalCents); err != nil {
 		return nil, err
 	}
@@ -165,7 +185,109 @@ func Claim(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents 
 		"UPDATE discounts SET times_used = times_used + 1 WHERE id = $1 AND tenant_id = $2", d.id, tenantID); err != nil {
 		return nil, err
 	}
-	return &Quote{Code: d.code, DiscountCents: d.discount(subtotalCents)}, nil
+	return &Quote{Code: *d.code, DiscountCents: d.discount(subtotalCents)}, nil
+}
+
+// AutoQuote is an applied automatic discount: no code, one scope, and the
+// computed discount_cents for the checkout subtotal/shipping. The scope is what
+// the cents apply to — an 'order' discount cuts the goods subtotal (so it
+// reduces the taxable base), a 'shipping' discount cuts the shipping cost (so
+// tax is unaffected).
+type AutoQuote struct {
+	ID            string
+	AppliesTo     string
+	DiscountCents int
+}
+
+// AutoPick selects the single best automatic discount for the tenant inside the
+// caller's (checkout) transaction. Eligible rows — requires_code=false, active,
+// inside their validity window, under their usage cap — are locked FOR UPDATE in
+// deterministic id order, so concurrent checkouts serialize and a claimed cap is
+// never overshot. Each candidate's value is computed against the subtotal
+// ('order') or the shipping cost ('shipping') and the best is measured in the
+// same unit (cents of real money), so the winner is the best deal for the
+// shopper regardless of scope. Values of zero or less are skipped.
+//
+// AutoPick has no write side effects besides the row locks: the caller decides
+// (against any entered code) and claims the winner via ClaimAuto, so a
+// discount's times_used is only burned when it is actually applied.
+//
+// Returns nil when nothing qualifies or every candidate is worth <= 0.
+func AutoPick(ctx context.Context, tx pgx.Tx, tenantID string, subtotalCents, shippingCents int) (*AutoQuote, error) {
+	rows, err := tx.Query(ctx, discountSelect+`
+		WHERE tenant_id = $1 AND status = 'active' AND requires_code = false
+		  AND (starts_at IS NULL OR starts_at <= now())
+		  AND (ends_at IS NULL OR ends_at > now())
+		  AND (usage_limit IS NULL OR times_used < usage_limit)
+		ORDER BY id
+		FOR UPDATE`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var best *AutoQuote
+	for rows.Next() {
+		d, err := scanDiscount(rows)
+		if err != nil {
+			return nil, err
+		}
+		if err := d.validate(subtotalCents); err != nil {
+			continue // e.g. subtotal below min_subtotal_cents — not eligible now
+		}
+		var cents int
+		switch d.appliesTo {
+		case "order":
+			cents = d.discount(subtotalCents)
+		case "shipping":
+			cents = d.discount(shippingCents)
+		default: // 'product' (BOGO) has no checkout logic yet
+			continue
+		}
+		if cents <= 0 {
+			continue
+		}
+		// Strict > keeps the first (lowest id) on ties — deterministic, so the
+		// outcome never depends on scan order, time, or index choice.
+		if best == nil || cents > best.DiscountCents {
+			best = &AutoQuote{ID: d.id, AppliesTo: d.appliesTo, DiscountCents: cents}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return best, nil
+}
+
+// ClaimAuto claims a discount already selected by AutoPick, re-validating and
+// incrementing times_used in the caller's transaction. The row was locked by
+// AutoPick's FOR UPDATE, so the validation/usage-check cannot observe a stale
+// count; re-validating anyway keeps a single source of truth. Returns the
+// computed quote for the discount's scope.
+func ClaimAuto(ctx context.Context, tx pgx.Tx, tenantID, id string, subtotalCents, shippingCents int) (*AutoQuote, error) {
+	d, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE id = $1 AND tenant_id = $2 FOR UPDATE", id, tenantID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, invalid(fiber.StatusNotFound, "discount not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := d.validate(subtotalCents); err != nil {
+		return nil, err
+	}
+	var cents int
+	switch d.appliesTo {
+	case "order":
+		cents = d.discount(subtotalCents)
+	case "shipping":
+		cents = d.discount(shippingCents)
+	default:
+		return nil, invalid(fiber.StatusBadRequest, "unsupported discount scope")
+	}
+	if _, err := tx.Exec(ctx,
+		"UPDATE discounts SET times_used = times_used + 1 WHERE id = $1 AND tenant_id = $2", d.id, tenantID); err != nil {
+		return nil, err
+	}
+	return &AutoQuote{ID: d.id, AppliesTo: d.appliesTo, DiscountCents: cents}, nil
 }
 
 // --- helpers --------------------------------------------------------------------
@@ -182,7 +304,7 @@ func tenantID(c *fiber.Ctx) string {
 
 func toJSON(d discountRow) fiber.Map {
 	return fiber.Map{
-		"id": d.id, "code": d.code, "type": d.dType,
+		"id": d.id, "code": strp(d.code), "type": d.dType,
 		"value_percent":      intOrNil(d.valuePercent),
 		"value_cents":        intOrNil(d.valueCents),
 		"min_subtotal_cents": intOrNil(d.minSubtotal),
@@ -191,8 +313,19 @@ func toJSON(d discountRow) fiber.Map {
 		"usage_limit":        intOrNil(d.usageLimit),
 		"times_used":         d.timesUsed,
 		"status":             d.status,
+		"applies_to":         d.appliesTo,
+		"requires_code":      d.requiresCode,
+		"buy_quantity":       intOrNil(d.buyQuantity),
+		"get_quantity":       intOrNil(d.getQuantity),
 		"created_at":         d.createdAt.Format(time.RFC3339),
 	}
+}
+
+func strp(v *string) any {
+	if v == nil {
+		return nil
+	}
+	return *v
 }
 
 func intOrNil(v *int) any {
@@ -223,9 +356,24 @@ func parseTimePtr(s string) (*time.Time, error) {
 
 // validateFields checks that a (possibly partial) discount row is well-formed:
 // a valid type, exactly one of value_percent/value_cents depending on the type,
-// and sensible limits. Returns a client-facing 400 on violation.
-func validateFields(code, dType string, valuePercent, valueCents, minSubtotal, usageLimit *int) error {
-	if strings.TrimSpace(code) == "" {
+// sensible limits, a valid applies scope, and code requirements. A code is only
+// mandatory when the discount is code-entered; automatic discounts
+// (requires_code=false) have no code. Returns a client-facing 400 on violation.
+func validateFields(code, dType string, valuePercent, valueCents, minSubtotal, usageLimit *int,
+	requiresCode bool, appliesTo string, buyQuantity, getQuantity *int) error {
+	switch appliesTo {
+	case "":
+		appliesTo = "order"
+	case "order", "shipping":
+	case "product":
+		return invalid(fiber.StatusBadRequest, "product (BOGO) discounts are not supported yet")
+	default:
+		return invalid(fiber.StatusBadRequest, "applies_to must be order, shipping or product")
+	}
+	if buyQuantity != nil || getQuantity != nil {
+		return invalid(fiber.StatusBadRequest, "buy_quantity/get_quantity (BOGO) are not supported yet")
+	}
+	if requiresCode && strings.TrimSpace(code) == "" {
 		return invalid(fiber.StatusBadRequest, "code required")
 	}
 	if dType == "" {
@@ -294,6 +442,10 @@ type discountRequest struct {
 	EndsAt           string `json:"ends_at"`
 	UsageLimit       *int   `json:"usage_limit"`
 	Status           string `json:"status"`
+	AppliesTo        string `json:"applies_to"`
+	BuyQuantity      *int   `json:"buy_quantity"`
+	GetQuantity      *int   `json:"get_quantity"`
+	RequiresCode     *bool  `json:"requires_code"`
 }
 
 // CreateDiscount handles POST /discounts (Admin).
@@ -302,8 +454,13 @@ func (s *Service) CreateDiscount(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
+	appliesTo, requiresCode := req.AppliesTo, true
+	if req.RequiresCode != nil {
+		requiresCode = *req.RequiresCode
+	}
 	if err := validateFields(req.Code, req.Type, req.ValuePercent, req.ValueCents,
-		req.MinSubtotalCents, req.UsageLimit); err != nil {
+		req.MinSubtotalCents, req.UsageLimit, requiresCode, appliesTo,
+		req.BuyQuantity, req.GetQuantity); err != nil {
 		return translate(err)
 	}
 	startsAt, err := parseTimePtr(req.StartsAt)
@@ -321,6 +478,10 @@ func (s *Service) CreateDiscount(c *fiber.Ctx) error {
 	if status != "active" && status != "disabled" {
 		return httperr.C(fiber.StatusBadRequest, "status must be active or disabled")
 	}
+	var code *string
+	if codeVal := strings.TrimSpace(req.Code); codeVal != "" {
+		code = ptr(strings.ToUpper(codeVal))
+	}
 
 	tx, ok := txFrom(c)
 	if !ok {
@@ -328,13 +489,13 @@ func (s *Service) CreateDiscount(c *fiber.Ctx) error {
 	}
 	d, err := scanDiscount(tx.QueryRow(c.Context(), `
 		INSERT INTO discounts (tenant_id, code, type, value_percent, value_cents,
-			min_subtotal_cents, starts_at, ends_at, usage_limit, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			min_subtotal_cents, starts_at, ends_at, usage_limit, status, applies_to, requires_code)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id, code, type, value_percent, value_cents, min_subtotal_cents,
-			starts_at, ends_at, usage_limit, times_used, status, created_at`,
-		tenantID(c), strings.ToUpper(strings.TrimSpace(req.Code)), req.Type,
-		req.ValuePercent, req.ValueCents, req.MinSubtotalCents, startsAt, endsAt,
-		req.UsageLimit, status))
+			starts_at, ends_at, usage_limit, times_used, status, created_at,
+			applies_to, buy_quantity, get_quantity, requires_code`,
+		tenantID(c), code, req.Type, req.ValuePercent, req.ValueCents, req.MinSubtotalCents,
+		startsAt, endsAt, req.UsageLimit, status, appliesTo, requiresCode))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return httperr.C(fiber.StatusConflict, "discount code already exists")
@@ -342,6 +503,15 @@ func (s *Service) CreateDiscount(c *fiber.Ctx) error {
 		return httperr.ErrInternalServerError
 	}
 	return c.Status(fiber.StatusCreated).JSON(toJSON(d))
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func orEmpty(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }
 
 // GetDiscount handles GET /discounts/:id (Admin).
@@ -388,8 +558,10 @@ func (s *Service) UpdateDiscount(c *fiber.Ctx) error {
 	minSubtotal, usageLimit := cur.minSubtotal, cur.usageLimit
 	status := cur.status
 	start, end := cur.startsAt, cur.endsAt
+	appliesTo, requiresCode := cur.appliesTo, cur.requiresCode
+	buyQuantity, getQuantity := cur.buyQuantity, cur.getQuantity
 	if v := strings.TrimSpace(req.Code); v != "" {
-		code = strings.ToUpper(v)
+		code = ptr(strings.ToUpper(v))
 	}
 	if req.Type != "" {
 		dType = req.Type
@@ -409,6 +581,18 @@ func (s *Service) UpdateDiscount(c *fiber.Ctx) error {
 	if req.Status != "" {
 		status = req.Status
 	}
+	if req.AppliesTo != "" {
+		appliesTo = req.AppliesTo
+	}
+	if req.RequiresCode != nil {
+		requiresCode = *req.RequiresCode
+	}
+	if req.BuyQuantity != nil {
+		buyQuantity = req.BuyQuantity
+	}
+	if req.GetQuantity != nil {
+		getQuantity = req.GetQuantity
+	}
 	if req.StartsAt != "" {
 		t, err := parseTimePtr(req.StartsAt)
 		if err != nil {
@@ -423,7 +607,8 @@ func (s *Service) UpdateDiscount(c *fiber.Ctx) error {
 		}
 		end = t
 	}
-	if err := validateFields(code, dType, valuePercent, valueCents, minSubtotal, usageLimit); err != nil {
+	if err := validateFields(orEmpty(code), dType, valuePercent, valueCents, minSubtotal, usageLimit,
+		requiresCode, appliesTo, buyQuantity, getQuantity); err != nil {
 		return translate(err)
 	}
 	if status != "active" && status != "disabled" {
@@ -432,12 +617,14 @@ func (s *Service) UpdateDiscount(c *fiber.Ctx) error {
 
 	d, err := scanDiscount(tx.QueryRow(ctx, `
 		UPDATE discounts SET code = $1, type = $2, value_percent = $3, value_cents = $4,
-			min_subtotal_cents = $5, starts_at = $6, ends_at = $7, usage_limit = $8, status = $9
-		WHERE id = $10 AND tenant_id = $11
+			min_subtotal_cents = $5, starts_at = $6, ends_at = $7, usage_limit = $8, status = $9,
+			applies_to = $10, requires_code = $11
+		WHERE id = $12 AND tenant_id = $13
 		RETURNING id, code, type, value_percent, value_cents, min_subtotal_cents,
-			starts_at, ends_at, usage_limit, times_used, status, created_at`,
+			starts_at, ends_at, usage_limit, times_used, status, created_at,
+			applies_to, buy_quantity, get_quantity, requires_code`,
 		code, dType, valuePercent, valueCents, minSubtotal, start, end, usageLimit, status,
-		c.Params("id"), tenantID(c)))
+		appliesTo, requiresCode, c.Params("id"), tenantID(c)))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return httperr.C(fiber.StatusConflict, "discount code already exists")
