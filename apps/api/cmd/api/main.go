@@ -12,6 +12,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/shopkeet/api/internal/analytics"
 	"github.com/shopkeet/api/internal/auth"
 	"github.com/shopkeet/api/internal/cart"
 	"github.com/shopkeet/api/internal/catalog"
@@ -236,6 +237,10 @@ func main() {
 	// Phase 10 — discounts. Admin CRUD behind TenantMW; the cart apply endpoint
 	// lives in the cart package and checkout claims the usage atomically.
 	discounts.RegisterRoutes(v1, pool, cfg.JWTSecret, discounts.New(pool))
+
+	// Phase 24 — analytics dashboard. Merchant-only SQL aggregation over the
+	// order/cart tables that already exist; no new tables.
+	analytics.RegisterRoutes(v1, pool, cfg.JWTSecret, analytics.New(pool))
 
 	// Phase 18 — gift cards. Admin issue/list behind TenantMW; the customer
 	// apply endpoint lives in the cart package and checkout claims the balance.
