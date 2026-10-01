@@ -191,14 +191,14 @@ func TestAnalyticsReconciliation(t *testing.T) {
 	// Manual reconciliation over the same predicate (non-cancelled, in-window).
 	var manualRev, manualCount, manualWithCancelled int
 	if err := pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(total_cents), 0), COUNT(*)
+		SELECT COALESCE(SUM(total_cents), 0)::int, COUNT(*)::int
 		FROM orders WHERE tenant_id = $1
 		  AND created_at >= now() - make_interval(days => 30)
 		  AND status <> 'cancelled'`, tid).Scan(&manualRev, &manualCount); err != nil {
 		t.Fatalf("manual sales sum: %v", err)
 	}
 	if err := pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(total_cents), 0)
+		SELECT COALESCE(SUM(total_cents), 0)::int
 		FROM orders WHERE tenant_id = $1
 		  AND created_at >= now() - make_interval(days => 30)`, tid).Scan(&manualWithCancelled); err != nil {
 		t.Fatalf("manual incl cancelled: %v", err)
@@ -254,7 +254,7 @@ func TestAnalyticsReconciliation(t *testing.T) {
 	}
 	manualDays := map[string]dayTot{}
 	rows, err := pool.Query(ctx, `
-		SELECT date_trunc('day', created_at)::date, COALESCE(SUM(total_cents),0), COUNT(*)
+		SELECT date_trunc('day', created_at)::date, COALESCE(SUM(total_cents),0)::int, COUNT(*)::int
 		FROM orders WHERE tenant_id = $1
 		  AND created_at >= now() - make_interval(days => 30)
 		  AND status <> 'cancelled'

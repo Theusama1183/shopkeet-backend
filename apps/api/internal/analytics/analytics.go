@@ -70,8 +70,8 @@ func (s *Service) GetSales(c *fiber.Ctx) error {
 	}
 	rows, err := tx.Query(c.Context(), `
 		SELECT date_trunc('day', created_at)::date,
-		       COALESCE(SUM(total_cents), 0),
-		       COUNT(*)
+		       COALESCE(SUM(total_cents), 0)::int,
+		       COUNT(*)::int
 		FROM orders
 		WHERE tenant_id = $1
 		  AND created_at >= now() - make_interval(days => $2)
@@ -202,9 +202,9 @@ func (s *Service) GetConversion(c *fiber.Ctx) error {
 	}
 	var cartsCreated, ordersPlaced int
 	if err := tx.QueryRow(c.Context(), `
-		SELECT (SELECT COUNT(*) FROM carts
+		SELECT (SELECT COUNT(*)::int FROM carts
 		         WHERE tenant_id = $1 AND created_at >= now() - make_interval(days => $2)),
-		       (SELECT COUNT(*) FROM orders
+		       (SELECT COUNT(*)::int FROM orders
 		         WHERE tenant_id = $1 AND created_at >= now() - make_interval(days => $2))`,
 		tenantID(c), days).Scan(&cartsCreated, &ordersPlaced); err != nil {
 		return httperr.ErrInternalServerError
