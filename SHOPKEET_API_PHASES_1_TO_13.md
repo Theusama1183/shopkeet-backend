@@ -1,7 +1,7 @@
 # Shopkeet API — Complete Reference (Phases 1–13)
 
 **Last updated:** 2026-10-01  
-**DB version:** 22 (migrations 0001–0022 applied on VPS)  
+**DB version:** 23 (migrations 0001–0023 applied on VPS)  
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthy)  
 **All acceptance tests:** PASS  
 **Stack:** Go 1.27 · Fiber · pgx/pgxpool · PostgreSQL 16 (RLS + FORCE) · Redis 7 · golang-migrate (embedded)
@@ -29,7 +29,8 @@
 17. [Gift Cards (Phase 18)](#gift-cards-phase-18)
 18. [Pre-orders & Back-in-Stock Alerts (Phase 19)](#phase-19--pre-orders--back-in-stock-alerts)
 19. [Loyalty & Referrals (Phase 20)](#loyalty--referrals-phase-20)
-20. [Database Schema Summary](#database-schema-summary)
+20. [Advanced & Automatic Discounts (Phase 21)](#advanced--automatic-discounts-phase-21)
+21. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
 18. [Env Vars & Config](#env-vars--config)
@@ -774,6 +775,111 @@ Default codes by status:
 
 ---
 
+## Advanced & Automatic Discounts (Phase 21)
+
+Sent 2026-10-01 (commits `b99665e` → `087da2c`). Bold Discounts replacement:
+discounts can now be **automatic** (`requires_code=false`) — a store-wide promo or
+"free shipping over $X" — that apply at checkout without any code. When a shopper
+also enters a code, checkout applies **exactly one of them: whichever saves more**
+(v1 never stacks), and only the winner's `times_used` is bumped so a beaten code or
+promo is never burned. Backed by migration `0023_discount_automatic`, folded into
+the RLS model like every prior phase.
+
+### Model
+
+`discounts` gains:
+
+- `applies_to TEXT NOT NULL DEFAULT 'order'` — `'order'` discounts the goods
+  subtotal (tax computed on the reduced base), `'shipping'` discounts only the
+  shipping cost (taxable base untouched; the order still records the original
+  `shipping_cost_cents` and the total savings in `discount_cents`).
+  `'product'` (BOGO) is reserved: the CHECK constraint permits it but validation
+  rejects it with `400 "product (BOGO) discounts are not supported yet"`, as are
+  any non-null `buy_quantity` / `get_quantity`.
+- `requires_code BOOLEAN NOT NULL DEFAULT true` — `false` marks an automatic
+  discount. Automatic discounts are stored with `code NULL` and are **not**
+  resolvable by `POST /cart/discount` or claimable as a code (they exist outside
+  the cart-code path). A code is only mandatory when `requires_code=true`.
+- `buy_quantity` / `get_quantity INTEGER` — nullable BOGO columns reserved for a
+  future phase.
+
+### Endpoints (same admin surface as Phase 10, extended)
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/discounts` | Merchant | Now accepts `applies_to` (`order` default, `shipping`) and `requires_code` (default `true`). `requires_code:false` creates an automatic discount — no `code`, never entered by a shopper. |
+| PATCH | `/discounts/:id` | Merchant | Same field set; absent fields preserved. |
+| GET | `/discounts` · `/discounts/:id` | Merchant | Responses include `applies_to`, `requires_code`, `code` (`null` for automatic), `buy_quantity`/`get_quantity` (`null`). |
+
+### Checkout behavior
+
+1. If the cart carries a code, it is **resolved** (read-only) to `codeCents`.
+2. All eligible automatic discounts are scanned
+   (`status='active'`, `requires_code=false`, inside the window, under `usage_limit`)
+   under `FOR UPDATE` locks, `ORDER BY id`; each is validated against the goods
+   subtotal (`min_subtotal_cents` is compared to the cart goods subtotal regardless
+   of scope — "free shipping over $X" triggers on what the shopper spends on goods),
+   and its cents computed on the subtotal (`order`) or on the shipping cost
+   (`shipping`). The **single best-value** winner is picked; **ties -> lowest id**,
+   so the outcome is deterministic and never order/index dependent.
+3. Winner = better of `auto.DiscountCents` vs `codeCents`. The winner is **claimed**
+   (re-validated in the same transaction, `times_used + 1`, exactly-once like the
+   code path); the loser is left untouched. Checkout fails closed if the claimed
+   discount no longer validates.
+4. `discount_cents` on the order = goods savings + shipping savings; the shipping
+   rate is snapshot as its original cost, so the customer's effective shipping is
+   `rate − shippingDiscount`.
+
+### Migration (`0023_discount_automatic`)
+
+```sql
+ALTER TABLE discounts ADD COLUMN applies_to TEXT NOT NULL DEFAULT 'order';
+ALTER TABLE discounts ADD COLUMN buy_quantity INTEGER;
+ALTER TABLE discounts ADD COLUMN get_quantity INTEGER;
+ALTER TABLE discounts ADD COLUMN requires_code BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE discounts ALTER COLUMN code DROP NOT NULL;      -- automatic discounts have no code
+ALTER TABLE discounts ADD CONSTRAINT discounts_applies_to_check
+  CHECK (applies_to IN ('order', 'shipping', 'product'));
+```
+
+Down-migration pre-suffixes NULL codes with `'AUTO-' || left(replace(id::text,'-',''), 8)`
+before restoring `NOT NULL`, then drops the new columns and constraint.
+
+### Implementation
+
+`apps/api/internal/discounts/discounts.go`:
+- `discountRow.code` is now `*string`; `scanDiscount`/`toJSON` (`strp` helper)
+  handle the nullable code; `discountSelect` covers the 16 columns.
+- `validateFields` verifies scope, BOGO guard, code requirement, and discount value
+  against the merged row; `CreateDiscount`/`UpdateDiscount` carry the new fields
+  (create defaults `applies_to` to `order` when omitted).
+- `Resolve`/`Claim` (code path) return `"discount code not found"` for
+  `requires_code=false` rows, so automatic discounts can never be entered or
+  double-claimed.
+- New `AutoPick` (scan + validate + best-single-value pick, `FOR UPDATE`, no side
+  effects) and `ClaimAuto` (re-validate + `times_used + 1`), plus `AutoQuote`.
+
+`apps/api/internal/orders/orders.go` (checkout): resolve code → `AutoPick` →
+pick winner → `ClaimAuto`/`Claim` the winner → split goods vs shipping savings →
+tax on `(subtotal − goodsDiscount) * rate / 100` → `amountDue = subtotal −
+goodsDiscount + (shipping − shippingDiscount) + tax`.
+
+### Acceptance criteria (live smoke passed 2026-10-01, commit `087da2c`)
+
+- Automatic free-shipping-over-$15 applies with **no code**: 2000¢ cart → 500¢
+  off shipping, order total 2000¢, `discount_code` null, shipping snapshot 500¢.
+- Code vs automatic: `SAVE30` (−600¢) beats the −500¢ promo → exactly SAVE30
+  applies (600¢, total 1900¢) and the promo is not bumped. `SMALL5` (−100¢)
+  loses → exactly the promo applies (500¢, total 2000¢) and `SMALL5.times_used`
+  stays 0.
+- Below the promo's `min_subtotal_cents` (1000¢ < 1500¢): no discount, total 1500¢.
+- `usage_limit=1` automatic promo: first checkout applies it (600¢), second falls
+  back to the next-best unlimited promo (500¢); `times_used` counted per claim.
+- `applies_to:'product'` (BOGO) → 400; admin list/create echo
+  `applies_to`/`requires_code`.
+- Integration suite: `TestAutomaticDiscounts` (`internal/discounts`, requires the
+  migrated local test DB; run with `go test ./internal/discounts/`).
+
 ## Loyalty & Referrals (Phase 20)
 
 Sent 2026-10-01 (commit `caab28d`). Smile.io / Gameball replacement: customers
@@ -1250,6 +1356,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestVariantPreorderFields` | `internal/catalog` | 19 |
 | `TestDeliverBackInStockExactlyOnce` | `internal/notifications` | 19 |
 | `TestLoyaltyReferrals` | `internal/loyalty` | 20 |
+| `TestAutomaticDiscounts` | `internal/discounts` | 21 |
 
 Run:  
 ```bash
