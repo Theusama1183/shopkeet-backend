@@ -1,7 +1,7 @@
 # Shopkeet API — Complete Reference (Phases 1–13)
 
-**Last updated:** 2026-09-28  
-**DB version:** 21 (migrations 0001–0021 applied on VPS)  
+**Last updated:** 2026-10-01  
+**DB version:** 22 (migrations 0001–0022 applied on VPS)  
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthy)  
 **All acceptance tests:** PASS  
 **Stack:** Go 1.27 · Fiber · pgx/pgxpool · PostgreSQL 16 (RLS + FORCE) · Redis 7 · golang-migrate (embedded)
@@ -28,7 +28,8 @@
 16. [Abandoned Cart Recovery & Lifecycle Emails (Phase 17)](#abandoned-cart-recovery--lifecycle-emails-phase-17)
 17. [Gift Cards (Phase 18)](#gift-cards-phase-18)
 18. [Pre-orders & Back-in-Stock Alerts (Phase 19)](#phase-19--pre-orders--back-in-stock-alerts)
-19. [Database Schema Summary](#database-schema-summary)
+19. [Loyalty & Referrals (Phase 20)](#loyalty--referrals-phase-20)
+20. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
 18. [Env Vars & Config](#env-vars--config)
@@ -773,6 +774,114 @@ Default codes by status:
 
 ---
 
+## Loyalty & Referrals (Phase 20)
+
+Sent 2026-10-01 (commit `caab28d`). Smile.io / Gameball replacement: customers
+earn points when a delivered order (`order.paid`) is credited, redeem points for
+a one-time cart discount, and recruit friends with a per-customer referral code.
+Backed by migration `0022_loyalty_referrals`, which folded cleanly into the RLS
+model (all new tables FORCE RLS, owner `shopkeet_app`).
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/customers/me/loyalty` | Customer | Running `balance` (points) + recent ledger (newest first, ≤100): each entry `{id, points (+earned/−redeemed), reason, order_id?, created_at}`. |
+| GET | `/customers/me/referral` | Customer | Lazily creates the caller's unique `fixed_amount` referral code (value = package constant `ReferralDiscountCents` = 500, `usage_limit` NULL) and returns `{code, value_cents}`. Stable per customer — re-calling returns the same code. |
+| POST | `/loyalty/redeem` | Customer | Body `{points}`. Converts points into a one-time `fixed_amount` code (`usage_limit=1`, random code) of `floor(points/rate) × 100` cents applied to the current cart. Returns `{code, discount_cents, points, balance}`. Rejects: `points < 1`, rate ≤ 0 ("redemption disabled"), `points > balance` ("insufficient"), or `points` not reaching one full currency unit. Idempotency-guarded (`POST /loyalty/redeem`). |
+
+### Earning model
+
+- **When:** an order transitions to `delivered` — the existing Phase 12
+  `order.paid` event. The buyer earns only if the order is linked to a customer
+  account (`customer_id`); guest orders earn nothing.
+- **How many:** `floor(total_cents / 100) × loyalty_points_per_currency_unit`.
+  Default belongs to each order's tenant; 0 = program disabled for that tenant.
+- **Exactly-once:** partial unique indexes
+  `loyalty_ledger_order_placed_once ON (order_id) WHERE reason='order_placed'` and
+  `loyalty_ledger_referral_once ON (order_id) WHERE reason='referral'`. The
+  subscriber inserts with `ON CONFLICT DO NOTHING` and bumps
+  `customers.loyalty_points` **only when `RowsAffected()==1`** — a re-emitted
+  `order.paid` can never double-credit (verified live + in tests).
+
+### Referral flow
+
+1. Shopper GETs `/customers/me/referral` → `REF-style` fixed_amount code whose
+   `discounts.customer_id` points back at them (created lazily, once).
+2. Any shopper (guest or account) applies the code at checkout like a normal
+   discount.
+3. When that order reaches `delivered`, the **referrer** earns the same points
+   the buyer's `order_placed` credit would have produced (same rate/formula).
+   Self-referral (a customer using their own code) pays out nothing.
+4. Redeemed one-time codes carry `customer_id` NULL, so they are never mistaken
+   for referral codes by the `order.paid` subscriber.
+
+### Migration (`0022_loyalty_referrals`)
+
+```sql
+ALTER TABLE customers ADD COLUMN loyalty_points INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE loyalty_ledger (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id   UUID NOT NULL REFERENCES tenants(id),
+  customer_id UUID NOT NULL REFERENCES customers(id),
+  points      INTEGER NOT NULL,           -- positive = earned, negative = redeemed
+  reason      TEXT NOT NULL,              -- 'order_placed' | 'referral' | 'redeemed' | 'signup_bonus'
+  order_id    UUID REFERENCES orders(id),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE loyalty_ledger ENABLE ROW LEVEL SECURITY;
+ALTER TABLE loyalty_ledger FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON loyalty_ledger
+  USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
+ALTER TABLE loyalty_ledger OWNER TO shopkeet_app;
+CREATE INDEX loyalty_ledger_customer_idx ON loyalty_ledger (customer_id, created_at DESC);
+CREATE UNIQUE INDEX loyalty_ledger_order_placed_once
+  ON loyalty_ledger (order_id) WHERE order_id IS NOT NULL AND reason = 'order_placed';
+CREATE UNIQUE INDEX loyalty_ledger_referral_once
+  ON loyalty_ledger (order_id) WHERE order_id IS NOT NULL AND reason = 'referral';
+
+ALTER TABLE tenants
+  ADD COLUMN loyalty_points_per_currency_unit INTEGER NOT NULL DEFAULT 0, -- 0 = disabled
+  ADD COLUMN loyalty_redemption_rate INTEGER NOT NULL DEFAULT 100;         -- points per 1 unit of discount
+ALTER TABLE discounts ADD COLUMN customer_id UUID REFERENCES customers(id);
+```
+
+Exposed through the Phase 13 admin surface: `GET/PATCH /tenant/settings` now
+return and accept `loyalty_points_per_currency_unit` and `loyalty_redemption_rate`
+(must be ≥ 0; setting the earn rate to 0 disables the program, setting the
+redemption rate to 0 disables redemptions).
+
+### Implementation
+
+`apps/api/internal/loyalty`:
+- `loyalty.go` — `Service{pool}`; `Subscribe(bus)` registers `onOrderPaid`
+  (own RLS-scoped tx like notifications' senders, never fails the status change);
+  `GetLoyalty`, `GetReferral`, `Redeem` all run inside the customer's
+  `CustomerAuthMW` request tx. Codes generated from crypto randomness, retried on
+  the `(tenant_id, code)` uniqueness violation.
+- `routes.go` — `GET /customers/me/loyalty`, `GET /customers/me/referral` under
+  `CustomerAuthMW`; `POST /loyalty/redeem` under `CustomerAuthMW` +
+  `idempotency.Middleware("POST /loyalty/redeem")`.
+- `cmd/api/main.go` — `loyaltySvc := loyalty.New(pool)`, `loyaltySvc.Subscribe(bus)`,
+  `loyalty.RegisterRoutes(v1, pool, cfg.JWTSecret, loyaltySvc)` (after customers).
+
+### Acceptance criteria (live smoke passed 2026-10-01, commit `caab28d`)
+
+- Fresh customer: balance 0, empty ledger.
+- Signed-in 2500¢ COD order → delivered → balance 250 (25 × 10), ledger entry
+  `order_placed +250`. Re-broadcasting `order.paid` for the same order did not
+  double-credit.
+- `GET /customers/me/referral` → minted value 500; second call returns the same
+  code.
+- Redeem over balance → 400; redeem 150 → `{code, discount_cents:100, points:150,
+  balance:100}`, ledger `redeemed -150`; over-balance and sub-unit redemptions 400;
+  rate 0 → 400 "redemption disabled".
+- Referred buyer (2000¢ after −500 referral coupon) → delivered → buyer earned 200
+  and referrer earned a 200 `referral` payout; referrer balance 300.
+- Integration suite: `TestLoyaltyReferrals` (`internal/loyalty`, requires the
+  migrated local test DB; run with `go test ./internal/loyalty/`).
+
 ## Phase 19 — Pre-orders & Back-in-Stock Alerts
 
 Pre-orderable variants can be checked out with zero stock; shoppers can subscribe to
@@ -1140,6 +1249,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestNotifyMe` | `internal/catalog` | 19 |
 | `TestVariantPreorderFields` | `internal/catalog` | 19 |
 | `TestDeliverBackInStockExactlyOnce` | `internal/notifications` | 19 |
+| `TestLoyaltyReferrals` | `internal/loyalty` | 20 |
 
 Run:  
 ```bash
