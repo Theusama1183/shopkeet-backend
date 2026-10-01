@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -207,22 +208,25 @@ func (s *Service) deliverOrder(ctx context.Context, tenantID, orderID, typ strin
 		return
 	}
 
-	var customerName, customerEmail, customerPhone, currency string
+	var customerName, currency string
+	var customerEmail *string
 	var totalCents int
 	err = tx.QueryRow(ctx, `
-		SELECT customer_name, customer_email, customer_phone, currency, total_cents
-		FROM orders WHERE id = $1`, orderID).Scan(&customerName, &customerEmail, &customerPhone, &currency, &totalCents)
+		SELECT customer_name, customer_email, currency, total_cents
+		FROM orders WHERE id = $1`, orderID).Scan(&customerName, &customerEmail, &currency, &totalCents)
 	if err != nil {
 		log.Printf("[notifications] load order %s failed: %v", orderID, err)
 		return
 	}
 
-	recipient := customerEmail
-	if recipient == "" {
-		recipient = customerPhone
+	// Guest orders carry a NULL customer_email. Providers are email-only, so a
+	// phone number is not a usable recipient — skip rather than send garbage.
+	recipient := ""
+	if customerEmail != nil {
+		recipient = strings.TrimSpace(*customerEmail)
 	}
 	if recipient == "" {
-		log.Printf("[notifications] order %s has no recipient", orderID)
+		log.Printf("[notifications] order %s has no email recipient", orderID)
 		return
 	}
 
@@ -470,15 +474,16 @@ func (s *Service) SendCartAbandoned(ctx context.Context, tenantID, cartID string
 		return
 	}
 
-	var email string
+	var email *string
 	if err := tx.QueryRow(ctx,
 		"SELECT customer_email FROM carts WHERE id = $1 AND tenant_id = $2", cartID, tenantID).Scan(&email); err != nil {
 		log.Printf("[notifications] load cart %s failed: %v", cartID, err)
 		return
 	}
-	if email == "" {
+	if email == nil || *email == "" {
 		return
 	}
+	emailAddr := *email
 
 	type line struct {
 		name     string
@@ -545,7 +550,7 @@ func (s *Service) SendCartAbandoned(ctx context.Context, tenantID, cartID string
 	if err := s.prov.Send(sendCtx, Notification{
 		TenantID:  tenantID,
 		Type:      "cart_abandoned",
-		Recipient: email,
+		Recipient: emailAddr,
 		From:      from,
 		ReplyTo:   replyTo,
 		Subject:   subject,
