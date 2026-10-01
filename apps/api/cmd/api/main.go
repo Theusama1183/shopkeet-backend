@@ -19,6 +19,7 @@ import (
 	"github.com/shopkeet/api/internal/customers"
 	"github.com/shopkeet/api/internal/discounts"
 	"github.com/shopkeet/api/internal/giftcards"
+	"github.com/shopkeet/api/internal/loyalty"
 	"github.com/shopkeet/api/internal/media"
 	"github.com/shopkeet/api/internal/notifications"
 	"github.com/shopkeet/api/internal/orders"
@@ -244,6 +245,14 @@ func main() {
 	// customer-scoped JWT. Checkout under CustomerOrGuestMW links orders to the
 	// account when the caller is signed in, and stays fully guest otherwise.
 	customers.RegisterRoutes(v1, pool, cfg.JWTSecret, customers.New(pool, cfg.JWTSecret, bus), rl)
+
+	// Phase 20 — loyalty & referrals. The order.paid subscriber (same bus as the
+	// notification emailer) credits points once a customer's order is delivered
+	// and pays out referrals; the customer-facing balance/referral/redeem routes
+	// mount here.
+	loyaltySvc := loyalty.New(pool)
+	loyaltySvc.Subscribe(bus)
+	loyalty.RegisterRoutes(v1, pool, cfg.JWTSecret, loyaltySvc)
 
 	// Phase 12 — notifications. The provider + service were constructed before
 	// the Redis block (the abandoned-cart sweep reuses them). Here we wire the

@@ -28,35 +28,40 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string) {
 	g.Patch("/settings", svc.PatchSettings)
 }
 
-// tenantRow matches the tenants table (Phase 13 columns appended).
+// tenantRow matches the tenants table (Phase 13 + Phase 20 columns appended).
 type tenantRow struct {
-	id               string
-	name             string
-	subdomain        string
-	logoMediaAssetID *string
-	defaultCurrency  string
-	timezone         string
-	supportEmail     *string
-	supportPhone     *string
-	taxRatePercent   int
+	id                           string
+	name                         string
+	subdomain                    string
+	logoMediaAssetID             *string
+	defaultCurrency              string
+	timezone                     string
+	supportEmail                 *string
+	supportPhone                 *string
+	taxRatePercent               int
+	loyaltyPointsPerCurrencyUnit int
+	loyaltyRedemptionRate        int
 }
 
 const tenantSelect = `
 	SELECT id, name, subdomain, logo_media_asset_id, default_currency, timezone,
-	       support_email, support_phone, tax_rate_percent
+	       support_email, support_phone, tax_rate_percent,
+	       loyalty_points_per_currency_unit, loyalty_redemption_rate
 	FROM tenants`
 
 func tenantJSON(t *tenantRow) fiber.Map {
 	return fiber.Map{
-		"id":                  t.id,
-		"name":                t.name,
-		"subdomain":           t.subdomain,
-		"logo_media_asset_id": strp(t.logoMediaAssetID),
-		"default_currency":    t.defaultCurrency,
-		"timezone":            t.timezone,
-		"support_email":       strp(t.supportEmail),
-		"support_phone":       strp(t.supportPhone),
-		"tax_rate_percent":    t.taxRatePercent,
+		"id":                               t.id,
+		"name":                             t.name,
+		"subdomain":                        t.subdomain,
+		"logo_media_asset_id":              strp(t.logoMediaAssetID),
+		"default_currency":                 t.defaultCurrency,
+		"timezone":                         t.timezone,
+		"support_email":                    strp(t.supportEmail),
+		"support_phone":                    strp(t.supportPhone),
+		"tax_rate_percent":                 t.taxRatePercent,
+		"loyalty_points_per_currency_unit": t.loyaltyPointsPerCurrencyUnit,
+		"loyalty_redemption_rate":          t.loyaltyRedemptionRate,
 	}
 }
 
@@ -84,7 +89,8 @@ func (s *Service) GetSettings(c *fiber.Ctx) error {
 	var t tenantRow
 	err := tx.QueryRow(c.Context(), tenantSelect+" WHERE id = $1",
 		c.Locals("tenant_id")).Scan(&t.id, &t.name, &t.subdomain, &t.logoMediaAssetID,
-		&t.defaultCurrency, &t.timezone, &t.supportEmail, &t.supportPhone, &t.taxRatePercent)
+		&t.defaultCurrency, &t.timezone, &t.supportEmail, &t.supportPhone, &t.taxRatePercent,
+		&t.loyaltyPointsPerCurrencyUnit, &t.loyaltyRedemptionRate)
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
@@ -92,13 +98,15 @@ func (s *Service) GetSettings(c *fiber.Ctx) error {
 }
 
 type settingsPatchRequest struct {
-	Name             *string `json:"name"`
-	LogoMediaAssetID *string `json:"logo_media_asset_id"`
-	DefaultCurrency  *string `json:"default_currency"`
-	Timezone         *string `json:"timezone"`
-	SupportEmail     *string `json:"support_email"`
-	SupportPhone     *string `json:"support_phone"`
-	TaxRatePercent   *int    `json:"tax_rate_percent"`
+	Name                         *string `json:"name"`
+	LogoMediaAssetID             *string `json:"logo_media_asset_id"`
+	DefaultCurrency              *string `json:"default_currency"`
+	Timezone                     *string `json:"timezone"`
+	SupportEmail                 *string `json:"support_email"`
+	SupportPhone                 *string `json:"support_phone"`
+	TaxRatePercent               *int    `json:"tax_rate_percent"`
+	LoyaltyPointsPerCurrencyUnit *int    `json:"loyalty_points_per_currency_unit"`
+	LoyaltyRedemptionRate        *int    `json:"loyalty_redemption_rate"`
 }
 
 // PatchSettings updates the current tenant's settings (partial merge).
@@ -116,9 +124,15 @@ func (s *Service) PatchSettings(c *fiber.Ctx) error {
 	ctx := c.Context()
 	tid := c.Locals("tenant_id").(string)
 
-	// Validate tax_rate_percent range if provided.
+	// Validate numeric ranges if provided.
 	if req.TaxRatePercent != nil && (*req.TaxRatePercent < 0 || *req.TaxRatePercent > 100) {
 		return httperr.C(fiber.StatusBadRequest, "tax_rate_percent must be 0-100")
+	}
+	if req.LoyaltyPointsPerCurrencyUnit != nil && *req.LoyaltyPointsPerCurrencyUnit < 0 {
+		return httperr.C(fiber.StatusBadRequest, "loyalty_points_per_currency_unit must be >= 0")
+	}
+	if req.LoyaltyRedemptionRate != nil && *req.LoyaltyRedemptionRate < 0 {
+		return httperr.C(fiber.StatusBadRequest, "loyalty_redemption_rate must be >= 0")
 	}
 
 	// Build dynamic update (only provided fields).
@@ -165,6 +179,16 @@ func (s *Service) PatchSettings(c *fiber.Ctx) error {
 		args = append(args, *req.TaxRatePercent)
 		arg++
 	}
+	if req.LoyaltyPointsPerCurrencyUnit != nil {
+		sets = append(sets, "loyalty_points_per_currency_unit = $"+strconv.Itoa(arg))
+		args = append(args, *req.LoyaltyPointsPerCurrencyUnit)
+		arg++
+	}
+	if req.LoyaltyRedemptionRate != nil {
+		sets = append(sets, "loyalty_redemption_rate = $"+strconv.Itoa(arg))
+		args = append(args, *req.LoyaltyRedemptionRate)
+		arg++
+	}
 
 	if len(sets) == 0 {
 		return httperr.C(fiber.StatusBadRequest, "no fields to update")
@@ -179,7 +203,8 @@ func (s *Service) PatchSettings(c *fiber.Ctx) error {
 	var t tenantRow
 	err = tx.QueryRow(ctx, tenantSelect+" WHERE id = $1", tid).Scan(
 		&t.id, &t.name, &t.subdomain, &t.logoMediaAssetID,
-		&t.defaultCurrency, &t.timezone, &t.supportEmail, &t.supportPhone, &t.taxRatePercent)
+		&t.defaultCurrency, &t.timezone, &t.supportEmail, &t.supportPhone, &t.taxRatePercent,
+		&t.loyaltyPointsPerCurrencyUnit, &t.loyaltyRedemptionRate)
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
