@@ -1,7 +1,7 @@
 # Shopkeet API — Complete Reference (Phases 1–13)
 
 **Last updated:** 2026-10-01  
-**DB version:** 23 (migrations 0001–0023 applied on VPS)  
+**DB version:** 24 (migrations 0001–0024 applied on VPS)  
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthy)  
 **All acceptance tests:** PASS  
 **Stack:** Go 1.27 · Fiber · pgx/pgxpool · PostgreSQL 16 (RLS + FORCE) · Redis 7 · golang-migrate (embedded)
@@ -30,7 +30,8 @@
 18. [Pre-orders & Back-in-Stock Alerts (Phase 19)](#phase-19--pre-orders--back-in-stock-alerts)
 19. [Loyalty & Referrals (Phase 20)](#loyalty--referrals-phase-20)
 20. [Advanced & Automatic Discounts (Phase 21)](#advanced--automatic-discounts-phase-21)
-21. [Database Schema Summary](#database-schema-summary)
+21. [Wishlist (Phase 22)](#wishlist-phase-22)
+22. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
 18. [Env Vars & Config](#env-vars--config)
@@ -734,6 +735,9 @@ gift_cards
 -- order_items: is_preorder BOOLEAN DEFAULT false
 back_in_stock_subscriptions
 -- notification_log: type 'back_in_stock'
+
+-- Phase 22
+wishlist_items
 ```
 
 **Every tenant-scoped table has:**
@@ -772,6 +776,38 @@ Default codes by status:
 - 409 → `conflict`
 - 502 → `upstream_error`
 - 5xx → `internal_error`
+
+---
+
+## Wishlist (Phase 22)
+
+Sent 2026-10-01 (commit `c896d8e`, migration `0024_wishlist`). **Wishlist Plus**-type
+app replacement: a signed-in customer's saved products, per tenant, with the usual
+RLS contract. No guest wishlists — the surface is customer-JWT only, same
+`/customers/me` group as Phase 11. Small, low-risk phase, shipped end to end in one
+sitting.
+
+### Model
+
+`wishlist_items` — `tenant_id` + `customer_id` + `product_id` + `created_at`, with
+`UNIQUE (customer_id, product_id)`. The unique row makes a storefront double-tap a
+relational hash join away: the duplicate add surfaces as a `23505` the API answers
+`409`, not a second row. `ENABLE/FORCE ROW LEVEL SECURITY` + same-migration
+`tenant_isolation` policy + `OWNER TO shopkeet_app`, like every tenant-scoped table.
+
+### Endpoints (all Customer-scoped)
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/customers/me/wishlist` | Customer | Every saved product, newest first, joined to live product data (`product_name`, `product_slug`, `price_cents`, `currency`, `status`). |
+| POST | `/customers/me/wishlist` | Customer | Body `{product_id}`. Adds to wishlist; responds `201` with the item. Duplicate → `409 "already in wishlist"`. Unknown product → `404`. Missing/empty `product_id` → `400`. |
+| POST | `/customers/me/wishlist/:productId` | Customer | Route-param form of the add. |
+| DELETE | `/customers/me/wishlist/:productId` | Customer | Removes by product; `204` on success, `404 "not in wishlist"` if absent (a delete that hits nothing is a bug the storefront should see). |
+
+Products of any status can be wishlisted (a merchant may draft/archive a saved
+item); the joined `status` lets the frontend grey it out. Isolation is inherited:
+tenant B's customer can't add tenant A's product (RLS + FK), and a merchant token is
+refused by `CustomerAuthMW` (`403`).
 
 ---
 
@@ -1315,6 +1351,9 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 19 | 17 | ✓ | Abandoned Cart Recovery: `carts.customer_email` + `last_activity_at` + `recovery_sent_at` (+ partial scan index) |
 | 20 | 18 | ✓ | Gift Cards: `gift_cards` + `carts.gift_card_code` + `orders.gift_card_code`/`gift_card_cents` |
 | 21 | 19 | ✓ | Pre-orders & Back-in-Stock: `product_variants.allow_preorder`/`preorder_ships_at`, `order_items.is_preorder`, `back_in_stock_subscriptions` + `notification_log` type `back_in_stock` |
+| 22 | 20 | ✓ | Loyalty & Referrals: `loyalty_ledger` + `customers.loyalty_points`/`discounts.customer_id` + tenant loyalty settings |
+| 23 | 21 | ✓ | Advanced & Automatic Discounts: `discounts.applies_to`/`requires_code`/`buy_quantity`/`get_quantity` |
+| 24 | 22 | ✓ | Wishlist: `wishlist_items` |
 
 ---
 
@@ -1357,6 +1396,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestDeliverBackInStockExactlyOnce` | `internal/notifications` | 19 |
 | `TestLoyaltyReferrals` | `internal/loyalty` | 20 |
 | `TestAutomaticDiscounts` | `internal/discounts` | 21 |
+| `TestWishlistFlow` | `internal/wishlist` | 22 |
 
 Run:  
 ```bash
@@ -1375,7 +1415,6 @@ go test -count=1 ./...
 - Online payments beyond COD
 - Post/template revision history
 - Blog archive, search-results, announcement-bar templates
-- Wishlists
 - Analytics dashboard
 - Granular staff permissions beyond `owner`/`staff`
 - Refund tracking
