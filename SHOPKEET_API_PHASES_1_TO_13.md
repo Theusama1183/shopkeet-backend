@@ -1,7 +1,7 @@
 # Shopkeet API — Complete Reference (Phases 1–13)
 
-**Last updated:** 2026-10-01  
-**DB version:** 24 (migrations 0001–0024 applied on VPS)  
+**Last updated:** 2026-10-02  
+**DB version:** 25 (migrations 0001–0025 applied on VPS)  
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthy)  
 **All acceptance tests:** PASS  
 **Stack:** Go 1.27 · Fiber · pgx/pgxpool · PostgreSQL 16 (RLS + FORCE) · Redis 7 · golang-migrate (embedded)
@@ -31,7 +31,8 @@
 19. [Loyalty & Referrals (Phase 20)](#loyalty--referrals-phase-20)
 20. [Advanced & Automatic Discounts (Phase 21)](#advanced--automatic-discounts-phase-21)
 21. [Wishlist (Phase 22)](#wishlist-phase-22)
-22. [Database Schema Summary](#database-schema-summary)
+22. [Order Tracking & Invoice PDF (Phase 23)](#order-tracking--invoice-pdf-phase-23)
+23. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
 18. [Env Vars & Config](#env-vars--config)
@@ -738,6 +739,9 @@ back_in_stock_subscriptions
 
 -- Phase 22
 wishlist_items
+
+-- Phase 23
+-- orders: tracking_number TEXT, tracking_carrier TEXT, tracking_url TEXT
 ```
 
 **Every tenant-scoped table has:**
@@ -776,6 +780,52 @@ Default codes by status:
 - 409 → `conflict`
 - 502 → `upstream_error`
 - 5xx → `internal_error`
+
+---
+
+## Order Tracking & Invoice PDF (Phase 23)
+
+Sent 2026-10-02 (commit `737e2c8`, migration `0025_order_tracking`). The AfterShip /
+Sufio replacements in one phase: merchants attach a carrier + tracking number to an
+order as it advances to `shipped`, the customer-facing `GET /orders/:id` lookup
+surfaces it, and a server-generated A4 `invoice.pdf` with line items and the full
+money block is served to both admins and customers — the PDF total is computed from
+the exact same columns checkout snapshots, so it can never disagree with
+`orders.total_cents`.
+
+### Model
+
+`orders` gains three nullable `TEXT` columns: `tracking_number`, `tracking_carrier`,
+`tracking_url`. Not a separate table (a carrier gets 0–N tracking events but the
+storefront only needs the latest URL bullet). RLS untouched. The PDF needs **no new
+table at all**: it renders from `order_items` (joined to `product_variants` /
+`products` for name + SKU) and the order's existing money columns.
+
+### Server-side invoice (new: `github.com/go-pdf/fpdf v0.9.0`)
+
+A4, portrait, page margins 20mm, auto page-break at 25mm bottom. Header: store name
+(real `tenants.name`, fallback `Shopkeet`, via RLS) + `INVOICE` + order id, date,
+currency. Customer block: name, phone, email (phase 5 columns). Shipping block:
+`shipping_address_line1`/`city`/`country` when present. Table: QTY / ITEM (name +
+SKU) / UNIT / LINE, then `Subtotal`, `Shipping`, `Discount`, `Gift card`, `Tax`
+rows and a bold `TOTAL` — each from `computeInvoice`, which derives from
+`total_cents`' own parts (`subtotal + shipping + tax − discount − gift`), so a unit
+test can assert equality without any formatting drift. Out-of-Latin-1 runes in
+product names are mapped to `?` (core fonts are Latin-1 only); currencies use
+symbols for `usd`/`eur`/`gbp`/`pkr`, an ISO code otherwise.
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| PATCH | `/orders/:id/status` | Merchant | Body now also accepts optional `tracking_number`, `tracking_carrier`, `tracking_url`; persisted when provided on any admitted **advance** transition (cancelled excluded). Absent fields are preserved; `tracking_*: ""` clears. Answering with tracking after `pending`→`confirmed`→`delivered` is fine — the dashboard sets it when the carrier label is scanned at `shipped`. |
+| GET | `/orders/:id` | Customer | Lookup response now always includes `tracking_number`, `tracking_carrier`, `tracking_url` (`null` until set). Shipping apps watch these three. |
+| GET | `/orders/:id/invoice.pdf` | Merchant, **or** Customer (same phone[/email] lookup as the order fetch) | Streams `application/pdf` (byte body, starts `%PDF-`). Admin path loads by id only; customer path requires `?phone=` → `404 "order not found"` on mismatch. Wrong/missing phone → `400`. |
+
+Tracking info is deliberately never scrubbed from customer responses — a shopper
+confirms delivery with the carrier link; there is nothing private in a tracking
+number. The invoice exposes only what the storefront already shows after checkout
+(customer + shipping details + itemized amounts).
 
 ---
 
@@ -1354,6 +1404,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 22 | 20 | ✓ | Loyalty & Referrals: `loyalty_ledger` + `customers.loyalty_points`/`discounts.customer_id` + tenant loyalty settings |
 | 23 | 21 | ✓ | Advanced & Automatic Discounts: `discounts.applies_to`/`requires_code`/`buy_quantity`/`get_quantity` |
 | 24 | 22 | ✓ | Wishlist: `wishlist_items` |
+| 25 | 23 | ✓ | Order Tracking + Invoice PDF: `orders.tracking_number`/`tracking_carrier`/`tracking_url` |
 
 ---
 
@@ -1397,6 +1448,8 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestLoyaltyReferrals` | `internal/loyalty` | 20 |
 | `TestAutomaticDiscounts` | `internal/discounts` | 21 |
 | `TestWishlistFlow` | `internal/wishlist` | 22 |
+| `TestOrderTrackingAndInvoicePDF` | `internal/orders` | 23 |
+| `TestInvoiceTotalsMath` | `internal/orders` | 23 |
 
 Run:  
 ```bash
