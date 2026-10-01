@@ -263,12 +263,12 @@ func TestAnalyticsReconciliation(t *testing.T) {
 		t.Fatalf("manual day buckets: %v", err)
 	}
 	for rows.Next() {
-		var d string
+		var d time.Time
 		var dt dayTot
 		if err := rows.Scan(&d, &dt.Rev, &dt.Cnt); err != nil {
 			t.Fatalf("scan day: %v", err)
 		}
-		manualDays[d] = dt
+		manualDays[d.Format("2006-01-02")] = dt
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {

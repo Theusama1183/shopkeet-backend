@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
@@ -93,7 +94,7 @@ func (s *Service) GetSales(c *fiber.Ctx) error {
 		totRev += b.revenueCents
 		totCount += b.orderCount
 		buckets = append(buckets, fiber.Map{
-			"date": b.date, "revenue_cents": b.revenueCents, "order_count": b.orderCount,
+			"date": b.date.Format("2006-01-02"), "revenue_cents": b.revenueCents, "order_count": b.orderCount,
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -111,7 +112,7 @@ func (s *Service) GetSales(c *fiber.Ctx) error {
 }
 
 type salesBucket struct {
-	date         string
+	date         time.Time
 	revenueCents int
 	orderCount   int
 }
@@ -143,8 +144,8 @@ func (s *Service) GetTopProducts(c *fiber.Ctx) error {
 	}
 	rows, err := tx.Query(c.Context(), `
 		SELECT p.id, p.name,
-		       SUM(oi.quantity)::int,
-		       SUM(oi.quantity * oi.unit_price_cents)::int
+		       SUM(oi.quantity)::int AS quantity,
+		       SUM(oi.quantity * oi.unit_price_cents)::int AS revenue_cents
 		FROM order_items oi
 		JOIN orders o ON o.id = oi.order_id
 		JOIN products p ON p.id = oi.product_id
