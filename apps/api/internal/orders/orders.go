@@ -380,10 +380,18 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	// discount_cents records the total savings (goods + shipping).
 	discountCents, shippingDiscountCents := 0, 0
 	if auto != nil && auto.DiscountCents > codeCents {
-		if auto.AppliesTo == "shipping" {
-			shippingDiscountCents = auto.DiscountCents
+		claimed, err := discounts.ClaimAuto(ctx, tx, tid, auto.ID, subtotal, quote.CostCents)
+		if err != nil {
+			var ce *discounts.CodeError
+			if errors.As(err, &ce) {
+				return httperr.C(ce.Status, ce.Message)
+			}
+			return httperr.ErrInternalServerError
+		}
+		if claimed.AppliesTo == "shipping" {
+			shippingDiscountCents = claimed.DiscountCents
 		} else {
-			discountCents = auto.DiscountCents
+			discountCents = claimed.DiscountCents
 		}
 		discountCode = "" // automatic — nothing to snapshot as a code
 	} else if codeCents > 0 {
