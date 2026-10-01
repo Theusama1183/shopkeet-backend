@@ -36,6 +36,7 @@ import (
 	"github.com/shopkeet/api/internal/reviews"
 	"github.com/shopkeet/api/internal/shipping"
 	"github.com/shopkeet/api/internal/tenants"
+	"github.com/shopkeet/api/internal/wishlist"
 )
 
 func main() {
@@ -245,6 +246,10 @@ func main() {
 	// customer-scoped JWT. Checkout under CustomerOrGuestMW links orders to the
 	// account when the caller is signed in, and stays fully guest otherwise.
 	customers.RegisterRoutes(v1, pool, cfg.JWTSecret, customers.New(pool, cfg.JWTSecret, bus), rl)
+
+	// Phase 22 — wishlist. Customer-scoped; rides the same /customers/me group
+	// CustomerAuthMW as Phase 11's profile/addresses surface.
+	wishlist.RegisterRoutes(v1, pool, cfg.JWTSecret, wishlist.New(pool))
 
 	// Phase 20 — loyalty & referrals. The order.paid subscriber (same bus as the
 	// notification emailer) credits points once a customer's order is delivered
