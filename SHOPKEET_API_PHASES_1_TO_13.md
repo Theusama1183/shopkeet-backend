@@ -1,7 +1,7 @@
 # Shopkeet API — Complete Reference (Phases 1–13)
 
 **Last updated:** 2026-10-02  
-**DB version:** 25 (migrations 0001–0025 applied on VPS)  
+**DB version:** 26 (migrations 0001–0026 applied on VPS)  
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthy)  
 **All acceptance tests:** PASS  
 **Stack:** Go 1.27 · Fiber · pgx/pgxpool · PostgreSQL 16 (RLS + FORCE) · Redis 7 · golang-migrate (embedded)
@@ -32,7 +32,8 @@
 20. [Advanced & Automatic Discounts (Phase 21)](#advanced--automatic-discounts-phase-21)
 21. [Wishlist (Phase 22)](#wishlist-phase-22)
 22. [Order Tracking & Invoice PDF (Phase 23)](#order-tracking--invoice-pdf-phase-23)
-23. [Database Schema Summary](#database-schema-summary)
+23. [Storefront Analytics (Phase 24)](#storefront-analytics-phase-24)
+24. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
 18. [Env Vars & Config](#env-vars--config)
@@ -742,6 +743,11 @@ wishlist_items
 
 -- Phase 23
 -- orders: tracking_number TEXT, tracking_carrier TEXT, tracking_url TEXT
+
+-- Phase 24 (indexes only — no new tables)
+-- orders_created_at_idx (orders: tenant_id, created_at DESC)
+-- order_items_order_idx (order_items: order_id)
+-- carts_created_at_idx (carts: tenant_id, created_at)
 ```
 
 **Every tenant-scoped table has:**
@@ -826,6 +832,67 @@ Tracking info is deliberately never scrubbed from customer responses — a shopp
 confirms delivery with the carrier link; there is nothing private in a tracking
 number. The invoice exposes only what the storefront already shows after checkout
 (customer + shipping details + itemized amounts).
+
+---
+
+## Storefront Analytics (Phase 24)
+
+Sent 2026-10-02 (commits `660268c` → `8c125cb`, migration `0026_analytics`). The
+LifeTimely / Triple Whale replacement: three merchant-only aggregation endpoints
+over the existing orders / order_items / carts data — **no new tables**. Revenue
+("sales") means any order whose status isn't `cancelled`; `payment_status` is
+deliberately ignored because COD orders are revenue at placement. Everything runs
+inside the tenant tx `TenantMW` opened, so RLS scopes the aggregates and no query
+ships a `tenant_id` filter twice.
+
+### Model
+
+The spec (§24) demanded an index on `orders.created_at`; it also claimed
+`order_items.order_id` was already indexed "via the FK" — false for Postgres, which
+does not index the referencing side, so migration `0026` adds explicit indexes
+coverings all three queries:
+
+- `orders_created_at_idx` on `orders (tenant_id, created_at DESC)` — the sales /
+  conversion window filter.
+- `order_items_order_idx` on `order_items (order_id)` — the top-products join.
+- `carts_created_at_idx` on `carts (tenant_id, created_at)` — the conversion
+  cart-count.
+
+Buckets are UTC `date_trunc('day')` in Go `time.Time` (scanned, then formatted
+`2006-01-02`; Postgres `date` → `string` is not a supported pgx scan). Aggregate
+`SUM`/`COUNT` are cast `::int` in SQL (they return `bigint`). Two live-debug
+fixes landed after first deploy: the `date` scan type, and aliasing the aggregate
+columns (`AS quantity`, `AS revenue_cents`) so `ORDER BY` resolves against the
+output list instead of an ungrouped input column.
+
+### Endpoints (all Merchant)
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/analytics/sales?period=7d\|30d\|90d` | Merchant | `{period, currency, totals:{revenue_cents, order_count}, buckets:[{date, revenue_cents, order_count}]}` — non-cancelled orders, total and per-UTC-day. `period` defaults to `30d`; anything else → `400`. |
+| GET | `/analytics/top-products?period=&metric=quantity\|revenue&limit=1-50` | Merchant | `{period, metric, currency, items:[{product_id, product_name, quantity, revenue_cents}]}` — sales grouped by product (a variant sale rolls up to its product via the `order_items.product_id` snapshot), ranked by the requested metric (default `quantity`). Cancelled orders contribute nothing. |
+| GET | `/analytics/conversion?period=` | Merchant | `{period, carts_created, orders_placed, conversion_rate}` — funnel of carts present vs. orders placed (incl. cancelled) in the window; `conversion_rate = orders_placed / carts_created` rounded to 4dp. |
+
+Single-currency assumption: `currency` is always `"usd"`. The funnel counts
+**carts currently in the table** within the window (a checkout deletes the cart
+row, so completed carts fall out of `carts_created`); count is from the carts
+table itself — a noted data-model constraint, not something the endpoint hides.
+
+### Verification
+
+- Pure: `TestParsePeriodAndLimit` — period/limit parsing, `400`s.
+- Integration (`TestAnalyticsReconciliation`, requires the same DB the suite runs
+  against): seeds a tenant with 4 carts, 2 products (cheap Teapot, expensive Mug)
+  and 4 orders; asserts the API sales total/buckets reconcile **exactly** against
+  a manual `SUM(total_cents)` (cancelled excluded), top-products ranks by the
+  requested metric — Teapot wins by quantity, Mug by revenue — and tenant B sees
+  zero of tenant A's aggregates under RLS.
+- Live smoke (tenant purged after): seeded tenant + a second admin-created product,
+  3 guest checkouts (A×3=6500, B×2=10500, A×1 cancelled) + 1 abandoned cart, then
+  `period=30d` results cross-checked by hand against psql:
+  `sales` 23500/3 ✓ bucket 2026-10-01 ✓ · `top-products` qty: A(6)/B(2) ✓ rev:
+  A(12000)/B(10000) ✓ · `conversion` carts 1/orders 4/rate 4 ✓ · bad `period` and
+  bad `metric` → `400` ✓.
 
 ---
 
@@ -1405,6 +1472,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 23 | 21 | ✓ | Advanced & Automatic Discounts: `discounts.applies_to`/`requires_code`/`buy_quantity`/`get_quantity` |
 | 24 | 22 | ✓ | Wishlist: `wishlist_items` |
 | 25 | 23 | ✓ | Order Tracking + Invoice PDF: `orders.tracking_number`/`tracking_carrier`/`tracking_url` |
+| 26 | 24 | ✓ | Storefront Analytics: indexes `orders_created_at_idx` (`orders(tenant_id, created_at DESC)`), `order_items_order_idx` (`order_items(order_id)`), `carts_created_at_idx` (`carts(tenant_id, created_at)`) — no new tables |
 
 ---
 
@@ -1450,6 +1518,8 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestWishlistFlow` | `internal/wishlist` | 22 |
 | `TestOrderTrackingAndInvoicePDF` | `internal/orders` | 23 |
 | `TestInvoiceTotalsMath` | `internal/orders` | 23 |
+| `TestAnalyticsReconciliation` | `internal/analytics` | 24 |
+| `TestParsePeriodAndLimit` | `internal/analytics` | 24 |
 
 Run:  
 ```bash
