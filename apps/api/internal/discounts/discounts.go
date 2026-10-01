@@ -455,6 +455,9 @@ func (s *Service) CreateDiscount(c *fiber.Ctx) error {
 		return httperr.C(fiber.StatusBadRequest, "invalid body")
 	}
 	appliesTo, requiresCode := req.AppliesTo, true
+	if strings.TrimSpace(appliesTo) == "" {
+		appliesTo = "order"
+	}
 	if req.RequiresCode != nil {
 		requiresCode = *req.RequiresCode
 	}
