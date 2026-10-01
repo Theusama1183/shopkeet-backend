@@ -3,6 +3,7 @@ package orders
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -95,6 +96,9 @@ type orderRow struct {
 	source            string // 'storefront' (checkout) | 'draft' (merchant-created, Phase 15)
 	totalCents        int
 	currency          string
+	trackingNumber    *string // Phase 23
+	trackingCarrier   *string // Phase 23
+	trackingURL       *string // Phase 23
 	createdAt         time.Time
 	items             []orderItemRow
 }
@@ -105,7 +109,8 @@ const orderSelect = `
 	       shipping_postal_code, shipping_country, shipping_method, shipping_cost_cents,
 	       discount_code, discount_cents, gift_card_code, gift_card_cents,
 	       tax_cents, internal_note,
-	       payment_method, payment_status, status, source, total_cents, currency, created_at
+	       payment_method, payment_status, status, source, total_cents, currency,
+	       tracking_number, tracking_carrier, tracking_url, created_at
 	FROM orders`
 
 // loadOrder hydrates one order plus its items.
@@ -118,7 +123,8 @@ func loadOrder(c *fiber.Ctx, tx pgx.Tx, where string, args ...any) (*orderRow, e
 			&o.shippingMethod, &o.shippingCostCents, &o.discountCode, &o.discountCents,
 			&o.giftCardCode, &o.giftCardCents,
 			&o.taxCents, &o.internalNote,
-			&o.paymentMethod, &o.paymentStatus, &o.status, &o.source, &o.totalCents, &o.currency, &o.createdAt)
+			&o.paymentMethod, &o.paymentStatus, &o.status, &o.source, &o.totalCents, &o.currency,
+			&o.trackingNumber, &o.trackingCarrier, &o.trackingURL, &o.createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -178,7 +184,9 @@ func orderJSON(o *orderRow, includeInternalNote bool) fiber.Map {
 		"tax_cents":      o.taxCents,
 		"payment_method": o.paymentMethod, "payment_status": o.paymentStatus,
 		"status": o.status, "source": o.source, "total_cents": o.totalCents, "currency": o.currency,
-		"created_at": o.createdAt.Format(time.RFC3339), "items": items,
+		"tracking_number": strp(o.trackingNumber), "tracking_carrier": strp(o.trackingCarrier),
+		"tracking_url": strp(o.trackingURL),
+		"created_at":   o.createdAt.Format(time.RFC3339), "items": items,
 	}
 	if includeInternalNote {
 		m["internal_note"] = strp(o.internalNote)
@@ -583,7 +591,8 @@ func (s *Service) ListOrders(c *fiber.Ctx) error {
 			&o.shippingMethod, &o.shippingCostCents, &o.discountCode, &o.discountCents,
 			&o.giftCardCode, &o.giftCardCents,
 			&o.taxCents, &o.internalNote,
-			&o.paymentMethod, &o.paymentStatus, &o.status, &o.source, &o.totalCents, &o.currency, &o.createdAt); err != nil {
+			&o.paymentMethod, &o.paymentStatus, &o.status, &o.source, &o.totalCents, &o.currency,
+			&o.trackingNumber, &o.trackingCarrier, &o.trackingURL, &o.createdAt); err != nil {
 			return httperr.ErrInternalServerError
 		}
 		found = append(found, o)
@@ -623,7 +632,10 @@ func (s *Service) ListOrders(c *fiber.Ctx) error {
 }
 
 type updateStatusRequest struct {
-	Status string `json:"status"`
+	Status          string  `json:"status"`
+	TrackingNumber  *string `json:"tracking_number"` // Phase 23: set when advancing to shipped
+	TrackingCarrier *string `json:"tracking_carrier"`
+	TrackingURL     *string `json:"tracking_url"`
 }
 
 // nextStatus is the forward chain; cancelled is handled separately below.
@@ -674,8 +686,27 @@ func (s *Service) UpdateStatus(c *fiber.Ctx) error {
 		return httperr.C(fiber.StatusBadRequest, "invalid status")
 	}
 
-	if _, err := tx.Exec(ctx,
-		"UPDATE orders SET "+sets+" WHERE id = $1", c.Params("id")); err != nil {
+	// Phase 23: tracking fields ride the status update (the shipped transition
+	// is the canonical use) — set only when the body provides them, so an
+	// absent field is preserved and "" clears it. Parameterized to keep the
+	// values out of the concatenated SQL.
+	var params []any
+	if req.TrackingNumber != nil {
+		params = append(params, *req.TrackingNumber)
+		sets += fmt.Sprintf(", tracking_number = $%d", len(params))
+	}
+	if req.TrackingCarrier != nil {
+		params = append(params, *req.TrackingCarrier)
+		sets += fmt.Sprintf(", tracking_carrier = $%d", len(params))
+	}
+	if req.TrackingURL != nil {
+		params = append(params, *req.TrackingURL)
+		sets += fmt.Sprintf(", tracking_url = $%d", len(params))
+	}
+	params = append(params, c.Params("id"))
+	sets += fmt.Sprintf(" WHERE id = $%d", len(params))
+
+	if _, err := tx.Exec(ctx, "UPDATE orders SET "+sets, params...); err != nil {
 		return httperr.ErrInternalServerError
 	}
 

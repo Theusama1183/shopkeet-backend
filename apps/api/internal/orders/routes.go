@@ -16,9 +16,10 @@ import (
 //	POST /checkout              (Customer — guest session, or customer JWT to link the order, Phase 11)
 //	POST /orders/draft          (Admin — merchant-entered phone/WhatsApp order, Phase 15)
 //	GET  /orders/:id            (Customer — verified by phone[/email])
+//	GET  /orders/:id/invoice.pdf (Admin, or Customer — verified by phone[/email]; Phase 23)
 //	POST /orders/:id/returns    (Customer — verified by phone[/email], or Admin, Phase 15)
 //	GET  /orders                (Admin)
-//	PATCH /orders/:id/status    (Admin)
+//	PATCH /orders/:id/status    (Admin — tracking_number/carrier/url accepted when advancing, Phase 23)
 //	PATCH /orders/:id/note      (Admin — internal note, never shown to customer)
 //	GET  /returns               (Admin)
 //	PATCH /returns/:id/status   (Admin — received restocks the returned variants)
@@ -45,6 +46,7 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, svc 
 		auth.MerchantOrCustomerMW(pool, secret),
 		svc.CreateReturn)
 	router.Get("/orders/:id", auth.CustomerMW(pool), svc.GetOrder)
+	router.Get("/orders/:id/invoice.pdf", auth.MerchantOrCustomerMW(pool, secret), svc.GetInvoice)
 
 	admin := router.Group("/orders", auth.TenantMW(pool, secret))
 	admin.Get("/", svc.ListOrders)
