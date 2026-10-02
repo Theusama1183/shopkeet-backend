@@ -26,6 +26,11 @@ func txFrom(c *fiber.Ctx) (pgx.Tx, bool) {
 	return tx, ok && tx != nil
 }
 
+func isAdmin(c *fiber.Ctx) bool {
+	v, _ := c.Locals("admin").(bool)
+	return v
+}
+
 // --- JSON shape ---------------------------------------------------------------
 
 type bundleItemJSON struct {
@@ -96,8 +101,10 @@ func bundleJSON(id, name, btype, status string, priceCents, discountPercent *int
 
 // --- admin: bundles CRUD --------------------------------------------------------
 
-// ListBundles handles GET /bundles (Admin). Returns the tenant's bundles with
-// their items, newest first, optionally filtered by ?status=.
+// ListBundles handles GET /bundles (Public or Admin). For admins it returns
+// every bundle, newest first, optionally filtered by ?status=; public storefront
+// traffic sees active bundles only and no status field (mirrors catalog's
+// PublicOrAdminMW product view).
 func (s *Service) ListBundles(c *fiber.Ctx) error {
 	tx, ok := txFrom(c)
 	if !ok {
@@ -105,9 +112,13 @@ func (s *Service) ListBundles(c *fiber.Ctx) error {
 	}
 	ctx := c.Context()
 
-	where, args := "1 = 1", []any{}
-	if st := c.Query("status"); st != "" {
-		where, args = "status = $1", []any{st}
+	public := !isAdmin(c)
+	where, args := "status = 'active'", []any{}
+	if !public {
+		where, args = "1 = 1", []any{}
+		if st := c.Query("status"); st != "" {
+			where, args = "status = $1", []any{st}
+		}
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT id, name, type, bundle_price_cents, discount_percent, status, created_at
@@ -143,7 +154,7 @@ func (s *Service) ListBundles(c *fiber.Ctx) error {
 			return httperr.ErrInternalServerError
 		}
 		out = append(out, bundleJSON(b.id, b.name, b.btype, b.status, b.priceCents,
-			b.discountPercent, b.createdAt, items, false))
+			b.discountPercent, b.createdAt, items, public))
 	}
 	return c.JSON(fiber.Map{"bundles": out})
 }
@@ -436,54 +447,6 @@ func (s *Service) DeleteBundle(c *fiber.Ctx) error {
 		return httperr.C(fiber.StatusNotFound, "bundle not found")
 	}
 	return c.JSON(fiber.Map{"deleted": true})
-}
-
-// --- public storefront ---------------------------------------------------------
-
-// ListPublicBundles handles GET /bundles (Public). Active bundles only, with
-// their items, for the X-Tenant-ID header storefront.
-func (s *Service) ListPublicBundles(c *fiber.Ctx) error {
-	tx, ok := txFrom(c)
-	if !ok {
-		return httperr.ErrInternalServerError
-	}
-	ctx := c.Context()
-
-	rows, err := tx.Query(ctx, `
-		SELECT id, name, type, bundle_price_cents, discount_percent, status, created_at::text
-		FROM bundles WHERE status = 'active' ORDER BY created_at DESC, id`)
-	if err != nil {
-		return httperr.ErrInternalServerError
-	}
-	type baseRow struct {
-		id, name, btype, status, createdAt string
-		priceCents, discountPercent        *int
-	}
-	var found []baseRow
-	for rows.Next() {
-		var b baseRow
-		if err := rows.Scan(&b.id, &b.name, &b.btype, &b.priceCents, &b.discountPercent,
-			&b.status, &b.createdAt); err != nil {
-			rows.Close()
-			return httperr.ErrInternalServerError
-		}
-		found = append(found, b)
-	}
-	if err := rows.Err(); err != nil {
-		return httperr.ErrInternalServerError
-	}
-	rows.Close()
-
-	out := make([]fiber.Map, 0, len(found))
-	for _, b := range found {
-		items, err := loadBundleItemRows(c, tx, b.id)
-		if err != nil {
-			return httperr.ErrInternalServerError
-		}
-		out = append(out, bundleJSON(b.id, b.name, b.btype, b.status, b.priceCents,
-			b.discountPercent, b.createdAt, items, true))
-	}
-	return c.JSON(fiber.Map{"bundles": out})
 }
 
 // --- admin: quantity breaks -----------------------------------------------------

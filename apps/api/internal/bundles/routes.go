@@ -11,8 +11,7 @@ import (
 // RegisterRoutes mounts the Phase 25 bundles + quantity-break surface on
 // /api/v1:
 //
-//	GET    /bundles                    (Public — active only)
-//	GET    /bundles                    (Admin — all, ?status= filter)
+//	GET    /bundles                    (Public/Admin — public sees active only; admin all + status/?status=)
 //	POST   /bundles                    (Admin — idempotency-guarded)
 //	GET    /bundles/:id                (Admin)
 //	PATCH  /bundles/:id                (Admin — items replaced when provided)
@@ -23,14 +22,16 @@ import (
 //	DELETE /products/:id/quantity-breaks/:breakID   (Admin)
 //
 // The customer-facing POST /cart/bundle lives in the cart package (it needs
-// the CustomerMW group); checkout pricing lives in internal/orders. Registered
-// ahead of catalog's /products group so Fiber never shadows the sibling
-// quantity-break paths with the products group's middleware set.
+// the CustomerMW group); checkout pricing lives in internal/orders. GET
+// /bundles is a single route under PublicOrAdminMW — a separate admin GET at
+// the same path would be shadowed by the public one in Fiber's trie — so the
+// handler branches on the JWT exactly like catalog's GET /products/:id.
+// Registered ahead of catalog's /products group so Fiber never shadows the
+// sibling quantity-break paths with the products group's middleware set.
 func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, svc *Service) {
-	router.Get("/bundles", auth.PublicTenantMW(pool), svc.ListPublicBundles)
+	router.Get("/bundles", auth.PublicOrAdminMW(pool, secret), svc.ListBundles)
 
 	admin := router.Group("/bundles", auth.TenantMW(pool, secret))
-	admin.Get("/", svc.ListBundles)
 	admin.Post("/", idempotency.Middleware("POST /bundles"), svc.CreateBundle)
 	admin.Get("/:id", svc.GetBundle)
 	admin.Patch("/:id", svc.UpdateBundle)
