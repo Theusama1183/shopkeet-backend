@@ -21,7 +21,7 @@
 
 ### Working API endpoints (Coolify v4.3.23, base `https://coolify.shopkeet.com/api/v1`)
 
-All `-H "Authorization: Bearer 1|KZeej8fnRctMU379Zs6CnWhtaFXvf3GaUlCRNGIvb16c67c4"`.
+All requests authenticated with `-H "Authorization: Bearer <COOLIFY_API_TOKEN>"`. Token rotated on 2026-10-02 (audit remediation); it is **not** stored in this doc — see the deploy pipeline `p21-deploy.ps1` (kept outside the repo).
 
 - `GET /applications` — list. `GET /deployments/{uuid}` — status + `logs` (build/deploy output). `GET /deployments/applications/{uuid}` — deploy history.
 - `POST /applications/public` — create app from public git repo. Payload (project/environment/server uuids from Coolify UI):

@@ -237,7 +237,9 @@ Full contract in `shopkeet-agents-package (1)/docs/api-reference.md`.
 5. **Invoice PDF (P23):** generated with `go-pdf/fpdf v0.9` core fonts (Latin-1 only) —
    non-Latin-1 runes render as `?` (e.g. `Café 🐝` → `Café ?`); currency symbols handled for
    `usd/eur/gbp/pkr`, ISO code otherwise. Pure-math unit test proves totals can never
-   disagree with `orders.total_cents`.
+   disagree with `orders.total_cents`. **Accepted product decision (2026-10-02):** merchants
+   operate English-only; no Urdu/non-Latin-1 support planned — this caveat is permanent, not a
+   TODO. Don't re-open without an explicit product ask.
 6. **`order_items.order_id` is NOT auto-indexed post-FK** — the §24 spec claimed it was;
    Postgres only indexes the referenced side. `0026` adds the explicit index.
 7. **Gift-card double spend** — prevented by idempotency keys + `FOR UPDATE`
