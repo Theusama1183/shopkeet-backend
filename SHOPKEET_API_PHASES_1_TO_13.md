@@ -33,7 +33,8 @@
 21. [Wishlist (Phase 22)](#wishlist-phase-22)
 22. [Order Tracking & Invoice PDF (Phase 23)](#order-tracking--invoice-pdf-phase-23)
 23. [Storefront Analytics (Phase 24)](#storefront-analytics-phase-24)
-24. [Database Schema Summary](#database-schema-summary)
+24. [Product Bundles & Quantity Breaks (Phase 25)](#product-bundles--quantity-breaks-phase-25)
+25. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
 18. [Env Vars & Config](#env-vars--config)
@@ -896,6 +897,94 @@ table itself — a noted data-model constraint, not something the endpoint hides
 
 ---
 
+## Product Bundles & Quantity Breaks (Phase 25)
+
+Sent 2026-10-02 (commits `455dbac` + `f7663dc`, migration `0027_bundles`). The
+first phase of `09-growth-features-build-spec.md`, replacing the ReConvert /
+"bundle apps" tier: merchants compose products into **fixed** bundles (one flat
+price for the whole bundle) or **mix-and-match** bundles (a % off whatever the
+customer picks from a pool), and set per-product **quantity breaks** (best % off
+once a line's quantity clears a threshold). This is the first phase where the
+**cart / checkout money math** itself becomes bundle-aware — the shopper pays the
+bundle price, not the sum of its variants.
+
+### Model (`0027`)
+
+- `bundles` — `tenant_id`+RLS, `type` (`fixed` | `mix_and_match`), `status`
+  (`draft` | `active` | `archived`, default `draft`), and **exactly one** of
+  `bundle_price_cents` / `discount_percent` (two CHECKs pin the shapes: `fixed`
+  must carry `bundle_price_cents`, `mix_and_match` must carry
+  `discount_percent`). `UNIQUE (tenant_id, name)`.
+- `bundle_items` — one row per component product (`quantity` = units per bundle
+  for `fixed`, marker `1` for `mix_and_match`); `ON DELETE CASCADE` from the
+  bundle, `UNIQUE (bundle_id, product_id)`.
+- `quantity_breaks` — `product_id`, `min_quantity`, `discount_percent`,
+  `UNIQUE (product_id, min_quantity)`; `ON DELETE CASCADE` from the product.
+- `cart_items.bundle_id` + `order_items.bundle_id` (nullable, `REFERENCES
+  bundles(id)`) — a fixed bundle expands into **one cart row per component
+  variant**, each row tagged with the bundle id so the pricers and the order
+  snapshot can recognize a bundle group. `order_items` snapshot each component's
+  **real** unit price (not the bundle price) because stock must decrement per
+  variant.
+
+All three new tables follow the standard contract exactly (tenant_id + `ENABLE` /
+`FORCE RLS` + same-migration `tenant_isolation` policy + `OWNER TO shopkeet_app`);
+`bundles`/`quantity_breaks`/`bundle_items` get tenant indexes.
+
+### Pricing model (`bundles.PriceCart`, called by cart load + checkout)
+
+- **Bundle lines price as a unit.** `fixed` = `bundle_price_cents` × complete
+  sets (the smallest `lineQty / configuredQty` ratio across components, clamped
+  ≥ 1 — a shopper who shrank one component line pays for fewer bundles); the flat
+  total is allocated across the component lines pro-rata by real value, last line
+  absorbing rounding. `mix_and_match` = `discount_percent` off the summed real
+  component prices of the lines actually in the cart.
+- **Plain lines** get the best qualifying quantity break (highest
+  `discount_percent` whose `min_quantity` the line quantity clears). Breaks never
+  stack onto bundle lines — a bundle already carries its own discount.
+- A bundle referenced by a cart but deleted degrades to the component sum
+  (graceful read); **checkout additionally gates** every `bundles.status='active'`
+  before an order is formed → `409`. Both cart read and checkout run inside the
+  request tx, so RLS scopes every pricing query.
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/bundles` | Merchant | Create a bundle (`name`, `type`, exactly-one pricing field, optional `status`, `items:[{product_id, quantity?}]`). `type` omitted → `fixed`. Mixed shapes (`fixed`+`%`, `mix`+flat, both-price) → `400`; items referencing another/unknown/inactive product → `400`. |
+| GET | `/bundles` | Merchant | List all bundles (draft/active/archived). |
+| GET | `/bundles/:id` | Merchant | One bundle + its items. |
+| PATCH | `/bundles/:id` | Merchant | Partial merge; sending `items` replaces them wholesale; any pricing field flips the pricing mode (re-validated on the merged row). `404` across tenants (RLS). |
+| DELETE | `/bundles/:id` | Merchant | Delete (items cascade); `409` while any cart/order still references the bundle (`23503` → translated). |
+| GET | `/bundles` | Public | Active bundles only, no `status` field leak. |
+| POST | `/products/:id/quantity-breaks` | Merchant | Create a break; duplicate `(product, min_quantity)` → `409`. |
+| GET | `/products/:id/quantity-breaks` | Merchant | List a product's breaks. |
+| PATCH | `/products/:id/quantity-breaks/:bid` | Merchant | Update a break. |
+| DELETE | `/products/:id/quantity-breaks/:bid` | Merchant | Delete a break. |
+| POST | `/cart/bundle` | Customer (guest session) | `{bundle_id, quantity?}` for fixed (1–99; expands the product's **cheapest active variant** per component, rows tagged `bundle_id`) or `{bundle_id, selections:[{product_id, quantity?}]}` for mix (each selection must be in the pool). Adding a bundle whose component variant already sits in the cart outright → `409` (never merges, keeps line pricing intact); draft/archived/deleted → `409`; unknown → `404`; stockless component → `409`. Returns the same cart shape as `POST /cart` — `total_cents` already reflects bundle pricing. |
+
+### Verification
+
+- Integration (`TestBundlesAcceptance`, `internal/bundles`, requires the DB the
+  suite runs against): seeds 2 alpha products + 1 beta product + shipping; asserts
+  fixed bundle carts at exactly 900 (not the 1500 sum) with every line carrying
+  `bundle_id`, checkout totals 1400, per-variant stock decrement, mix discounts
+  the whole pick (1350/1850), quantity breaks on the 2× line (900/1400), tenant
+  isolation (`404`s + empty public list), draft/archived refused (`409`), and the
+  admin validation matrix (cross-tenant item, both-price, mix-with-flat,
+  fixed-with-%, type-default).
+- Live smoke (tenants purged, prod DB back to 0 bundles): created Duo (fixed 900
+  active) + PickMix (mix 10%) + Drafty2; `GET /bundles` (public) = 2 active;
+  fixed bundle in cart = **900**, 2 lines, both `bundle_id`-tagged; checkout =
+  **1400** with the two `order_items` snapshotted at real prices (1000/500, both
+  `bundle_id`-linked); mix cart = **1350**, checkout **1850**; quantity break
+  min-2 @ 10% made a 2× alpha-two line **900** (checkout 1400), create + duplicate
+  `409` verified; variant stock 5→3 / 10→6 exactly; draft add → `409`; archive →
+  hidden (public count 1) + add `409`; beta admin reading alpha's bundle → `404`;
+  cross-tenant bundle item → `400`; bad mix selection → `400`.
+
+---
+
 ## Wishlist (Phase 22)
 
 Sent 2026-10-01 (commit `c896d8e`, migration `0024_wishlist`). **Wishlist Plus**-type
@@ -1473,6 +1562,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 24 | 22 | ✓ | Wishlist: `wishlist_items` |
 | 25 | 23 | ✓ | Order Tracking + Invoice PDF: `orders.tracking_number`/`tracking_carrier`/`tracking_url` |
 | 26 | 24 | ✓ | Storefront Analytics: indexes `orders_created_at_idx` (`orders(tenant_id, created_at DESC)`), `order_items_order_idx` (`order_items(order_id)`), `carts_created_at_idx` (`carts(tenant_id, created_at)`) — no new tables |
+| 27 | 25 | ✓ | Product Bundles & Quantity Breaks: `bundles` + `bundle_items` + `quantity_breaks` + `cart_items.bundle_id`/`order_items.bundle_id` |
 
 ---
 
@@ -1520,6 +1610,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestInvoiceTotalsMath` | `internal/orders` | 23 |
 | `TestAnalyticsReconciliation` | `internal/analytics` | 24 |
 | `TestParsePeriodAndLimit` | `internal/analytics` | 24 |
+| `TestBundlesAcceptance` | `internal/bundles` | 25 |
 
 Run:  
 ```bash

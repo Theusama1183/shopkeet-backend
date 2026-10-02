@@ -1,9 +1,9 @@
-# Shopkeet — Project Status & Complete State (Phases 1–24)
+# Shopkeet — Project Status & Complete State (Phases 1–25)
 
-**Last verified:** 2026-10-02 against live prod (`auth` live smoke, DB dump)
-**DB version:** 26 (migrations 0001–0026 applied, `schema_migrations = 26 | dirty=f`)
+**Last verified:** 2026-10-02 against live prod (bundles live smoke, DB dump)
+**DB version:** 27 (migrations 0001–0027 applied, `schema_migrations = 27 | dirty=f`)
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthz `200`)
-**Status:** Phases 1–24 **complete, deployed, and verified live**. No phase currently in progress.
+**Status:** Phases 1–25 **complete, deployed, and verified live**. No phase currently in progress.
 
 > Purpose of this file: one page a fresh Claude/agent can read to know **exactly how far
 > the project has gone** — every phase, every table + field, what succeeded, what broke and
@@ -23,10 +23,11 @@ content/page-builder, observability, shipping zones/rates, discounts (manual and
 automatic), customer accounts, notifications (Resend), store settings/tax, platform
 hardening (rate limit, idempotency, cache), draft orders + returns, product reviews,
 abandoned-cart recovery emails, gift cards, pre-orders/back-in-stock, loyalty/referrals,
-wishlist, order tracking + server-side invoice PDF, and a merchant analytics dashboard.
+wishlist, order tracking + server-side invoice PDF, a merchant analytics dashboard,
+and product bundles + quantity breaks.
 Every tenant-scoped table ships with `tenant_id` + `ENABLE/FORCE ROW LEVEL SECURITY` +
 a `tenant_isolation` policy + `OWNER TO shopkeet_app` in **the same migration**.
-Prod runs 34 tables / 75 indexes / migration 26; all acceptance tests PASS.
+Prod runs 37 tables / migration 27; all acceptance tests PASS.
 
 ---
 
@@ -58,9 +59,10 @@ Prod runs 34 tables / 75 indexes / migration 26; all acceptance tests PASS.
 | 22 | Wishlist | `0024` | `TestWishlistFlow` | ✅ deployed |
 | 23 | Order Tracking + Invoice PDF | `0025` | `TestOrderTrackingAndInvoicePDF`, `TestInvoiceTotalsMath` | ✅ deployed |
 | 24 | Storefront Analytics (sales / top-products / conversion) | `0026` | `TestAnalyticsReconciliation`, `TestParsePeriodAndLimit` | ✅ deployed |
+| 25 | Product Bundles (fixed flat / mix-and-match % off) + Quantity Breaks | `0027` | `TestBundlesAcceptance` | ✅ deployed |
 
-All migrations applied on the VPS DB (`schema_migrations` = 26). The currently-deployed
-API image covers everything up to Phase 24.
+All migrations applied on the VPS DB (`schema_migrations` = 27). The currently-deployed
+API image covers everything up to Phase 25.
 
 ---
 
