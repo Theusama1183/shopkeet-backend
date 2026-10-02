@@ -35,6 +35,7 @@ import (
 	"github.com/shopkeet/api/internal/platform/observe"
 	"github.com/shopkeet/api/internal/platform/queue"
 	"github.com/shopkeet/api/internal/platform/ratelimit"
+	"github.com/shopkeet/api/internal/recommendations"
 	"github.com/shopkeet/api/internal/reviews"
 	"github.com/shopkeet/api/internal/shipping"
 	"github.com/shopkeet/api/internal/tenants"
@@ -194,6 +195,11 @@ func main() {
 	// breaks sibling group is registered ahead of catalog's /products group so
 	// Fiber never shadows it with the products group's middleware set.
 	bundles.RegisterRoutes(v1, pool, cfg.JWTSecret, bundles.New(pool))
+
+	// Phase 26 — product recommendations. The /products/:id/recommendations
+	// sibling group is registered ahead of catalog's /products group so Fiber
+	// never shadows it with the products group's middleware set.
+	recommendations.RegisterRoutes(v1, pool, cfg.JWTSecret, recommendations.New(pool))
 
 	// Phase 3 — catalog. Storefront routes resolve the tenant from the
 	// X-Tenant-ID header (Next.js middleware per docs/03-architecture.md §2);

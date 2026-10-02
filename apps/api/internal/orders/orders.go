@@ -619,6 +619,143 @@ func (s *Service) GetOrder(c *fiber.Ctx) error {
 	return c.JSON(orderJSON(order, false))
 }
 
+// --- post-purchase upsell (Phase 26) -------------------------------------------
+
+type addItemRequest struct {
+	CustomerPhone string `json:"customer_phone"`
+	VariantID     string `json:"variant_id"`
+	Quantity      int    `json:"quantity"`
+}
+
+// AddOrderItem handles POST /orders/:id/add-item (Customer). The order-
+// confirmation screen upsell: while the COD order is still 'pending' the buyer
+// can add another line. It re-runs the Phase 4 stock check (locking the variant
+// and product FOR UPDATE — the same authoritative guard checkout uses),
+// snapshots the variant's current unit price into order_items, decrements
+// inventory, and recalculates total_cents. Privacy mirrors GET /orders/:id —
+// the caller must present the recorded customer_phone, or the order 404s. Once
+// the order has moved to 'confirmed' (or beyond) it 409s: fulfilment has begun
+// and the number must not drift.
+//
+// The order's frozen financial components (discounts, gift card, shipping,
+// tax) are immutable snapshots; the add prices the new line with the exact
+// checkout pricing (bundles/quantity-breaks aware) and bumps total_cents by
+// that delta, so a later quantity-break edit never rewrites history.
+func (s *Service) AddOrderItem(c *fiber.Ctx) error {
+	var req addItemRequest
+	if err := c.BodyParser(&req); err != nil {
+		return httperr.C(fiber.StatusBadRequest, "invalid body")
+	}
+	if req.CustomerPhone == "" {
+		return httperr.C(fiber.StatusBadRequest, "customer_phone required")
+	}
+	if req.VariantID == "" {
+		return httperr.C(fiber.StatusBadRequest, "variant_id required")
+	}
+	if req.Quantity < 1 {
+		return httperr.C(fiber.StatusBadRequest, "quantity must be at least 1")
+	}
+	if req.Quantity > 99 {
+		return httperr.C(fiber.StatusBadRequest, "quantity must be at most 99")
+	}
+	tx, ok := txFrom(c)
+	if !ok {
+		return httperr.ErrInternalServerError
+	}
+	ctx := c.Context()
+	tid, _ := c.Locals("tenant_id").(string)
+
+	// Lock the order and require the pending window + matching phone in one
+	// hit; FOR UPDATE serializes concurrent post-purchase adds on one order.
+	var oid, status string
+	var orderTotal int
+	err := tx.QueryRow(ctx, `
+		SELECT id, status, total_cents FROM orders
+		WHERE id = $1 AND customer_phone = $2
+		FOR UPDATE`, c.Params("id"), req.CustomerPhone).Scan(&oid, &status, &orderTotal)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return httperr.C(fiber.StatusNotFound, "order not found")
+	} else if err != nil {
+		return httperr.ErrInternalServerError
+	}
+	if status != "pending" {
+		return httperr.C(fiber.StatusConflict, "order can no longer be modified")
+	}
+
+	// Lock the variant + its product — the authoritative stock guard. Two
+	// concurrent adds for the last unit serialize here and the second sees the
+	// already-decremented inventory (Phase 19 preorder semantics preserved).
+	var productID, variantStatus, productStatus string
+	var inventory, price int
+	var allowPreorder bool
+	err = tx.QueryRow(ctx, `
+		SELECT v.product_id, v.price_cents, v.inventory_count, v.status, p.status, v.allow_preorder
+		FROM product_variants v
+		JOIN products p ON p.id = v.product_id
+		WHERE v.id = $1
+		FOR UPDATE OF v, p`, req.VariantID).
+		Scan(&productID, &price, &inventory, &variantStatus, &productStatus, &allowPreorder)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return httperr.C(fiber.StatusNotFound, "variant not found")
+	} else if err != nil {
+		return httperr.ErrInternalServerError
+	}
+	if variantStatus != "active" || productStatus != "active" {
+		return httperr.C(fiber.StatusConflict, "product is no longer available")
+	}
+	preorder := allowPreorder && inventory < req.Quantity
+	if !preorder && inventory < req.Quantity {
+		return httperr.C(fiber.StatusConflict, "insufficient stock")
+	}
+
+	// Price the new line exactly like checkout (quantity breaks included).
+	_, delta, err := bundles.PriceCart(ctx, tx, []bundles.CartItem{{
+		ProductID: productID, VariantID: req.VariantID,
+		Quantity: req.Quantity, PriceCents: price,
+	}})
+	if err != nil {
+		return httperr.ErrInternalServerError
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO order_items (tenant_id, order_id, product_id, variant_id, quantity, unit_price_cents, is_preorder)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		tid, oid, productID, req.VariantID, req.Quantity, price, preorder); err != nil {
+		return httperr.ErrInternalServerError
+	}
+	if !preorder {
+		if _, err := tx.Exec(ctx,
+			"UPDATE product_variants SET inventory_count = inventory_count - $1 WHERE id = $2",
+			req.Quantity, req.VariantID); err != nil {
+			return httperr.ErrInternalServerError
+		}
+	}
+	// Refresh the cached products.price_cents / products.inventory_count
+	// aggregates after the decrement and drop the Redis product detail cache so
+	// the storefront repopulates with fresh stock (mirrors checkout/draft).
+	if _, err := tx.Exec(ctx, `
+		UPDATE products p SET
+			price_cents = COALESCE((SELECT MIN(price_cents) FROM product_variants v
+				WHERE v.product_id = p.id AND v.status = 'active'), 0),
+			inventory_count = COALESCE((SELECT SUM(inventory_count) FROM product_variants v
+				WHERE v.product_id = p.id AND v.status = 'active'), 0)
+		WHERE p.id = $1`, productID); err != nil {
+		return httperr.ErrInternalServerError
+	}
+	cache.InvalidateProduct(ctx, s.cache, tid, productID)
+
+	if _, err := tx.Exec(ctx,
+		"UPDATE orders SET total_cents = $1 WHERE id = $2", orderTotal+delta, oid); err != nil {
+		return httperr.ErrInternalServerError
+	}
+
+	order, err := loadOrder(c, tx, "id = $1", oid)
+	if err != nil || order == nil {
+		return httperr.ErrInternalServerError
+	}
+	return c.JSON(orderJSON(order, false))
+}
+
 // --- admin: list & status ------------------------------------------------------
 
 // ListOrders handles GET /orders (Admin). Returns the tenant's orders, newest

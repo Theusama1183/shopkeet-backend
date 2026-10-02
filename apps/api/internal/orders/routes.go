@@ -17,6 +17,7 @@ import (
 //	POST /orders/draft          (Admin — merchant-entered phone/WhatsApp order, Phase 15)
 //	GET  /orders/:id            (Customer — verified by phone[/email])
 //	GET  /orders/:id/invoice.pdf (Admin, or Customer — verified by phone[/email]; Phase 23)
+//	POST /orders/:id/add-item   (Customer — post-purchase upsell while status='pending'; Phase 26)
 //	POST /orders/:id/returns    (Customer — verified by phone[/email], or Admin, Phase 15)
 //	GET  /orders                (Admin)
 //	PATCH /orders/:id/status    (Admin — tracking_number/carrier/url accepted when advancing, Phase 23)
@@ -47,6 +48,7 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, svc 
 		svc.CreateReturn)
 	router.Get("/orders/:id", auth.CustomerMW(pool), svc.GetOrder)
 	router.Get("/orders/:id/invoice.pdf", auth.MerchantOrCustomerMW(pool, secret), svc.GetInvoice)
+	router.Post("/orders/:id/add-item", auth.CustomerMW(pool), svc.AddOrderItem)
 
 	admin := router.Group("/orders", auth.TenantMW(pool, secret))
 	admin.Get("/", svc.ListOrders)
