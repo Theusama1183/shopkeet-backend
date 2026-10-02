@@ -395,13 +395,13 @@ stage/commit the `shopkeet-agents-package*/` directories or `*.zip`.
 
 ---
 
-## 10. Git state (as of Phase 27)
+## 10. Git state (as of Phase 30)
 
-`main` = latest shipped code + committed Phase 27 (image deploy pending). Recent commits:
+`main` = latest shipped code incl. Phases 28–30 (DB 31). Recent commits:
+`4bc6780 feat(metafields,bulkcsv,feeds): Phases 28-30 metafields, bulk CSV import/export, product feeds (DB 31)` ·
+`f0edbdc feat(affiliates): Phase 27 affiliate program (DB 30)` ·
 `a0b89bb fix(rls): NULLIF-wrap tenant_isolation policies + fix Phase 26 acceptance tests (DB 29)` ·
-`a02af9f docs: Phase 26 upsell, cross-sell and post-purchase recommendations (DB 28)` ·
-`91e1d31 feat(recommendations): Phase 26 upsell, cross-sell and post-purchase offers (DB 28)` ·
-`9165c9a fix(bundles,recommendations): un-shadow admin list GET via PublicOrAdminMW`
+`a02af9f docs: Phase 26 upsell, cross-sell and post-purchase recommendations (DB 28)`
 
 ## 11. Not built yet (deferred — when you get here, check `04-agent-build-spec.md`)
 
