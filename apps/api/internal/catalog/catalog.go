@@ -185,6 +185,7 @@ type productRow struct {
 	categories      []categoryRow
 	options         []optionRow
 	variants        []variantRow
+	metafields      []metafieldRow
 }
 
 func strp(s *string) string {
@@ -192,6 +193,13 @@ func strp(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// metafieldRow mirrors one product_metafields row (Phase 28 custom fields).
+type metafieldRow struct {
+	key   string
+	value string
+	typ   string
 }
 
 func productJSON(p *productRow) fiber.Map {
@@ -233,6 +241,10 @@ func productJSON(p *productRow) fiber.Map {
 			"preorder_ships_at": shipsAt, "option_values": links,
 		})
 	}
+	mf := make([]fiber.Map, 0, len(p.metafields))
+	for _, m := range p.metafields {
+		mf = append(mf, fiber.Map{"key": m.key, "value": m.value, "type": m.typ})
+	}
 	return fiber.Map{
 		"id": p.id, "name": p.name, "slug": p.slug,
 		"description": strp(p.description), "price_cents": p.priceCents,
@@ -246,6 +258,7 @@ func productJSON(p *productRow) fiber.Map {
 		"categories":       cats,
 		"options":          opts,
 		"variants":         variants,
+		"metafields":       mf,
 	}
 }
 
@@ -439,7 +452,26 @@ func (s *Service) hydrateDetail(ctx *fiber.Ctx, tx pgx.Tx, p *productRow) error 
 		}
 		lrows.Close()
 	}
-	return nil
+
+	// Phase 28 metafields (custom key/value pairs) — drained fully before the
+	// handler returns, same one-active-result rule as the other sections.
+	mrows, err := tx.Query(ctx.Context(), `
+		SELECT key, value, type
+		FROM product_metafields
+		WHERE product_id = $1
+		ORDER BY key`, p.id)
+	if err != nil {
+		return err
+	}
+	defer mrows.Close()
+	for mrows.Next() {
+		var m metafieldRow
+		if err := mrows.Scan(&m.key, &m.value, &m.typ); err != nil {
+			return err
+		}
+		p.metafields = append(p.metafields, m)
+	}
+	return mrows.Err()
 }
 
 // --- request/response types -----------------------------------------------------

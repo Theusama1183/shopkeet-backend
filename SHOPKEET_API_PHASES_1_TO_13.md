@@ -36,6 +36,9 @@
 24. [Product Bundles & Quantity Breaks (Phase 25)](#product-bundles--quantity-breaks-phase-25)
 25. [Upsell, Cross-sell & Post-Purchase Recommendations (Phase 26)](#upsell-cross-sell--post-purchase-recommendations-phase-26)
 26. [Affiliate Program (Phase 27)](#affiliate-program-phase-27)
+27. [Metafields / Custom Fields (Phase 28)](#metafields--custom-fields-phase-28)
+28. [Bulk CSV Import/Export (Phase 29)](#bulk-csv-importexport-phase-29)
+29. [Product Feeds (Phase 30)](#product-feeds-phase-30)
 26. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
@@ -1172,6 +1175,114 @@ on admin + customer routes → tenant B `404` on tenant A's payout. Six seeded `
 purged leaf-first; orphan sweep = 0. NOTE: the suite must run as `shopkeet_app` — under the
 `shopkeet` superuser RLS is bypassed, so cross-tenant write checks pass vacuously (that
 misled the first run into thinking the cross-tenant payout gate leaked).
+
+---
+
+## Metafields / Custom Fields (Phase 28)
+
+Migration `0031_product_metafields` (DB 31). Per-product custom fields, edited only by the
+merchant, surfaced read-only to storefront products.
+
+### Model
+
+- `product_metafields`: id, tenant_id, product_id (FK → products), key, value (TEXT), type
+  (`string|number|boolean|json`), timestamps. UNIQUE (product_id, key) — one value per key.
+  RLS contract as elsewhere: `ENABLE ROW LEVEL SECURITY` + `FORCE ROW LEVEL SECURITY` +
+  `tenant_isolation` ALL policy (NULLIF-wrapped), `OWNER TO shopkeet_app`.
+
+### Endpoints & scopes
+
+Merchant (`TenantMW`): `GET /products/:id/metafields`, `PUT /products/:id/metafields/:key`
+(body `{value,type}`), `DELETE /products/:id/metafields/:key`. Public: `GET /products/:id`
+now embeds `metafields: [{key,value,type}]` in the detail object (sorted by key, cached, no
+extra round-trip).
+
+### Routing gotcha (recurring)
+
+The metafields group (`/products/:id/metafields`) must be registered **before** the catalog
+`/products/:id` group (first-registered route wins an overlapping prefix family — same class
+of bug as Phases 25/26/27).
+
+### Acceptance (live, DB 31)
+
+`TestProductMetafields` green **as `shopkeet_app`**: admin PUT key `size` on product A,
+public GET embeds it, admin list shows it, cross-tenant read `404`, bad type `400`,
+`DELETE` missing key `404`. A non-UUID id (`/products/does-not-exist/metafields`) must be
+`404` not `500` — `productExists` guards with `uuid.Parse` before querying (an invalid uuid
+would otherwise fail Postgres cast `22P02` inside the RLS-`NULLIF(tenant_id::uuid)` lookup
+and surface as a 500). `mf28-alpha/mf28-beta` tenants purged; orphan sweep = 0.
+
+---
+
+## Bulk CSV Import/Export (Phase 29)
+
+No new tables. Merchant uploads a CSV of products and gets an async job id; polls the job
+for a per-line report. Export streams a synchronous CSV of all products.
+
+### Endpoints & scopes
+
+Merchant (`TenantMW`): `POST /products/import` (multipart `file`, `Content-Type:
+text/csv`; returns `{job_id}` + `202`), `GET /products/import/:jobId` (`{status,
+report:{total,imported,errors:[{line,error}]}}`), `GET /products/export` (UTF-8 BOM CSV,
+header `name,slug,description,price,currency,inventory_count,status,sku,image_url`).
+Public/admin images untouched.
+
+### Import semantics
+
+Required column: `name`. Optional: `slug,description,price,currency,inventory_count,status,sku,image_url`.
+Per-row: savepoint → sanitize → slug auto-derived (`slugify`, deduped within the batch:
+`dup-thing`, `dup-thing-2`) → insert product + default variant → unique-violation on slug
+→ `"slug already exists"` row error, savepoint rollback (bad row never aborts the batch).
+`status` default `draft`; must be `draft|active|archived` (invalid → line error naming the
+offending value). Each product gets a default variant (sku = row sku if given).
+
+### Job plumbing
+
+Reuses the existing Asynq queue: `TaskTypeProductImport`, `EnqueueResult` (returns the
+asynq task id), and a worker handler that writes a JSON `Report` to the task result via
+`Task.ResultWriter().Write(...)`; `JobStatus` maps TaskState → `pending|processing|done|failed`
+and polls with `Inspector.GetTaskInfo`, reading `Result` bytes. Retention option is
+`asynq.Retention(d)` — v0.26.0 has no `asynq.ResultTTL`.
+
+### Routing gotcha (again)
+
+`/products/import`, `/products/import/:jobId`, `/products/export` are registered **before**
+catalog's `/products` group, so `import`/`export` are never swallowed by `GET /products/:id`.
+
+### Acceptance (live, DB 31)
+
+`TestProductCSVImportExport` green **as `shopkeet_app`**: 4-row CSV (alpha/beta/gamma +
+a `badstatus` row) → report shows `errors:[{Line:4, Error:"invalid status \"badstatus\"
+(draft|active|archived)"}]`; the two "Dup Thing" rows land as `dup-thing`/`dup-thing-2`
+(asserted as a set — random uuids make created_at/id order non-deterministic); `GET
+/products/export` returns a BOM CSV whose rows header + imported products. `bulk29-*` tenant
+purged; orphan sweep = 0.
+
+---
+
+## Product Feeds (Phase 30)
+
+No new tables. Public, tenant-scoped feed endpoints (`PublicTenantMW`, `X-Tenant-ID`) for
+Google Shopping XML and Meta (Instagram/Facebook) CSV.
+
+### Endpoints & scopes
+
+`GET /feeds/google-shopping.xml` — `rss`/`channel` with one `<item>` per **active** product:
+`g:id`, `g:title`, `g:description`, `link` (storefront URL), `g:price` (`"45.00 USD"`),
+`g:availability` (`in_stock`/`out_of_stock` by `inventory_count > 0`), `g:condition`
+(`new`), first image as `g:image_link`. `GET /feeds/meta-catalog.csv` — header
+`id,title,description,link,image_link,availability,price,condition` with `45.00_USD` /
+`in stock` / `new`. Storefront base = `custom_domain` if set else
+`https://{subdomain}.{appBaseDomain}` (per-tenant app_base_domain from settings). Draft and
+archived products omitted; XML escapes titles/descriptions; prices use the half-even cents→currency
+formatter shared with orders.
+
+### Acceptance (live, DB 31)
+
+`TestProductFeeds` green **as `shopkeet_app`**: XML contains the active+in-stock product with
+`<g:price>45.00 USD</g:price>` and `in_stock`, the active out-of-stock product gets
+`out_of_stock`, the draft product is absent; CSV rows match; missing `X-Tenant-ID` → `400`.
+`feed30-*` tenant purged; orphan sweep = 0.
 
 ---
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"time"
 
@@ -16,14 +17,17 @@ import (
 	"github.com/shopkeet/api/internal/analytics"
 	"github.com/shopkeet/api/internal/auth"
 	"github.com/shopkeet/api/internal/bundles"
+	"github.com/shopkeet/api/internal/bulkcsv"
 	"github.com/shopkeet/api/internal/cart"
 	"github.com/shopkeet/api/internal/catalog"
 	"github.com/shopkeet/api/internal/content"
 	"github.com/shopkeet/api/internal/customers"
 	"github.com/shopkeet/api/internal/discounts"
+	"github.com/shopkeet/api/internal/feeds"
 	"github.com/shopkeet/api/internal/giftcards"
 	"github.com/shopkeet/api/internal/loyalty"
 	"github.com/shopkeet/api/internal/media"
+	"github.com/shopkeet/api/internal/metafields"
 	"github.com/shopkeet/api/internal/notifications"
 	"github.com/shopkeet/api/internal/orders"
 	"github.com/shopkeet/api/internal/payments"
@@ -95,6 +99,8 @@ func main() {
 	// never starts (the API still serves; it just can't enqueue/dequeue jobs).
 	var rdb *redis.Client
 	var worker *queue.Worker
+	var importEnq *queue.Enqueuer
+	var importInsp *asynq.Inspector
 	if cfg.RedisURL != "" {
 		ropt, err := redis.ParseURL(cfg.RedisURL)
 		if err != nil {
@@ -102,6 +108,17 @@ func main() {
 		}
 		rdb = redis.NewClient(ropt)
 		defer rdb.Close()
+
+		// Phase 29 — product CSV import needs both halves of the job queue: an
+		// enqueuer to hand POST /products/import its job id, and an inspector
+		// to poll state/result for GET /products/import/:jobId. Both are
+		// nil-safe when Redis is absent (import returns 503; export still works).
+		importEnq, err = queue.NewEnqueuer(cfg.RedisURL)
+		if err != nil {
+			log.Fatalf("failed to init asynq enqueuer: %v", err)
+		}
+		co, _ := queue.ClientOpts(cfg.RedisURL)
+		importInsp = asynq.NewInspector(co)
 
 		// Asynq worker: registers the idempotency-key purge (Phase 14) as a
 		// scheduled hourly job, drains Redis-backed job queues in-process.
@@ -126,6 +143,9 @@ func main() {
 			asynq.NewTask(queue.TaskTypeCartAbandonment, nil)); err != nil {
 			log.Fatalf("failed to schedule cart abandonment sweep: %v", err)
 		}
+		// Phase 29 — bulk product CSV import handler inserts the batch (valid
+		// rows land, per-row failures land in the task result report).
+		worker.Register(queue.TaskTypeProductImport, productImportHandler(pool))
 		worker.Start()
 		log.Printf("redis rate limiting + asynq worker enabled at %s", cfg.RedisURL)
 	}
@@ -201,6 +221,25 @@ func main() {
 	// sibling group is registered ahead of catalog's /products group so Fiber
 	// never shadows it with the products group's middleware set.
 	recommendations.RegisterRoutes(v1, pool, cfg.JWTSecret, recommendations.New(pool))
+
+	// Phase 28 — custom fields (metafields). Admin read/write/delete per
+	// product, embedded in the public GET /products/:id detail. Registered
+	// ahead of catalog so /products/:id/metafields is never shadowed by the
+	// /products/:id public handler.
+	mfSvc := metafields.New(pool)
+	mfSvc.SetCache(cca)
+	metafields.RegisterRoutes(v1, mfSvc, pool, cfg.JWTSecret)
+
+	// Phase 29 — bulk CSV import/export. /products/export and
+	// /products/import[/:jobId] are registered ahead of catalog so the
+	// "export"/"import" segments never resolve as /products/:id.
+	bulkSvc := bulkcsv.New(pool, importEnq, importInsp)
+	bulkcsv.RegisterRoutes(v1, bulkSvc, pool, cfg.JWTSecret)
+
+	// Phase 30 — per-tenant shopping-channel feeds (public storefront routes;
+	// tenant resolved from X-Tenant-ID, GMC/Meta take over from there).
+	feedsSvc := feeds.New(pool, cfg.AppBaseDomain)
+	feeds.RegisterRoutes(v1, feedsSvc, pool)
 
 	// Phase 3 — catalog. Storefront routes resolve the tenant from the
 	// X-Tenant-ID header (Next.js middleware per docs/03-architecture.md §2);
@@ -355,6 +394,27 @@ func cartAbandonmentHandler(pool *pgxpool.Pool, notifSvc *notifications.Service)
 		}
 		if n > 0 {
 			log.Printf("cart abandonment sweep emailed %d carts", n)
+		}
+		return nil
+	}
+}
+
+// productImportHandler drains products:import jobs (Phase 29 bulk CSV import).
+// The parsed rows are already type-validated at upload; the handler runs the
+// batch in its own tenant-scoped transaction (valid rows land, per-row failures
+// are captured) and writes the JSON report to the task result so
+// GET /products/import/:jobId can surface it. A catastrophic error (broken
+// connection, bogus tenant) returns an error for Asynq's retry.
+func productImportHandler(pool *pgxpool.Pool) func(context.Context, *asynq.Task) error {
+	return func(ctx context.Context, t *asynq.Task) error {
+		rep, err := bulkcsv.ProcessImportTask(ctx, pool, t)
+		if err != nil {
+			log.Printf("product import failed: %v", err)
+			return err
+		}
+		if w := t.ResultWriter(); w != nil && rep != nil {
+			data, _ := json.Marshal(rep)
+			_, _ = w.Write(data)
 		}
 		return nil
 	}

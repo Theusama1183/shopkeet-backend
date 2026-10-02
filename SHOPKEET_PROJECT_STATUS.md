@@ -1,9 +1,9 @@
-# Shopkeet — Project Status & Complete State (Phases 1–27)
+# Shopkeet — Project Status & Complete State (Phases 1–30)
 
-**Last verified:** 2026-10-02 against live prod (Phase 27 affiliate acceptance on `shopkeet_app` + DB 30 dump)
-**DB version:** 30 (migrations 0001–0030 applied, `schema_migrations = 30 | dirty=f`)
-**Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthz `200`) — API image currently ends at Phase 26 (Phase 27 code committed, deploy pending)
-**Status:** Phases 1–26 complete, deployed, and verified live; **Phase 27 (affiliate program) built, accepted live, code committed — deploy of the new image pending.**
+**Last verified:** 2026-10-03 against live prod (Phases 28–30 acceptance on `shopkeet_app` + DB 31)
+**DB version:** 31 (migrations 0001–0031 applied, `schema_migrations = 31 | dirty=f`)
+**Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthz `200`) — deploy is not automatic on git push
+**Status:** Phases 1–27 complete, deployed, and verified live; **Phases 28–30 (metafields / bulk CSV import+export / product feeds) built, accepted live, and deployed.**
 
 > Purpose of this file: one page a fresh Claude/agent can read to know **exactly how far
 > the project has gone** — every phase, every table + field, what succeeded, what broke and
@@ -25,8 +25,10 @@ hardening (rate limit, idempotency, cache), draft orders + returns, product revi
 abandoned-cart recovery emails, gift cards, pre-orders/back-in-stock, loyalty/referrals,
 wishlist, order tracking + server-side invoice PDF, a merchant analytics dashboard,
 product bundles + quantity breaks, merchant-curated product recommendations
-with a post-purchase order upsell, and (Phase 27) a single-level affiliate program
-with commissions paid on delivered orders and manual merchant-paid payouts.
+with a post-purchase order upsell, (Phase 27) a single-level affiliate program
+with commissions paid on delivered orders and manual merchant-paid payouts,
+(Phase 28) per-product metafields/custom fields, (Phase 29) bulk CSV product
+import/export, and (Phase 30) Google Shopping + Meta product feeds.
 Every tenant-scoped table ships with `tenant_id` + `ENABLE/FORCE ROW LEVEL SECURITY` +
 a `tenant_isolation` policy (NULLIF-wrapped since `0029`, see below) + `OWNER TO shopkeet_app`
 in **the same migration**.
@@ -64,10 +66,13 @@ Prod runs 41 tables / migration 30; all acceptance tests PASS.
 | 24 | Storefront Analytics (sales / top-products / conversion) | `0026` | `TestAnalyticsReconciliation`, `TestParsePeriodAndLimit` | ✅ deployed |
 | 25 | Product Bundles (fixed flat / mix-and-match % off) + Quantity Breaks | `0027` | `TestBundlesAcceptance` | ✅ deployed |
 | 26 | Upsell & Cross-sell Recommendations + Post-Purchase add-item | `0028` | `TestRecommendationsAcceptance` | ✅ deployed |
-| 27 | Affiliate Program (apply/approve, `?ref=` commissions, manual payouts) | `0030` | `TestAffiliateProgram` | ✅ built + accepted, deploy pending |
+| 27 | Affiliate Program (apply/approve, `?ref=` commissions, manual payouts) | `0030` | `TestAffiliateProgram` | ✅ deployed |
+| 28 | Metafields / Custom Fields (`product_metafields`, admin CRUD, embedded public) | `0031` | `TestProductMetafields` | ✅ deployed |
+| 29 | Bulk CSV Import (async job + report) & Export | — (no migration) | `TestProductCSVImportExport` | ✅ deployed |
+| 30 | Product Feeds (Google Shopping XML + Meta Catalog CSV) | — (no migration) | `TestProductFeeds` | ✅ deployed |
 
-All migrations applied on the VPS DB (`schema_migrations` = 30). The currently-deployed
-API image covers everything up to Phase 26; the Phase 27 image is committed but not yet deployed.
+All migrations applied on the VPS DB (`schema_migrations` = 31). The currently-deployed API image
+covers everything through Phase 30.
 
 ---
 
@@ -119,6 +124,8 @@ alt_text, created_at.
 currency, inventory_count, status (`draft|active|archived`), meta_title, meta_description,
 search_vector TSVECTOR generated (English `to_tsvector`), created_at,
 **rating_average NUMERIC(2,1)**, **rating_count INTEGER** (P16).
+**product_metafields** (P28): id, tenant_id, product_id (FK), key, value (TEXT),
+type (`string|number|boolean|json`), timestamps. UNIQUE (product_id, key).
 **product_categories** (P3): tenant_id, product_id, category_id. PK (product_id, category_id).
 **product_images** (P3): id, tenant_id, product_id, media_asset_id, sort_order. UNIQUE (product_id, media_asset_id).
 
@@ -203,7 +210,7 @@ merchant marking the payout `paid` flips `approved→paid`.
 status (`requested|paid`), created_at. Request blocked while one is already `requested`;
 `paid` covers all currently-`approved` commissions for that affiliate.
 
-**schema_migrations**: version (BIGINT), dirty. Currently `30 | f`.
+**schema_migrations**: version (BIGINT), dirty. Currently `31 | f`.
 
 ### Indexes worth knowing (beyond PKs/UNIQUEs)
 - `products_search_idx` GIN on `search_vector`.
@@ -232,6 +239,9 @@ status (`requested|paid`), created_at. Request blocked while one is already `req
 | Settings (13) | `GET/PATCH /tenant/settings` |
 | **Analytics (24)** | `GET /analytics/sales?period=7d\|30d\|90d`, `GET /analytics/top-products?period=&metric=quantity\|revenue&limit=`, `GET /analytics/conversion?period=` — all Merchant |
 | **Affiliates (27)** | Public: `POST /affiliates/apply` (X-Tenant-ID), `POST /affiliates/login`; Merchant: `GET /affiliates`, `PATCH /affiliates/:id/status`, `PATCH /affiliate-payouts/:id`; Affiliate JWT: `GET /affiliates/me/dashboard`, `GET /affiliates/me/commissions`, `POST /affiliates/me/payout-request`. `?ref=CODE` on checkout links the order (see `09-growth-features-build-spec.md`) |
+| **Metafields (28)** | Merchant: `GET/PUT/DELETE /products/:id/metafields[/:key]`; metafields embedded in public `GET /products/:id` |
+| **Bulk CSV (29)** | Merchant: `POST /products/import` (multipart CSV → job id), `GET /products/import/:jobId` (status + per-line report), `GET /products/export` (sync CSV of all products) |
+| **Feeds (30)** | Public w/ X-Tenant-ID: `GET /feeds/google-shopping.xml`, `GET /feeds/meta-catalog.csv` — active products only, storefront = custom_domain else `https://{subdomain}.{appBaseDomain}` |
 
 Full contract in `shopkeet-agents-package (1)/docs/api-reference.md`.
 
@@ -335,6 +345,23 @@ Full contract in `shopkeet-agents-package (1)/docs/api-reference.md`.
   the one that genuinely gates. 6 seeded `aff-*` tenants purged leaf-first, orphan sweep = 0.
 - Deploy pipeline verified repeatedly: build → `scp` `migrate-linux` → apply migration →
 `p21-deploy.ps1` → healthz 200 → smoke → cleanup.
+- **Phases 28–30 (PASS as `shopkeet_app` on DB 31):**
+  - `TestProductMetafields` (P28) — seeded `mf28-alpha/mf28-beta`; admin `PUT /products/:id/metafields`
+    (key=size), public `GET /products/:id` embeds `metafields` `[{key,value,type}]`, admin `GET`
+    list, cross-tenant read `404`, bad type `400`, missing key `404`; also `404` (not `500`) for a
+    non-UUID product id (`does-not-exist`) — fixed via `uuid.Parse` guard on `productExists`.
+  - `TestProductCSVImportExport` (P29) — 4-row import: alpha/beta/gamma inserted, `badstatus` row
+    → `report errors [{Line:4 Error:"invalid status \"badstatus\" (draft|active|archived)"}]`;
+    duplicate-name batch dedupes slugs (`dup-thing`/`dup-thing-2`); `GET /products/export` returns
+    headered CSV for all products (first-name test builds the CSV from the import row).
+  - `TestProductFeeds` (P30) — active+in-stock product → `<item>` with `g:id/price` as
+    `<g:price>45.00 USD</g:price>` + `<g:availability>in_stock</g:availability>`; active but
+    out-of-stock → `out_of_stock`; draft product omitted; `link` uses custom_domain /
+    `shopbase.test` appBase; Meta CSV `id,title,description,link,image_link,availability,price,condition`
+    with `45.00_USD`; missing `X-Tenant-ID` → `400`.
+  - Migration `0031` applied (`schema_migrations = 31 | f`); RLS `ENABLE + FORCE` on
+    `product_metafields` as `shopkeet_app` w/ `tenant_isolation` ALL policy (NULLIF wrap).
+    Seed tenants purged leaf-first, orphan sweep = 0.
 
 ---
 

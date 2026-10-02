@@ -23,6 +23,12 @@ const (
 	// idle >1h with a captured email and no order yet, and sends exactly one
 	// recovery email per cart. Scheduled hourly via RegisterPeriodic.
 	TaskTypeCartAbandonment = "cart:abandonment"
+
+	// TaskTypeProductImport (Phase 29) processes an uploaded product CSV row by
+	// row in the background. The payload is the parsed rows (untrusted rows are
+	// never executed as SQL); the handler writes a JSON per-row report to the
+	// task result, which GET /products/import/:jobId surfaces.
+	TaskTypeProductImport = "products:import"
 )
 
 // ClientOpts converts a redis:// URL into the options both the enqueuer
@@ -71,6 +77,20 @@ func (e *Enqueuer) Enqueue(ctx context.Context, task *asynq.Task) error {
 		return fmt.Errorf("enqueue %s: %w", task.Type(), err)
 	}
 	return nil
+}
+
+// EnqueueResult is Enqueue for callers that must hand the job id back to the
+// client (async job endpoints — e.g. Phase 29 product import). It returns the
+// Asynq task ID; a nil Enqueuer (Redis disabled) yields an empty id, nil error.
+func (e *Enqueuer) EnqueueResult(ctx context.Context, task *asynq.Task) (string, error) {
+	if e == nil || e.client == nil || task == nil {
+		return "", nil
+	}
+	info, err := e.client.Enqueue(task, asynq.MaxRetry(3))
+	if err != nil {
+		return "", fmt.Errorf("enqueue %s: %w", task.Type(), err)
+	}
+	return info.ID, nil
 }
 
 // EnqueueIn schedules a task after a delay (retry/reminder jobs).
