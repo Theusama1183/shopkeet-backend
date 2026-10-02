@@ -222,11 +222,17 @@ func TestBundlesAcceptance(t *testing.T) {
 	// mix_and_match requires percent.
 	mkBundle(`{"name":"Pick","type":"mix_and_match","bundle_price_cents":900,
 		"items":[{"product_id":"`+aProd1+`"}]}`, fiber.StatusBadRequest)
+	// fixed requires a flat price (a fixed bundle cannot carry the percent model).
+	mkBundle(`{"name":"FixedPct","type":"fixed","discount_percent":10,
+		"items":[{"product_id":"`+aProd1+`"}]}`, fiber.StatusBadRequest)
+	// Omitting type defaults to fixed with a flat price.
+	mkBundle(`{"name":"NoType","bundle_price_cents":700,
+		"items":[{"product_id":"`+aProd1+`"}]}`, fiber.StatusCreated)
 	mixID := mkBundle(`{"name":"PickMix","type":"mix_and_match","discount_percent":10,"status":"active",
 		"items":[{"product_id":"`+aProd1+`"},{"product_id":"`+aProd2+`"}]}`, fiber.StatusCreated)
 	_ = mixID
 	// Draft bundles are hidden from the storefront / refused at add time.
-	draftID := mkBundle(`{"name":"Drafty","type":"fixed","discount_percent":5,
+	draftID := mkBundle(`{"name":"Drafty","type":"fixed","bundle_price_cents":800,
 		"items":[{"product_id":"`+aProd1+`"}]}`, fiber.StatusCreated)
 	_ = draftID
 

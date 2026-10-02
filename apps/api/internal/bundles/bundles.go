@@ -195,6 +195,9 @@ func validateBundle(btype string, priceCents, discountPercent *int, status strin
 	if discountPercent != nil && (*discountPercent < 1 || *discountPercent > 100) {
 		return errors.New("discount_percent must be between 1 and 100")
 	}
+	if btype == "fixed" && priceCents == nil {
+		return errors.New("fixed bundles require bundle_price_cents")
+	}
 	if btype == "mix_and_match" && discountPercent == nil {
 		return errors.New("mix_and_match bundles require discount_percent")
 	}
@@ -221,6 +224,9 @@ func (s *Service) CreateBundle(c *fiber.Ctx) error {
 		return httperr.C(fiber.StatusBadRequest, "name required")
 	}
 	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
+	if req.Type == "" {
+		req.Type = "fixed"
+	}
 	if err := validateBundle(req.Type, req.BundlePriceCents, req.DiscountPercent, req.Status, req.Items); err != nil {
 		return httperr.C(fiber.StatusBadRequest, err.Error())
 	}
