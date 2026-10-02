@@ -27,8 +27,9 @@ wishlist, order tracking + server-side invoice PDF, a merchant analytics dashboa
 product bundles + quantity breaks, and merchant-curated product recommendations
 with a post-purchase order upsell.
 Every tenant-scoped table ships with `tenant_id` + `ENABLE/FORCE ROW LEVEL SECURITY` +
-a `tenant_isolation` policy + `OWNER TO shopkeet_app` in **the same migration**.
-Prod runs 38 tables / migration 28; all acceptance tests PASS.
+a `tenant_isolation` policy (NULLIF-wrapped since `0029`, see below) + `OWNER TO shopkeet_app`
+in **the same migration**.
+Prod runs 38 tables / migration 29; all acceptance tests PASS.
 
 ---
 
@@ -63,7 +64,7 @@ Prod runs 38 tables / migration 28; all acceptance tests PASS.
 | 25 | Product Bundles (fixed flat / mix-and-match % off) + Quantity Breaks | `0027` | `TestBundlesAcceptance` | ✅ deployed |
 | 26 | Upsell & Cross-sell Recommendations + Post-Purchase add-item | `0028` | `TestRecommendationsAcceptance` | ✅ deployed |
 
-All migrations applied on the VPS DB (`schema_migrations` = 28). The currently-deployed
+All migrations applied on the VPS DB (`schema_migrations` = 29). The currently-deployed
 API image covers everything up to Phase 26.
 
 ---
@@ -91,9 +92,12 @@ API image covers everything up to Phase 26.
 ## 4. Full schema — every table, every field (live dump 2026-10-02)
 
 `tenant_id uuid NOT NULL REFERENCES tenants(id)` + `ENABLE RLS` + `FORCE RLS` +
-`POLICY tenant_isolation … (tenant_id = current_setting('app.current_tenant', true)::uuid)`
+`POLICY tenant_isolation … (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)`
 + `OWNER TO shopkeet_app` on **every** table below (all except `tenants` and
-`schema_migrations`, which are RLS-free by design).
+`schema_migrations`, which are RLS-free by design). The `NULLIF` wrap (migration
+`0029`) turns the reset-to-`''` custom GUC after a transaction-local
+`set_config` back into `NULL`, so an out-of-transaction query fails closed
+(zero rows) instead of raising `22P02`.
 
 **tenants** (root, no RLS): id, name, subdomain (UNIQUE), custom_domain (UNIQUE), status,
 created_at, **logo_media_asset_id**, **default_currency**, **timezone**, **support_email**,

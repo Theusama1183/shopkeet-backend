@@ -279,9 +279,22 @@ func TestRecommendationsAcceptance(t *testing.T) {
 
 	// Archiving the recommended product hides it from the public list but not
 	// the admin list.
-	if _, err := pool.Exec(ctx,
+	// A direct pool write evaluated a request out of a transaction sees the
+	// reset-to-'' custom GUC, so run it inside a tenant-scoped transaction.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin archive tx: %v", err)
+	}
+	if _, err := tx.Exec(ctx,
+		"SELECT set_config('app.current_tenant', $1, true)", aID); err != nil {
+		t.Fatalf("set archive tenant: %v", err)
+	}
+	if _, err := tx.Exec(ctx,
 		"UPDATE products SET status = 'archived' WHERE id = $1", aProd3); err != nil {
 		t.Fatalf("archive aProd3: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit archive tx: %v", err)
 	}
 	res = pub("GET", "/api/v1/products/"+aProd1+"/recommendations", "", fiber.StatusOK)
 	if err := json.NewDecoder(res.Body).Decode(&public); err != nil {
@@ -336,7 +349,16 @@ func TestRecommendationsAcceptance(t *testing.T) {
 	}
 	verifyStock := func(variantID string, want int) {
 		var got int
-		if err := pool.QueryRow(ctx,
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin stock tx: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", aID); err != nil {
+			t.Fatalf("set stock tenant: %v", err)
+		}
+		if err := tx.QueryRow(ctx,
 			"SELECT inventory_count FROM product_variants WHERE id = $1", variantID).Scan(&got); err != nil {
 			t.Fatalf("stock read: %v", err)
 		}
@@ -348,7 +370,7 @@ func TestRecommendationsAcceptance(t *testing.T) {
 
 	// Privacy: a wrong phone cannot see or touch the order.
 	cust("POST", "/api/v1/orders/"+oid+"/add-item", "sess-other-"+sfx,
-		`{"customer_phone":"+9-000-000","variant_id":"`+aV2+`"}`, fiber.StatusNotFound)
+		`{"customer_phone":"+9-000-000","variant_id":"`+aV2+`","quantity":1}`, fiber.StatusNotFound)
 
 	// The pending-window add: 2x alpha-two (500 each) triggers the 10% break ->
 	// 900 delta; total 1500 -> 2400; stock 20 -> 18.

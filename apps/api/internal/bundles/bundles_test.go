@@ -178,11 +178,11 @@ func TestBundlesAcceptance(t *testing.T) {
 			if session != "" {
 				req.Header.Set("X-Customer-Session", session)
 			}
-			res, err := app.Test(req, -1)
-			if err != nil {
-				t.Fatalf("%s %s: %v", method, path, err)
-			}
-			raw, _ := io.ReadAll(res.Body)
+res, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		raw, _ := io.ReadAll(res.Body)
 			res.Body.Close()
 			if res.StatusCode != want {
 				t.Fatalf("%s %s: status %d, want %d (body=%s)", method, path, res.StatusCode, want, raw)
@@ -310,9 +310,20 @@ func TestBundlesAcceptance(t *testing.T) {
 	}
 
 	// Stock decremented per component: alpha-one 10->9, alpha-two 20->19.
+	// A direct pool read evaluated out of a transaction sees the reset-to-'' custom
+	// GUC, so run it inside a tenant-scoped transaction.
 	verifyStock := func(variantID string, want int) {
 		var got int
-		if err := pool.QueryRow(ctx,
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin stock tx: %v", err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", aID); err != nil {
+			t.Fatalf("set stock tenant: %v", err)
+		}
+		if err := tx.QueryRow(ctx,
 			"SELECT inventory_count FROM product_variants WHERE id = $1", variantID).Scan(&got); err != nil {
 			t.Fatalf("stock read: %v", err)
 		}
@@ -325,7 +336,7 @@ func TestBundlesAcceptance(t *testing.T) {
 
 	// --- mix_and_match: the whole pick is discounted 10% (1500 -> 1350) ---
 	s2 := "sess-2-" + sfx
-	sel := `{"selections":[{"product_id":"` + aProd1 + `","quantity":1},{"product_id":"` + aProd2 + `","quantity":1}]}`
+	sel := `"selections":[{"product_id":"` + aProd1 + `","quantity":1},{"product_id":"` + aProd2 + `","quantity":1}]}`
 	res = cust("POST", "/api/v1/cart/bundle", s2, `{"bundle_id":"`+mixID+`",`+sel, fiber.StatusOK)
 	if err := json.NewDecoder(res.Body).Decode(&c); err != nil {
 		t.Fatalf("decode mix cart: %v", err)

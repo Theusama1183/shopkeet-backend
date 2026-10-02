@@ -988,7 +988,8 @@ All three new tables follow the standard contract exactly (tenant_id + `ENABLE` 
 ## Upsell, Cross-sell & Post-Purchase Recommendations (Phase 26)
 
 Sent 2026-10-02 (commits `91e1d31` + the shared GET hotfix `9165c9a`/`4a553ef`,
-migration `0028_recommendations`). Merchants curate **"you may also like /
+migration `0028_recommendations`; RLS hardening onward in migration `0029`).
+Merchants curate **"you may also like /
 customers also bought"** links per product (the storefront rail every product
 app has), and the order-confirmation screen gets a **post-purchase upsell**: a
 pending COD order can add another line while fulfilment hasn't started. Shipped
@@ -1026,6 +1027,17 @@ guest shoppers pass back into `AddOrderItem`.
   admin list shows status + archived, cross-tenant read `404`, delete +
   double-delete `404`, and the full add-item window (missing/wrong phone `404`,
   quantity bounds `400`, insufficient stock `409`, confirmed `409`).
+- **Acceptance PASS on 2026-10-02 (post-`0029`, against live prod DB):**
+  `TestRecommendationsAcceptance` and `TestBundlesAcceptance` both green via the
+  cross-compiled test binaries (`-test.count=1`, `DATABASE_URL` =
+  `shopkeet_app`), after the first real run surfaced the reset-to-`''` GUC trap
+  below. Two latent assertion bugs in the tests were fixed while exposing it:
+  (1) the wrong-phone add-item probe sent no `quantity`, but `AddOrderItem`
+  validates quantity **before** the privacy lookup (`orders.go`), so it answered
+  `400 quantity must be at least 1` instead of the expected `404` — the probe now
+  sends `quantity:1`; (2) the mix-and-match `sel` snippet carried an
+  unbalanced `{`, producing malformed JSON (`400 invalid body`) — the brace
+  moved so the POST body is `{"bundle_id":…,"selections":[…]}`
 - Live smoke (tenants purged, prod DB back to 0 recommendations after teardown):
   full CRUD — create A1→A2 (manual, sort 0) + A1→A3 (sort 10), duplicate `409`,
   self `400`, bogus type `400`; public list = 2 picks, no status
@@ -1037,6 +1049,36 @@ guest shoppers pass back into `AddOrderItem`.
   insufficient stock` → confirm order → add again `409`. Verified straight from
   the DB: 3 orders, per-variant stock decremented exactly (5→2 / 10→4), and 0
   rows left for the smoke tenant after teardown.
+
+### Hardening: out-of-transaction reads vs the reset custom GUC (migration `0029`)
+
+The first acceptance run of this phase errored with
+`invalid input syntax for type uuid: "" (SQLSTATE 22P02)` at the tests' **direct
+pool verification queries** (the archive `UPDATE` in the recommendations test
+and the post-checkout stock read in the bundles test) — never inside a handler.
+Root cause is server-side and reproducible: Go's custom GUC slot starts as
+`''`, and after a transaction that ran `set_config('app.current_tenant', X,
+true)` the slot **resets to `''` (not NULL) at COMMIT and persists for the rest
+of the pooled session**. Any query then evaluated **outside** a transaction hits
+the `tenant_isolation` policy `tenant_id = current_setting(...)::uuid` →
+`''::uuid` → `22P02`. ROLLBACK does **not** poison; a fresh connection without
+the GUC is NULL and silently returns zero rows (fail-open-ish, still isolated).
+pgx was cleared (v5.11.0's `CacheStatement` is server-side prepared statement
+caching, irrelevant here — the bare `pool.Exec` reproduced the error one
+session after a scoped COMMIT). Production was already safe: the only
+out-of-transaction pool queries (`auth.go` login subdomain lookup,
+`cart.go:562` recovery-sweep tenant list) target the RLS-free `tenants` table.
+
+**Fix (`0029_rls_nullif_policies`, DB 29):** packed every one of the 36
+`tenant_isolation` policies down to
+`USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)`
+so a stale `''` reads as NULL and the query fails closed instead of erroring.
+Applied to prod via the cross-compiled `migrate-linux` binary
+(`schema_migrations` = 29, clean); `pg_policies` shows all 36 NULLIF-wrapped.
+The acceptance tests' direct verification queries also run inside a tenant-scoped
+transaction (`set_config(..., true)`) so they can see the seeded rows under
+`FORCE RLS`. All `rec-*`/`bun-*` seeded tenants from the debug + passing runs
+were purged leaf-first; orphan sweep across all 36 RLS tables = 0.
 
 ### Shared route-table hotfix (shipped with this phase)
 
