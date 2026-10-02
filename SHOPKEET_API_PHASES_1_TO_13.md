@@ -34,7 +34,8 @@
 22. [Order Tracking & Invoice PDF (Phase 23)](#order-tracking--invoice-pdf-phase-23)
 23. [Storefront Analytics (Phase 24)](#storefront-analytics-phase-24)
 24. [Product Bundles & Quantity Breaks (Phase 25)](#product-bundles--quantity-breaks-phase-25)
-25. [Database Schema Summary](#database-schema-summary)
+25. [Upsell, Cross-sell & Post-Purchase Recommendations (Phase 26)](#upsell-cross-sell--post-purchase-recommendations-phase-26)
+26. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
 18. [Env Vars & Config](#env-vars--config)
@@ -952,11 +953,10 @@ All three new tables follow the standard contract exactly (tenant_id + `ENABLE` 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | POST | `/bundles` | Merchant | Create a bundle (`name`, `type`, exactly-one pricing field, optional `status`, `items:[{product_id, quantity?}]`). `type` omitted → `fixed`. Mixed shapes (`fixed`+`%`, `mix`+flat, both-price) → `400`; items referencing another/unknown/inactive product → `400`. |
-| GET | `/bundles` | Merchant | List all bundles (draft/active/archived). |
+| GET | `/bundles` | Public / Merchant (single route) | List. Public: active bundles only, no `status` field leak. Merchant: all statuses + `status`, optional `?status=` filter. A single `PublicOrAdminMW` route since `9165c9a` — the split public + admin `GET /` pattern let Fiber shadow the admin view (see the Phase 26 hotfix note). |
 | GET | `/bundles/:id` | Merchant | One bundle + its items. |
 | PATCH | `/bundles/:id` | Merchant | Partial merge; sending `items` replaces them wholesale; any pricing field flips the pricing mode (re-validated on the merged row). `404` across tenants (RLS). |
 | DELETE | `/bundles/:id` | Merchant | Delete (items cascade); `409` while any cart/order still references the bundle (`23503` → translated). |
-| GET | `/bundles` | Public | Active bundles only, no `status` field leak. |
 | POST | `/products/:id/quantity-breaks` | Merchant | Create a break; duplicate `(product, min_quantity)` → `409`. |
 | GET | `/products/:id/quantity-breaks` | Merchant | List a product's breaks. |
 | PATCH | `/products/:id/quantity-breaks/:bid` | Merchant | Update a break. |
@@ -982,6 +982,76 @@ All three new tables follow the standard contract exactly (tenant_id + `ENABLE` 
   `409` verified; variant stock 5→3 / 10→6 exactly; draft add → `409`; archive →
   hidden (public count 1) + add `409`; beta admin reading alpha's bundle → `404`;
   cross-tenant bundle item → `400`; bad mix selection → `400`.
+
+---
+
+## Upsell, Cross-sell & Post-Purchase Recommendations (Phase 26)
+
+Sent 2026-10-02 (commits `91e1d31` + the shared GET hotfix `9165c9a`/`4a553ef`,
+migration `0028_recommendations`). Merchants curate **"you may also like /
+customers also bought"** links per product (the storefront rail every product
+app has), and the order-confirmation screen gets a **post-purchase upsell**: a
+pending COD order can add another line while fulfilment hasn't started. Shipped
+alongside Phase 25, and the two phases share the route-table fix below.
+
+### Model (`0028`)
+
+`product_recommendations` — `tenant_id` + RLS (`ENABLE`/`FORCE` + same-migration
+`tenant_isolation` policy + `OWNER TO shopkeet_app`); `product_id` (the product
+whose rail this is) and `recommended_product_id` (the pick) both FK to
+`products(id)` **without cascade** — products archive, never hard-delete. `type`
+(`manual` = merchant-curated, `auto` = reserved for the Phase 32 scheduled job)
+has a CHECK; `sort_order` is the sort key. `UNIQUE (product_id,
+recommended_product_id, type)` turns a storefront double-tap into a `23505`.
+`recommendations_product_idx` `(product_id, type, sort_order)` serves the rail.
+
+The upsell adds no table — `orders.customer_phone` (Phase 5) is the re-entry key
+guest shoppers pass back into `AddOrderItem`.
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/products/:id/recommendations` | Public / Merchant (single route) | The rail. Public storefront: only picks whose recommended product is **active**, no status leak — a dead link never renders. Merchant: every pick incl. archived, each with `status`. Unknown product → `404` on both views. Sorted `type, sort_order, name`. |
+| POST | `/products/:id/recommendations` | Merchant | `{recommended_product_id, type?, sort_order?}`. `type` defaults `manual` (`manual`/`auto` only); self-recommend → `400`; both endpoints must be active → `400 "product not found or not active"`; duplicate → `409`; `sort_order < 0` → `400`. Idempotency-guarded; `201` returns the row. |
+| DELETE | `/products/:id/recommendations/:rid` | Merchant | Remove one pick, scoped to the route's `product_id`; bogus id → `404 "recommendation not found"`. |
+| POST | `/orders/:id/add-item` | Customer (JWT or guest session + `customer_phone`) | Post-purchase upsell. Body `{customer_phone, variant_id, quantity}` (1–99). Locks the order `FOR UPDATE`; it must still be `pending` and its recorded `customer_phone` must match, or the order `404`s; `confirmed`+ → `409 "order can no longer be modified"`. Re-runs the authoritative checkout stock guard (locks variant + product, Phase 19 preorder semantics) → `409 "insufficient stock"` / inactive product. Snapshots the variant's current `unit_price_cents`; prices the new line with **the exact checkout pricer** (quantity breaks / bundles) and bumps `total_cents` by that delta — the order's frozen discount/gift/shipping/tax snapshots never rewrite history. Decrements inventory, refreshes the `products` price/stock aggregates, invalidates the Redis product cache. |
+
+### Verification
+
+- Integration (`TestRecommendationsAcceptance`, `internal/recommendations`, needs
+  the DB the suite runs against): seeds alpha + beta tenants, products, variants,
+  shipping; asserts create defaults (manual, sort 0), duplicate `409`, self `400`,
+  bad type `400`, not-active `400`, public list hides archived with no status,
+  admin list shows status + archived, cross-tenant read `404`, delete +
+  double-delete `404`, and the full add-item window (missing/wrong phone `404`,
+  quantity bounds `400`, insufficient stock `409`, confirmed `409`).
+- Live smoke (tenants purged, prod DB back to 0 recommendations after teardown):
+  full CRUD — create A1→A2 (manual, sort 0) + A1→A3 (sort 10), duplicate `409`,
+  self `400`, bogus type `400`; public list = 2 picks, no status
+  leak; archive A3 → public hides it (1) while **admin still shows both with
+  `status:"archived"`** — exactly the bug this phase shook out; cross-tenant
+  public read `404`; delete + double-delete `404`. Post-purchase: cart 1000 →
+  checkout **1500** → add 2× alpha-two @500 with the min-2 10% quantity break →
+  **2400** → wrong phone `404` → add qty 10 with only 8 left → `409
+  insufficient stock` → confirm order → add again `409`. Verified straight from
+  the DB: 3 orders, per-variant stock decremented exactly (5→2 / 10→4), and 0
+  rows left for the smoke tenant after teardown.
+
+### Shared route-table hotfix (shipped with this phase)
+
+Live smoke proved the Phase 25 "public GET + admin group `GET /`"
+double-registration pattern is broken under Fiber: the first-registered (public)
+route matches every request, so the admin list route was **unreachable in
+production** for both `GET /bundles` and `GET /products/:id/recommendations` —
+an admin JWT still got the public shape (no `status`, archived picks hidden).
+`9165c9a` folds both views into a **single `auth.PublicOrAdminMW` GET** (the
+pattern catalog's `GET /products/:id` already uses), branching the handler on
+`c.Locals("admin")`; `4a553ef` then fixed a latent scan the un-shadowed route
+immediately exposed — the old admin handler read bare `created_at` into a Go
+string, which pgx rejects, so `GET /bundles` `500`'d until it used the `::text`
+cast the other bundle queries already carry. Public output is byte-for-byte
+unchanged across both endpoints.
 
 ---
 
@@ -1563,6 +1633,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | 25 | 23 | ✓ | Order Tracking + Invoice PDF: `orders.tracking_number`/`tracking_carrier`/`tracking_url` |
 | 26 | 24 | ✓ | Storefront Analytics: indexes `orders_created_at_idx` (`orders(tenant_id, created_at DESC)`), `order_items_order_idx` (`order_items(order_id)`), `carts_created_at_idx` (`carts(tenant_id, created_at)`) — no new tables |
 | 27 | 25 | ✓ | Product Bundles & Quantity Breaks: `bundles` + `bundle_items` + `quantity_breaks` + `cart_items.bundle_id`/`order_items.bundle_id` |
+| 28 | 26 | x | Upsell, Cross-sell & Post-Purchase: `product_recommendations` (manual/auto, per-pick unique) + post-purchase upsell keyed on `orders.customer_phone` |
 
 ---
 
@@ -1611,6 +1682,7 @@ See `SHOPKEET-COOLIFY-MIGRATION.md` → **"Executed: API-driven deployment"** fo
 | `TestAnalyticsReconciliation` | `internal/analytics` | 24 |
 | `TestParsePeriodAndLimit` | `internal/analytics` | 24 |
 | `TestBundlesAcceptance` | `internal/bundles` | 25 |
+| `TestRecommendationsAcceptance` | `internal/recommendations` | 26 |
 
 Run:  
 ```bash

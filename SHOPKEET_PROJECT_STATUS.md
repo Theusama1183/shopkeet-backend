@@ -1,9 +1,9 @@
-# Shopkeet — Project Status & Complete State (Phases 1–25)
+# Shopkeet — Project Status & Complete State (Phases 1–26)
 
-**Last verified:** 2026-10-02 against live prod (bundles live smoke, DB dump)
-**DB version:** 27 (migrations 0001–0027 applied, `schema_migrations = 27 | dirty=f`)
+**Last verified:** 2026-10-02 against live prod (Phase 26 rec + upsell live smoke, DB dump)
+**DB version:** 28 (migrations 0001–0028 applied, `schema_migrations = 28 | dirty=f`)
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthz `200`)
-**Status:** Phases 1–25 **complete, deployed, and verified live**. No phase currently in progress.
+**Status:** Phases 1–26 **complete, deployed, and verified live**. No phase currently in progress.
 
 > Purpose of this file: one page a fresh Claude/agent can read to know **exactly how far
 > the project has gone** — every phase, every table + field, what succeeded, what broke and
@@ -24,10 +24,11 @@ automatic), customer accounts, notifications (Resend), store settings/tax, platf
 hardening (rate limit, idempotency, cache), draft orders + returns, product reviews,
 abandoned-cart recovery emails, gift cards, pre-orders/back-in-stock, loyalty/referrals,
 wishlist, order tracking + server-side invoice PDF, a merchant analytics dashboard,
-and product bundles + quantity breaks.
+product bundles + quantity breaks, and merchant-curated product recommendations
+with a post-purchase order upsell.
 Every tenant-scoped table ships with `tenant_id` + `ENABLE/FORCE ROW LEVEL SECURITY` +
 a `tenant_isolation` policy + `OWNER TO shopkeet_app` in **the same migration**.
-Prod runs 37 tables / migration 27; all acceptance tests PASS.
+Prod runs 38 tables / migration 28; all acceptance tests PASS.
 
 ---
 
@@ -60,9 +61,10 @@ Prod runs 37 tables / migration 27; all acceptance tests PASS.
 | 23 | Order Tracking + Invoice PDF | `0025` | `TestOrderTrackingAndInvoicePDF`, `TestInvoiceTotalsMath` | ✅ deployed |
 | 24 | Storefront Analytics (sales / top-products / conversion) | `0026` | `TestAnalyticsReconciliation`, `TestParsePeriodAndLimit` | ✅ deployed |
 | 25 | Product Bundles (fixed flat / mix-and-match % off) + Quantity Breaks | `0027` | `TestBundlesAcceptance` | ✅ deployed |
+| 26 | Upsell & Cross-sell Recommendations + Post-Purchase add-item | `0028` | `TestRecommendationsAcceptance` | ✅ deployed |
 
-All migrations applied on the VPS DB (`schema_migrations` = 27). The currently-deployed
-API image covers everything up to Phase 25.
+All migrations applied on the VPS DB (`schema_migrations` = 28). The currently-deployed
+API image covers everything up to Phase 26.
 
 ---
 
@@ -338,13 +340,13 @@ stage/commit the `shopkeet-agents-package*/` directories or `*.zip`.
 
 ---
 
-## 10. Git state (as of Phase 24)
+## 10. Git state (as of Phase 26)
 
 `main` = latest shipped code. Recent commits:
-`660268c feat(analytics): Phase 24 dashboard …` ·
-`4a870da fix(analytics): cast SUM/COUNT aggregates to int for pgx scan` ·
-`8c125cb fix(analytics): scan date into time.Time, alias aggregate cols for ORDER BY` ·
-`42f32bf docs: Phase 24 storefront analytics (DB 26)`.
+`91e1d31 feat(recommendations): Phase 26 upsell, cross-sell and post-purchase offers (DB 28)` ·
+`9165c9a fix(bundles,recommendations): un-shadow admin list GET via PublicOrAdminMW` ·
+`4a553ef fix(bundles): scan created_at::text in merged ListBundles` ·
+`5a71481 docs: Phase 25 product bundles + quantity breaks (DB 27)`
 
 ## 11. Not built yet (deferred — when you get here, check `04-agent-build-spec.md`)
 
