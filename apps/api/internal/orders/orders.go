@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/affiliates"
 	"github.com/shopkeet/api/internal/bundles"
 	"github.com/shopkeet/api/internal/discounts"
 	"github.com/shopkeet/api/internal/giftcards"
@@ -226,6 +227,7 @@ type checkoutRequest struct {
 	ShippingCountry      string `json:"shipping_country"`
 	ShippingRateID       string `json:"shipping_rate_id"`
 	PaymentMethod        string `json:"payment_method"`
+	AffiliateCode        string `json:"affiliate_code"` // Phase 27: preferred over the ?ref= query param
 }
 
 // Checkout handles POST /checkout (Customer). Runs inside the request
@@ -547,6 +549,21 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	if _, err := tx.Exec(ctx,
 		"DELETE FROM carts WHERE id = $1", cartID); err != nil {
 		return httperr.ErrInternalServerError
+	}
+
+	// Phase 27 — affiliate tracking. An order that arrived via ?ref=CODE (or the
+	// body's affiliate_code) snapshots the code and books a pending commission at
+	// the affiliate's current commission_percent of the discounted goods subtotal
+	// (shipping/tax are excluded). An unknown, pending, suspended or rejected code
+	// is ignored — an affiliate link must never break checkout.
+	affCode := strings.TrimSpace(req.AffiliateCode)
+	if affCode == "" {
+		affCode = strings.TrimSpace(c.Query("ref"))
+	}
+	if affCode != "" {
+		if err := affiliates.RecordCheckout(ctx, tx, tid, orderID, affCode, subtotal-goodsDiscount); err != nil {
+			return httperr.ErrInternalServerError
+		}
 	}
 
 	auth.AfterCommit(c, func() {

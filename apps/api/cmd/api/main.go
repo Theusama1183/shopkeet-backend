@@ -12,6 +12,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/shopkeet/api/internal/affiliates"
 	"github.com/shopkeet/api/internal/analytics"
 	"github.com/shopkeet/api/internal/auth"
 	"github.com/shopkeet/api/internal/bundles"
@@ -276,6 +277,13 @@ func main() {
 	loyaltySvc := loyalty.New(pool)
 	loyaltySvc.Subscribe(bus)
 	loyalty.RegisterRoutes(v1, pool, cfg.JWTSecret, loyaltySvc)
+
+	// Phase 27 — affiliate program. Same bus as loyalty: checkout books the
+	// pending commission, the order.paid subscriber approves it on delivery,
+	// and the merchant marks payouts paid manually.
+	affiliatesSvc := affiliates.New(pool, cfg.JWTSecret)
+	affiliatesSvc.Subscribe(bus)
+	affiliates.RegisterRoutes(v1, pool, cfg.JWTSecret, affiliatesSvc, rl)
 
 	// Phase 12 — notifications. The provider + service were constructed before
 	// the Redis block (the abandoned-cart sweep reuses them). Here we wire the

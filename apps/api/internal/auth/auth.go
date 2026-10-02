@@ -238,8 +238,8 @@ func LoginHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 // --- middleware + routes -------------------------------------------------------
 
 // parseMerchant validates an Authorization header that must be a merchant token.
-// A customer-scoped JWT (Phase 11) is rejected here so a storefront shopper can
-// never reach admin routes.
+// Any other scope — customer (Phase 11) or affiliate (Phase 27) — is rejected
+// here so a storefront shopper or a partner can never reach admin routes.
 func parseMerchant(c *fiber.Ctx, secret string) (*Claims, int, string) {
 	h := c.Get("Authorization")
 	if !strings.HasPrefix(h, "Bearer ") {
@@ -249,8 +249,8 @@ func parseMerchant(c *fiber.Ctx, secret string) (*Claims, int, string) {
 	if err != nil {
 		return nil, fiber.StatusUnauthorized, "invalid token"
 	}
-	if claims.Scope == "customer" {
-		return nil, fiber.StatusForbidden, "customer token not allowed here"
+	if claims.Scope != "merchant" {
+		return nil, fiber.StatusForbidden, "non-merchant token not allowed here"
 	}
 	return claims, 0, ""
 }
@@ -524,6 +524,50 @@ func CustomerAuthMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 		c.Locals("tx", tx)
 		c.Locals("tenant_id", stable(claims.TenantID))
 		c.Locals("customer_id", claims.CustomerID)
+		if err := c.Next(); err != nil {
+			return err
+		}
+		return commitAndFlush(c, tx, ctx)
+	}
+}
+
+// AffiliateAuthMW guards Phase 27 affiliate-account routes. It requires an
+// affiliate-scoped JWT (scope="affiliate", signed via SignAffiliate) and opens
+// the RLS-scoped request transaction pinned to the token's tenant — the same
+// shape as TenantMW/CustomerAuthMW, but the identity is c.Locals("affiliate_id"),
+// never user_id/role or customer_id. Merchant and customer tokens are refused
+// here.
+func AffiliateAuthMW(pool *pgxpool.Pool, secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		h := c.Get("Authorization")
+		if !strings.HasPrefix(h, "Bearer ") {
+			return httperr.C(fiber.StatusUnauthorized, "missing bearer token")
+		}
+		claims, err := Parse(secret, strings.TrimPrefix(h, "Bearer "))
+		if err != nil {
+			return httperr.C(fiber.StatusUnauthorized, "invalid token")
+		}
+		if claims.Scope != "affiliate" {
+			return httperr.C(fiber.StatusForbidden, "non-affiliate token not allowed here")
+		}
+		if claims.AffiliateID == "" {
+			return httperr.C(fiber.StatusForbidden, "token carries no affiliate identity")
+		}
+
+		ctx := c.Context()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return httperr.ErrInternalServerError
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx,
+			"SELECT set_config('app.current_tenant', $1, true)", claims.TenantID); err != nil {
+			return httperr.ErrInternalServerError
+		}
+
+		c.Locals("tx", tx)
+		c.Locals("tenant_id", stable(claims.TenantID))
+		c.Locals("affiliate_id", claims.AffiliateID)
 		if err := c.Next(); err != nil {
 			return err
 		}

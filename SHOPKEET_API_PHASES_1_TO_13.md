@@ -35,6 +35,7 @@
 23. [Storefront Analytics (Phase 24)](#storefront-analytics-phase-24)
 24. [Product Bundles & Quantity Breaks (Phase 25)](#product-bundles--quantity-breaks-phase-25)
 25. [Upsell, Cross-sell & Post-Purchase Recommendations (Phase 26)](#upsell-cross-sell--post-purchase-recommendations-phase-26)
+26. [Affiliate Program (Phase 27)](#affiliate-program-phase-27)
 26. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
@@ -750,13 +751,27 @@ wishlist_items
 -- orders_created_at_idx (orders: tenant_id, created_at DESC)
 -- order_items_order_idx (order_items: order_id)
 -- carts_created_at_idx (carts: tenant_id, created_at)
+
+-- Phase 25 (tables)
+bundles
+bundle_items
+quantity_breaks
+
+-- Phase 26 (table)
+product_recommendations
+
+-- Phase 27 (tables)
+affiliates
+affiliate_commissions
+affiliate_payouts
+-- orders: affiliate_code TEXT
 ```
 
 **Every tenant-scoped table has:**
 - `tenant_id UUID NOT NULL REFERENCES tenants(id)`
 - `ENABLE ROW LEVEL SECURITY`
 - `FORCE ROW LEVEL SECURITY`
-- `CREATE POLICY tenant_isolation USING (tenant_id = current_setting('app.current_tenant', true)::uuid)`
+- `CREATE POLICY tenant_isolation USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid)`
 - `OWNER TO shopkeet_app`
 
 ---
@@ -771,6 +786,7 @@ wishlist_items
 | `CustomerMW(pool)` | Guest session (cookie/header) | Cart, guest checkout |
 | `CustomerAuthMW(pool, secret)` | Requires `scope="customer"` | `/customers/me/*` |
 | `CustomerOrGuestMW(pool, secret)` | Customer JWT → link order; else guest session | `POST /checkout` |
+| `AffiliateAuthMW(pool, secret)` | Requires `scope="affiliate"` | `/affiliates/me/*` (Phase 27) |
 
 ---
 
@@ -1094,6 +1110,68 @@ immediately exposed — the old admin handler read bare `created_at` into a Go
 string, which pgx rejects, so `GET /bundles` `500`'d until it used the `::text`
 cast the other bundle queries already carry. Public output is byte-for-byte
 unchanged across both endpoints.
+
+---
+
+## Affiliate Program (Phase 27)
+
+Commit in progress (migration `0030_affiliates`, DB 30). Single-level affiliate program per
+`09-growth-features-build-spec.md §Phase 27`: merchants approve partner applications (setting
+a `commission_percent`), partners get their own JWT scope (`affiliate`), and every order that
+arrives with `?ref=CODE` (or an `affiliate_code` body field at checkout) books a commission for
+that partner — snapped at **discounted goods subtotal** (`subtotal − goods_discount`), i.e.
+never on shipping or tax. Commissions are `pending` until the order is `delivered` (the
+`order.paid` event both loyalty and affiliates already subscribe to), then `approved`; the
+merchant marks a payout `paid` to flip an affiliate's `approved` commissions to `paid`.
+
+### Model
+
+- `affiliates`: id, tenant_id, name, email (UNIQUE tenant), **code** (UNIQUE tenant — the
+  canonical code matched by both `?ref=` and the body field), `commission_percent` NUMERIC,
+  status (`pending|approved|suspended`), created_at. RLS contract as elsewhere.
+- `affiliate_commissions`: id, tenant_id, affiliate_id, order_id, commission_cents, status
+  (`pending|approved|paid`), created_at. UNIQUE (affiliate_id, order_id) `ON CONFLICT DO
+  NOTHING` — one commission per order per affiliate, and checkout never fails because of
+  affiliate bookkeeping.
+- `affiliate_payouts`: id, tenant_id, affiliate_id, amount_cents, status (`requested|paid`),
+  created_at. A request is rejected (`409`) while one is already `requested`. Paying out
+  covers every currently-`approved` commission for that affiliate.
+- `orders.affiliate_code TEXT` — snapshot of the credited code (POST-ref arbitrary fetch
+  would get sticky).
+
+### Endpoints & scopes
+
+Public (`X-Tenant-ID`-only): `POST /affiliates/apply` (rate-limited, idempotency-guarded),
+`POST /affiliates/login` (returns an **affiliate-scoped JWT**; `pending` → `403`). Merchant:
+`GET /affiliates`, `PATCH /affiliates/:id/status` (status + optional `commission_percent`
+ride-along), `PATCH /affiliate-payouts/:id`. Affiliate JWT: `GET /affiliates/me/dashboard`,
+`GET /affiliates/me/commissions`, `POST /affiliates/me/payout-request`. Unknown / inactive
+codes are **silently ignored** — never a checkout failure.
+
+### Auth work
+
+`Claims.AffiliateID` + `auth.SignAffiliate`, new `auth.AffiliateAuthMW`, and a tightened
+`parseMerchant` (`scope != "merchant"` → reject, was `scope == "customer"`) so affiliate
+tokens get a clean `403` on every admin and customer route.
+
+### Routing gotcha (fixed during acceptance)
+
+Registering the `/affiliates` admin group **before** `/affiliates/me/*` let Fiber shadow the
+`me` routes with the admin group's `TenantMW` (first-registered route wins an overlapping
+prefix family — same class of bug as the Phase 26 shared hotfix). Fix: register `me` first;
+the acceptance test asserts an affiliate JWT gets `403 non-merchant` on admin routes and a
+merchant JWT gets `403 non-affiliate` on `/affiliates/me/*`.
+
+### Acceptance (live, DB 30)
+
+`TestAffiliateProgram` ran green **as `shopkeet_app`** against prod: apply → dup `409` →
+approve 10% → pending-login `403` → approved-login → bogus ref ignored → valid-ref checkout
+books pending 200¢ on a 2000¢ subtotal → `delivered` approves → payout-request `201` /
+dup `409` → merchant-paid flips to `paid` → dashboard totals reconcile → affiliate JWT `403`
+on admin + customer routes → tenant B `404` on tenant A's payout. Six seeded `aff-*` tenants
+purged leaf-first; orphan sweep = 0. NOTE: the suite must run as `shopkeet_app` — under the
+`shopkeet` superuser RLS is bypassed, so cross-tenant write checks pass vacuously (that
+misled the first run into thinking the cross-tenant payout gate leaked).
 
 ---
 

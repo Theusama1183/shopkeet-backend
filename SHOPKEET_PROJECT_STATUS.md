@@ -1,9 +1,9 @@
-# Shopkeet — Project Status & Complete State (Phases 1–26)
+# Shopkeet — Project Status & Complete State (Phases 1–27)
 
-**Last verified:** 2026-10-02 against live prod (Phase 26 rec + upsell live smoke, DB dump)
-**DB version:** 28 (migrations 0001–0028 applied, `schema_migrations = 28 | dirty=f`)
-**Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthz `200`)
-**Status:** Phases 1–26 **complete, deployed, and verified live**. No phase currently in progress.
+**Last verified:** 2026-10-02 against live prod (Phase 27 affiliate acceptance on `shopkeet_app` + DB 30 dump)
+**DB version:** 30 (migrations 0001–0030 applied, `schema_migrations = 30 | dirty=f`)
+**Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthz `200`) — API image currently ends at Phase 26 (Phase 27 code committed, deploy pending)
+**Status:** Phases 1–26 complete, deployed, and verified live; **Phase 27 (affiliate program) built, accepted live, code committed — deploy of the new image pending.**
 
 > Purpose of this file: one page a fresh Claude/agent can read to know **exactly how far
 > the project has gone** — every phase, every table + field, what succeeded, what broke and
@@ -24,12 +24,13 @@ automatic), customer accounts, notifications (Resend), store settings/tax, platf
 hardening (rate limit, idempotency, cache), draft orders + returns, product reviews,
 abandoned-cart recovery emails, gift cards, pre-orders/back-in-stock, loyalty/referrals,
 wishlist, order tracking + server-side invoice PDF, a merchant analytics dashboard,
-product bundles + quantity breaks, and merchant-curated product recommendations
-with a post-purchase order upsell.
+product bundles + quantity breaks, merchant-curated product recommendations
+with a post-purchase order upsell, and (Phase 27) a single-level affiliate program
+with commissions paid on delivered orders and manual merchant-paid payouts.
 Every tenant-scoped table ships with `tenant_id` + `ENABLE/FORCE ROW LEVEL SECURITY` +
 a `tenant_isolation` policy (NULLIF-wrapped since `0029`, see below) + `OWNER TO shopkeet_app`
 in **the same migration**.
-Prod runs 38 tables / migration 29; all acceptance tests PASS.
+Prod runs 41 tables / migration 30; all acceptance tests PASS.
 
 ---
 
@@ -63,9 +64,10 @@ Prod runs 38 tables / migration 29; all acceptance tests PASS.
 | 24 | Storefront Analytics (sales / top-products / conversion) | `0026` | `TestAnalyticsReconciliation`, `TestParsePeriodAndLimit` | ✅ deployed |
 | 25 | Product Bundles (fixed flat / mix-and-match % off) + Quantity Breaks | `0027` | `TestBundlesAcceptance` | ✅ deployed |
 | 26 | Upsell & Cross-sell Recommendations + Post-Purchase add-item | `0028` | `TestRecommendationsAcceptance` | ✅ deployed |
+| 27 | Affiliate Program (apply/approve, `?ref=` commissions, manual payouts) | `0030` | `TestAffiliateProgram` | ✅ built + accepted, deploy pending |
 
-All migrations applied on the VPS DB (`schema_migrations` = 29). The currently-deployed
-API image covers everything up to Phase 26.
+All migrations applied on the VPS DB (`schema_migrations` = 30). The currently-deployed
+API image covers everything up to Phase 26; the Phase 27 image is committed but not yet deployed.
 
 ---
 
@@ -73,7 +75,9 @@ API image covers everything up to Phase 26.
 
 - **API** — one Go binary, Coolify-managed app (container `l6modsyezs1vlrv6ly1oqz4i-…`,
   listens on `:3001` internally), proxied by `coolify-proxy` (traefik) at
-  `https://api.shopkeet.com`. Auto-deploys on git push to `main`.
+  `https://api.shopkeet.com`. **Deploy is not automatic on git push** (verified
+  2026-10-02: pushing `a0b89bb` left the old `4a553ef` container running) — the image is
+  released via the Coolify deploy trigger (`p21-deploy.ps1`).
 - **Postgres** — manual container `shopkeet-postgres` (postgres:16-alpine), DB `shopkeet`,
   volume `infra_postgres_data`. **Not** a Coolify service (known hybrid, see
   `03-architecture.md §7`).
@@ -131,7 +135,7 @@ currency, created_at, **shipping_address_line1/2, shipping_city/state/postal_cod
 shipping_method, shipping_cost_cents** (P9), **discount_code, discount_cents** (P10),
 **customer_id** (P11), **internal_note, tax_cents** (P13), **source** (`storefront|draft`, P15),
 **gift_card_code, gift_card_cents** (P18), **tracking_number, tracking_carrier,
-tracking_url** (P23).
+tracking_url** (P23), **affiliate_code** (P27 — snapshot of the code credited for the order).
 **order_items** (P5): id, tenant_id, order_id, product_id, quantity, unit_price_cents,
 **variant_id** (P8), **is_preorder** (P19).
 
@@ -188,7 +192,18 @@ Partial unique indexes: `order_placed_once`, `referral_once` (one per order).
 **wishlist_items** (P22): id, tenant_id, customer_id, product_id, created_at.
 UNIQUE (customer_id, product_id).
 
-**schema_migrations**: version (BIGINT), dirty. Currently `26 | f`.
+**affiliates** (P27): id, tenant_id, name, email (UNIQUE tenant), code (UNIQUE tenant,
+canonical — both `affiliate_code` body param and `?ref=` query match it), commission_percent
+(NUMERIC), status (`pending|approved|suspended`), created_at.
+**affiliate_commissions** (P27): id, tenant_id, affiliate_id, order_id, commission_cents,
+status (`pending|approved|paid`), created_at. Snapshot rules: UNIQUE (affiliate_id, order_id)
+`ON CONFLICT DO NOTHING`; `delivered` order event (`order.paid`) flips `pending→approved`;
+merchant marking the payout `paid` flips `approved→paid`.
+**affiliate_payouts** (P27): id, tenant_id, affiliate_id, amount_cents,
+status (`requested|paid`), created_at. Request blocked while one is already `requested`;
+`paid` covers all currently-`approved` commissions for that affiliate.
+
+**schema_migrations**: version (BIGINT), dirty. Currently `30 | f`.
 
 ### Indexes worth knowing (beyond PKs/UNIQUEs)
 - `products_search_idx` GIN on `search_vector`.
@@ -216,6 +231,7 @@ UNIQUE (customer_id, product_id).
 | Reviews (16) | `POST /products/:id/reviews`, list/fetch, admin reject/delete |
 | Settings (13) | `GET/PATCH /tenant/settings` |
 | **Analytics (24)** | `GET /analytics/sales?period=7d\|30d\|90d`, `GET /analytics/top-products?period=&metric=quantity\|revenue&limit=`, `GET /analytics/conversion?period=` — all Merchant |
+| **Affiliates (27)** | Public: `POST /affiliates/apply` (X-Tenant-ID), `POST /affiliates/login`; Merchant: `GET /affiliates`, `PATCH /affiliates/:id/status`, `PATCH /affiliate-payouts/:id`; Affiliate JWT: `GET /affiliates/me/dashboard`, `GET /affiliates/me/commissions`, `POST /affiliates/me/payout-request`. `?ref=CODE` on checkout links the order (see `09-growth-features-build-spec.md`) |
 
 Full contract in `shopkeet-agents-package (1)/docs/api-reference.md`.
 
@@ -309,6 +325,14 @@ Full contract in `shopkeet-agents-package (1)/docs/api-reference.md`.
   - `/analytics/conversion` → carts 1 / orders 4 / rate 4 ✓ (seed script itself places an
     order and checkout deletes carts — see caveat #1)
   - bad `period` (`45d`) → `400`, bad `metric` (`units`) → `400` ✓
+- **Phase 27 (PASS as `shopkeet_app`):** `TestAffiliateProgram` — apply → duplicate `409` →
+  merchant approve 10% → pending-login `403` → approved-login → bogus ref ignored → valid
+  `?ref=` checkout books a 200¢ pending commission (10% of 2000¢ subtotal) → `delivered`
+  approves it → payout-request `201` (200¢) / duplicate `409` → merchant-paid flips comm to
+  `paid` → dashboard totals reconcile → affiliate JWT `403` on merchant-admin and customer
+  routes → tenant B cannot touch tenant A's payout (`404`). Ran **as `shopkeet_app`** — the
+  superuser bypasses RLS (that's how the earlier false positive happened); production role is
+  the one that genuinely gates. 6 seeded `aff-*` tenants purged leaf-first, orphan sweep = 0.
 - Deploy pipeline verified repeatedly: build → `scp` `migrate-linux` → apply migration →
 `p21-deploy.ps1` → healthz 200 → smoke → cleanup.
 
@@ -344,13 +368,13 @@ stage/commit the `shopkeet-agents-package*/` directories or `*.zip`.
 
 ---
 
-## 10. Git state (as of Phase 26)
+## 10. Git state (as of Phase 27)
 
-`main` = latest shipped code. Recent commits:
+`main` = latest shipped code + committed Phase 27 (image deploy pending). Recent commits:
+`a0b89bb fix(rls): NULLIF-wrap tenant_isolation policies + fix Phase 26 acceptance tests (DB 29)` ·
+`a02af9f docs: Phase 26 upsell, cross-sell and post-purchase recommendations (DB 28)` ·
 `91e1d31 feat(recommendations): Phase 26 upsell, cross-sell and post-purchase offers (DB 28)` ·
-`9165c9a fix(bundles,recommendations): un-shadow admin list GET via PublicOrAdminMW` ·
-`4a553ef fix(bundles): scan created_at::text in merged ListBundles` ·
-`5a71481 docs: Phase 25 product bundles + quantity breaks (DB 27)`
+`9165c9a fix(bundles,recommendations): un-shadow admin list GET via PublicOrAdminMW`
 
 ## 11. Not built yet (deferred — when you get here, check `04-agent-build-spec.md`)
 
