@@ -121,7 +121,7 @@ func (s *Service) ListBundles(c *fiber.Ctx) error {
 		}
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT id, name, type, bundle_price_cents, discount_percent, status, created_at
+		SELECT id, name, type, bundle_price_cents, discount_percent, status, created_at::text
 		FROM bundles WHERE `+where+` ORDER BY created_at DESC, id`, args...)
 	if err != nil {
 		return httperr.ErrInternalServerError
