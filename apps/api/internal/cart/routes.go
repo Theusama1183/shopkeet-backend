@@ -21,6 +21,7 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, svc *Service, limit
 	g := router.Group("/cart", auth.CustomerMW(pool))
 	g.Get("/", svc.GetCart)
 	g.Post("/", svc.AddItem)
+	g.Post("/bundle", svc.AddBundle)
 	g.Post("/discount",
 		limiter.Middleware(ratelimit.Entry{
 			Route:   "POST /cart/discount",

@@ -14,6 +14,7 @@ import (
 
 	"github.com/shopkeet/api/internal/analytics"
 	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/bundles"
 	"github.com/shopkeet/api/internal/cart"
 	"github.com/shopkeet/api/internal/catalog"
 	"github.com/shopkeet/api/internal/content"
@@ -187,6 +188,12 @@ func main() {
 	reviewsSvc := reviews.New(pool)
 	reviewsSvc.SetCache(cca)
 	reviews.RegisterRoutes(v1, pool, cfg.JWTSecret, reviewsSvc)
+
+	// Phase 25 — bundles & quantity breaks. Admin CRUD behind TenantMW; the
+	// storefront listing is public (active only). The /products/:id/quantity-
+	// breaks sibling group is registered ahead of catalog's /products group so
+	// Fiber never shadows it with the products group's middleware set.
+	bundles.RegisterRoutes(v1, pool, cfg.JWTSecret, bundles.New(pool))
 
 	// Phase 3 — catalog. Storefront routes resolve the tenant from the
 	// X-Tenant-ID header (Next.js middleware per docs/03-architecture.md §2);

@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/auth"
+	"github.com/shopkeet/api/internal/bundles"
 	"github.com/shopkeet/api/internal/discounts"
 	"github.com/shopkeet/api/internal/giftcards"
 	"github.com/shopkeet/api/internal/payments"
@@ -67,6 +68,7 @@ type orderItemRow struct {
 	variantID      string
 	quantity       int
 	unitPriceCents int
+	bundleID       *string // Phase 25 — set when the line belonged to a bundle
 }
 
 type orderRow struct {
@@ -133,7 +135,7 @@ func loadOrder(c *fiber.Ctx, tx pgx.Tx, where string, args ...any) (*orderRow, e
 	}
 
 	rows, err := tx.Query(ctx, `
-		SELECT id, product_id, variant_id, quantity, unit_price_cents
+		SELECT id, product_id, variant_id, quantity, unit_price_cents, bundle_id
 		FROM order_items
 		WHERE order_id = $1
 		ORDER BY id`, o.id)
@@ -143,7 +145,7 @@ func loadOrder(c *fiber.Ctx, tx pgx.Tx, where string, args ...any) (*orderRow, e
 	defer rows.Close()
 	for rows.Next() {
 		var it orderItemRow
-		if err := rows.Scan(&it.id, &it.productID, &it.variantID, &it.quantity, &it.unitPriceCents); err != nil {
+		if err := rows.Scan(&it.id, &it.productID, &it.variantID, &it.quantity, &it.unitPriceCents, &it.bundleID); err != nil {
 			return nil, err
 		}
 		o.items = append(o.items, it)
@@ -169,6 +171,7 @@ func orderJSON(o *orderRow, includeInternalNote bool) fiber.Map {
 			"quantity":         it.quantity,
 			"unit_price_cents": it.unitPriceCents,
 			"line_total_cents": it.quantity * it.unitPriceCents,
+			"bundle_id":        strp(it.bundleID),
 		})
 	}
 	m := fiber.Map{
@@ -195,6 +198,20 @@ func orderJSON(o *orderRow, includeInternalNote bool) fiber.Map {
 }
 
 // --- checkout -----------------------------------------------------------------
+
+// line is one locked cart row during checkout (its prices and availability are
+// authoritative snapshots for the order).
+type line struct {
+	cartItemID    string
+	bundleID      *string
+	variantID     string
+	productID     string
+	quantity      int
+	price         int
+	currency      string
+	allowPreorder bool
+	preorder      bool
+}
 
 type checkoutRequest struct {
 	CustomerName         string `json:"customer_name"`
@@ -268,7 +285,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	// checkouts for the last unit serialize here, and the second sees the
 	// already-decremented inventory.
 	rows, err := tx.Query(ctx, `
-		SELECT ci.variant_id, ci.product_id, ci.quantity, v.price_cents, p.currency,
+		SELECT ci.id, ci.bundle_id, ci.variant_id, ci.product_id, ci.quantity, v.price_cents, p.currency,
 		       v.inventory_count, v.status, p.status, v.allow_preorder
 		FROM cart_items ci
 		JOIN product_variants v ON v.id = ci.variant_id
@@ -279,21 +296,12 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
-	type line struct {
-		variantID     string
-		productID     string
-		quantity      int
-		price         int
-		currency      string
-		allowPreorder bool
-		preorder      bool
-	}
 	var lines []line
 	for rows.Next() {
 		var l line
 		var inventory int
 		var variantStatus, productStatus string
-		if err := rows.Scan(&l.variantID, &l.productID, &l.quantity, &l.price, &l.currency,
+		if err := rows.Scan(&l.cartItemID, &l.bundleID, &l.variantID, &l.productID, &l.quantity, &l.price, &l.currency,
 			&inventory, &variantStatus, &productStatus, &l.allowPreorder); err != nil {
 			rows.Close()
 			return httperr.ErrInternalServerError
@@ -321,17 +329,52 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		return httperr.C(fiber.StatusBadRequest, "cart is empty")
 	}
 
+	// Phase 25 — bundles must still be purchasable at checkout. A bundle set to
+	// draft/archived (or deleted) between add-to-cart and checkout rejects the
+	// whole checkout, mirroring the unavailable-product gate above.
+	if ids := distinctBundleIDs(lines); len(ids) > 0 {
+		n, err := tx.Query(ctx, `
+			SELECT id FROM bundles WHERE id = ANY($1) AND status = 'active'`, ids)
+		if err != nil {
+			return httperr.ErrInternalServerError
+		}
+		var activeCount int
+		for n.Next() {
+			activeCount++
+		}
+		if err := n.Err(); err != nil {
+			n.Close()
+			return httperr.ErrInternalServerError
+		}
+		n.Close()
+		if activeCount != len(ids) {
+			return httperr.C(fiber.StatusConflict, "a bundle in your cart is no longer available")
+		}
+	}
+
 	res, err := provider.Process(ctx, payments.ProcessRequest{
 		Method: req.PaymentMethod, AmountCents: 0, Currency: "usd"})
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
 
-	subtotal := 0
-	currency := lines[0].currency
+	// Phase 25 — the goods subtotal is repriced exactly like the cart preview:
+	// bundle rows charge as a unit (flat bundle price, or the configured % off
+	// the summed components), plain rows get the best qualifying quantity-break
+	// discount. The real component prices are still snapshotted into
+	// order_items and stock is still decremented per component variant.
+	cartLines := make([]bundles.CartItem, 0, len(lines))
 	for _, l := range lines {
-		subtotal += l.quantity * l.price
+		cartLines = append(cartLines, bundles.CartItem{
+			CartItemID: l.cartItemID, ProductID: l.productID, VariantID: l.variantID,
+			Quantity: l.quantity, PriceCents: l.price, BundleID: l.bundleID,
+		})
 	}
+	_, subtotal, err := bundles.PriceCart(ctx, tx, cartLines)
+	if err != nil {
+		return httperr.ErrInternalServerError
+	}
+	currency := lines[0].currency
 
 	// Fetch tenant's tax rate (Phase 13).
 	var taxRatePercent int
@@ -466,9 +509,9 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	}
 	for _, l := range lines {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO order_items (tenant_id, order_id, product_id, variant_id, quantity, unit_price_cents, is_preorder)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			tid, orderID, l.productID, l.variantID, l.quantity, l.price, l.preorder); err != nil {
+			INSERT INTO order_items (tenant_id, order_id, product_id, variant_id, quantity, unit_price_cents, is_preorder, bundle_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			tid, orderID, l.productID, l.variantID, l.quantity, l.price, l.preorder, l.bundleID); err != nil {
 			return httperr.ErrInternalServerError
 		}
 	}
@@ -525,6 +568,22 @@ func nullableStr(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// distinctBundleIDs returns the unique non-nil bundle ids referenced by the
+// cart's lines, in first-seen order.
+func distinctBundleIDs(lines []line) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, l := range lines {
+		if l.bundleID != nil {
+			if _, ok := seen[*l.bundleID]; !ok {
+				seen[*l.bundleID] = struct{}{}
+				out = append(out, *l.bundleID)
+			}
+		}
+	}
+	return out
 }
 
 // --- customer order lookup -----------------------------------------------------
@@ -608,14 +667,14 @@ func (s *Service) ListOrders(c *fiber.Ctx) error {
 	for i := range found {
 		var items []orderItemRow
 		irows, err := tx.Query(ctx, `
-			SELECT id, product_id, variant_id, quantity, unit_price_cents
+			SELECT id, product_id, variant_id, quantity, unit_price_cents, bundle_id
 			FROM order_items WHERE order_id = $1 ORDER BY id`, found[i].id)
 		if err != nil {
 			return httperr.ErrInternalServerError
 		}
 		for irows.Next() {
 			var it orderItemRow
-			if err := irows.Scan(&it.id, &it.productID, &it.variantID, &it.quantity, &it.unitPriceCents); err != nil {
+			if err := irows.Scan(&it.id, &it.productID, &it.variantID, &it.quantity, &it.unitPriceCents, &it.bundleID); err != nil {
 				irows.Close()
 				return httperr.ErrInternalServerError
 			}

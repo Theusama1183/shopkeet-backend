@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/shopkeet/api/internal/bundles"
 	"github.com/shopkeet/api/internal/discounts"
 	"github.com/shopkeet/api/internal/giftcards"
 	"github.com/shopkeet/api/internal/platform/httperr"
@@ -55,6 +56,7 @@ type itemRow struct {
 	priceCents     int
 	currency       string
 	lineTotalCents int
+	bundleID       *string
 }
 
 type cartPayload struct {
@@ -96,7 +98,7 @@ func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 
 	rows, err := tx.Query(ctx, `
 		SELECT ci.id, ci.product_id, ci.variant_id, ci.quantity,
-		       p.name, p.slug, v.price_cents, p.currency
+		       p.name, p.slug, v.price_cents, p.currency, ci.bundle_id
 		FROM cart_items ci
 		JOIN products p ON p.id = ci.product_id
 		JOIN product_variants v ON v.id = ci.variant_id
@@ -111,7 +113,7 @@ func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 	for rows.Next() {
 		var it itemRow
 		if err := rows.Scan(&it.id, &it.productID, &it.variantID, &it.quantity,
-			&it.name, &it.slug, &it.priceCents, &it.currency); err != nil {
+			&it.name, &it.slug, &it.priceCents, &it.currency, &it.bundleID); err != nil {
 			return nil, err
 		}
 		it.lineTotalCents = it.quantity * it.priceCents
@@ -122,6 +124,28 @@ func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+
+	// Phase 25 — repricing pass: bundle rows are charged as a unit (flat
+	// bundle_price_cents or the configured discount off the summed components)
+	// and plain rows get the best qualifying quantity-break discount. The raw
+	// sum above is replaced so the cart advertises exactly what checkout will
+	// charge; best-effort, checkout re-derives the same arithmetic authoritatively.
+	priced := make([]bundles.CartItem, 0, len(cp.items))
+	for _, it := range cp.items {
+		priced = append(priced, bundles.CartItem{
+			CartItemID: it.id, ProductID: it.productID, VariantID: it.variantID,
+			Quantity: it.quantity, PriceCents: it.priceCents, BundleID: it.bundleID,
+		})
+	}
+	perLine, total, err := bundles.PriceCart(ctx, tx, priced)
+	if err != nil {
+		return nil, err
+	}
+	cp.total = total
+	for i := range cp.items {
+		cp.items[i].lineTotalCents = perLine[cp.items[i].id]
+	}
+
 	cp.discountCode = discountCode
 	cp.giftCardCode = giftCardCode
 	cp.email = email
@@ -154,6 +178,10 @@ func cartJSON(cp *cartPayload) fiber.Map {
 	}
 	items := make([]fiber.Map, 0, len(cp.items))
 	for _, it := range cp.items {
+		bid := ""
+		if it.bundleID != nil {
+			bid = *it.bundleID
+		}
 		items = append(items, fiber.Map{
 			"id":               it.id,
 			"product_id":       it.productID,
@@ -164,6 +192,7 @@ func cartJSON(cp *cartPayload) fiber.Map {
 			"price_cents":      it.priceCents,
 			"currency":         it.currency,
 			"line_total_cents": it.lineTotalCents,
+			"bundle_id":        bid,
 		})
 	}
 	return fiber.Map{"cart": fiber.Map{
