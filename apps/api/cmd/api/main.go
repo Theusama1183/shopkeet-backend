@@ -43,6 +43,7 @@ import (
 	"github.com/shopkeet/api/internal/recommendations"
 	"github.com/shopkeet/api/internal/reviews"
 	"github.com/shopkeet/api/internal/shipping"
+	"github.com/shopkeet/api/internal/smartcollections"
 	"github.com/shopkeet/api/internal/tenants"
 	"github.com/shopkeet/api/internal/wishlist"
 )
@@ -240,6 +241,12 @@ func main() {
 	// tenant resolved from X-Tenant-ID, GMC/Meta take over from there).
 	feedsSvc := feeds.New(pool, cfg.AppBaseDomain)
 	feeds.RegisterRoutes(v1, feedsSvc, pool)
+
+	// Phase 31 — smart (rule-based) collections. Merchant category CRUD behind
+	// TenantMW; the public GET /categories (catalog) now exposes is_smart +
+	// rules. Registered ahead of catalog per the route-shadow convention.
+	scSvc := smartcollections.New(pool)
+	smartcollections.RegisterRoutes(v1, scSvc, pool, cfg.JWTSecret)
 
 	// Phase 3 — catalog. Storefront routes resolve the tenant from the
 	// X-Tenant-ID header (Next.js middleware per docs/03-architecture.md §2);

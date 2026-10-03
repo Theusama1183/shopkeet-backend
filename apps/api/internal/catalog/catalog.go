@@ -17,6 +17,7 @@ import (
 	"github.com/shopkeet/api/internal/platform/cache"
 	"github.com/shopkeet/api/internal/platform/events"
 	"github.com/shopkeet/api/internal/platform/httperr"
+	"github.com/shopkeet/api/internal/smartcollections"
 )
 
 // Service is the catalog business surface. Handlers read/write through the
@@ -123,9 +124,10 @@ type imageRow struct {
 }
 
 type categoryRow struct {
-	id   string
-	name string
-	slug string
+	id      string
+	name    string
+	slug    string
+	isSmart bool
 }
 
 // optionValueRow is a product option's selectable value.
@@ -211,7 +213,7 @@ func productJSON(p *productRow) fiber.Map {
 	}
 	cats := make([]fiber.Map, 0, len(p.categories))
 	for _, ct := range p.categories {
-		cats = append(cats, fiber.Map{"id": ct.id, "name": ct.name, "slug": ct.slug})
+		cats = append(cats, fiber.Map{"id": ct.id, "name": ct.name, "slug": ct.slug, "is_smart": ct.isSmart})
 	}
 	opts := make([]fiber.Map, 0, len(p.options))
 	for _, o := range p.options {
@@ -315,7 +317,7 @@ func (s *Service) hydrate(ctx *fiber.Ctx, tx pgx.Tx, p *productRow) error {
 	}
 
 	crows, err := tx.Query(ctx.Context(), `
-		SELECT c.id, c.name, c.slug
+		SELECT c.id, c.name, c.slug, c.is_smart
 		FROM product_categories pc
 		JOIN categories c ON c.id = pc.category_id
 		WHERE pc.product_id = $1
@@ -326,7 +328,7 @@ func (s *Service) hydrate(ctx *fiber.Ctx, tx pgx.Tx, p *productRow) error {
 	defer crows.Close()
 	for crows.Next() {
 		var ct categoryRow
-		if err := crows.Scan(&ct.id, &ct.name, &ct.slug); err != nil {
+		if err := crows.Scan(&ct.id, &ct.name, &ct.slug, &ct.isSmart); err != nil {
 			return err
 		}
 		p.categories = append(p.categories, ct)
@@ -568,6 +570,12 @@ func (s *Service) CreateProduct(c *fiber.Ctx) error {
 			tid, id, req.PriceCents, req.InventoryCount, "active")
 		return err
 	}); err != nil {
+		return httperr.ErrInternalServerError
+	}
+
+	// Phase 31: if any smart (rule-based) categories exist, derive membership
+	// so the new product automatically joins those it matches.
+	if err := smartcollections.RecomputeForProduct(c.Context(), tx, id); err != nil {
 		return httperr.ErrInternalServerError
 	}
 
@@ -821,6 +829,13 @@ func (s *Service) UpdateProduct(c *fiber.Ctx) error {
 		}
 	}
 
+	// Phase 31: re-derive smart (rule-based) memberships whenever any field the
+	// rules inspect may have changed (category_ids re-listing, price, inventory,
+	// status, name). Manual links set above survive; smart ones reconcile.
+	if err := smartcollections.RecomputeForProduct(ctx, tx, id); err != nil {
+		return httperr.ErrInternalServerError
+	}
+
 	p, err := s.queryProduct(c, tx, "p.id = $1", id)
 	if err != nil {
 		return httperr.ErrInternalServerError
@@ -963,23 +978,60 @@ func (s *Service) ListCategories(c *fiber.Ctx) error {
 	if !ok {
 		return httperr.ErrInternalServerError
 	}
-	rows, err := tx.Query(c.Context(), `
-		SELECT id, name, slug FROM categories
+	ctx := c.Context()
+	rows, err := tx.Query(ctx, `
+		SELECT id, name, slug, is_smart FROM categories
 		ORDER BY name`)
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
-	defer rows.Close()
-	var cats []fiber.Map
+	var cats []categoryRow
 	for rows.Next() {
 		var ct categoryRow
-		if err := rows.Scan(&ct.id, &ct.name, &ct.slug); err != nil {
+		if err := rows.Scan(&ct.id, &ct.name, &ct.slug, &ct.isSmart); err != nil {
+			rows.Close()
 			return httperr.ErrInternalServerError
 		}
-		cats = append(cats, fiber.Map{"id": ct.id, "name": ct.name, "slug": ct.slug})
+		cats = append(cats, ct)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return httperr.ErrInternalServerError
 	}
-	return c.JSON(fiber.Map{"categories": cats})
+	rows.Close()
+
+	// Phase 31: smart categories expose their rules so storefronts can label
+	// derived collections ("Under $20 deals").
+	rules := make(map[string][]fiber.Map)
+	rrows, err := tx.Query(ctx, `
+		SELECT category_id, field, operator, value FROM smart_collection_rules
+		ORDER BY created_at`)
+	if err != nil {
+		return httperr.ErrInternalServerError
+	}
+	for rrows.Next() {
+		var cid, f, op, v string
+		if err := rrows.Scan(&cid, &f, &op, &v); err != nil {
+			rrows.Close()
+			return httperr.ErrInternalServerError
+		}
+		rules[cid] = append(rules[cid], fiber.Map{"field": f, "operator": op, "value": v})
+	}
+	if err := rrows.Err(); err != nil {
+		rrows.Close()
+		return httperr.ErrInternalServerError
+	}
+	rrows.Close()
+
+	out := make([]fiber.Map, 0, len(cats))
+	for _, ct := range cats {
+		rs := rules[ct.id]
+		if rs == nil {
+			rs = []fiber.Map{}
+		}
+		out = append(out, fiber.Map{
+			"id": ct.id, "name": ct.name, "slug": ct.slug, "is_smart": ct.isSmart, "rules": rs,
+		})
+	}
+	return c.JSON(fiber.Map{"categories": out})
 }

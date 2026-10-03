@@ -30,6 +30,7 @@ import (
 
 	"github.com/shopkeet/api/internal/platform/httperr"
 	"github.com/shopkeet/api/internal/platform/queue"
+	"github.com/shopkeet/api/internal/smartcollections"
 )
 
 // Row is one CSV record, already validated for type but not for referential
@@ -268,6 +269,13 @@ func insertRow(ctx context.Context, tx pgx.Tx, row *Row) error {
 		id, row.PriceCents, row.InventoryCount); err != nil {
 		_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT import_row")
 		return fmt.Errorf("insert variant: %w", err)
+	}
+
+	// Phase 31: a rule-based (smart) collection adopts the row as soon as it
+	// lands, so an import auto-fills under-$20 collections and the like.
+	if err := smartcollections.RecomputeForProduct(ctx, tx, id); err != nil {
+		_, _ = tx.Exec(ctx, "ROLLBACK TO SAVEPOINT import_row")
+		return fmt.Errorf("recompute smart collections: %w", err)
 	}
 	return nil
 }

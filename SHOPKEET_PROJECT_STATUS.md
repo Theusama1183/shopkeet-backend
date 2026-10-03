@@ -1,6 +1,6 @@
 # Shopkeet — Project Status & Complete State (Phases 1–30)
 
-**Last verified:** 2026-10-03 against live prod (Phases 28–30 acceptance on `shopkeet_app` + DB 31)
+**Last verified:** 2026-10-03 against live prod (Phases 28–31 acceptance on `shopkeet_app` + DB 32)
 **DB version:** 31 (migrations 0001–0031 applied, `schema_migrations = 31 | dirty=f`)
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthz `200`) — deploy is not automatic on git push
 **Status:** Phases 1–27 complete, deployed, and verified live; **Phases 28–30 (metafields / bulk CSV import+export / product feeds) built, accepted live, and deployed.**
@@ -28,11 +28,14 @@ product bundles + quantity breaks, merchant-curated product recommendations
 with a post-purchase order upsell, (Phase 27) a single-level affiliate program
 with commissions paid on delivered orders and manual merchant-paid payouts,
 (Phase 28) per-product metafields/custom fields, (Phase 29) bulk CSV product
-import/export, and (Phase 30) Google Shopping + Meta product feeds.
+import/export, (Phase 30) Google Shopping + Meta product feeds, and (Phase 31)
+smart (rule-based) collections — a category declared smart adopts every product
+that satisfies its AND-combined rules automatically (`product_categories` is
+recomputed on product save, so the storefront list path stays query-time-free).
 Every tenant-scoped table ships with `tenant_id` + `ENABLE/FORCE ROW LEVEL SECURITY` +
 a `tenant_isolation` policy (NULLIF-wrapped since `0029`, see below) + `OWNER TO shopkeet_app`
 in **the same migration**.
-Prod runs 41 tables / migration 30; all acceptance tests PASS.
+Prod runs 43 tables / migration 32; all acceptance tests PASS.
 
 ---
 
@@ -70,9 +73,10 @@ Prod runs 41 tables / migration 30; all acceptance tests PASS.
 | 28 | Metafields / Custom Fields (`product_metafields`, admin CRUD, embedded public) | `0031` | `TestProductMetafields` | ✅ deployed |
 | 29 | Bulk CSV Import (async job + report) & Export | — (no migration) | `TestProductCSVImportExport` | ✅ deployed |
 | 30 | Product Feeds (Google Shopping XML + Meta Catalog CSV) | — (no migration) | `TestProductFeeds` | ✅ deployed |
+| 31 | Smart (Rule-Based) Collections (`smart_collection_rules`, `categories.is_smart`) | `0032` | `TestSmartCollections` | ✅ deployed |
 
-All migrations applied on the VPS DB (`schema_migrations` = 31). The currently-deployed API image
-covers everything through Phase 30.
+All migrations applied on the VPS DB (`schema_migrations` = 32). The currently-deployed API image
+covers everything through Phase 31.
 
 ---
 
@@ -119,7 +123,7 @@ created_at. UNIQUE (tenant_id, email).
 **media_assets** (P2): id, tenant_id, r2_key (UNIQUE), url, content_type, size_bytes,
 alt_text, created_at.
 
-**categories** (P3): id, tenant_id, name, slug. UNIQUE (tenant_id, slug).
+**categories** (P3, P31): id, tenant_id, name, slug, **is_smart BOOLEAN** (P31). UNIQUE (tenant_id, slug).
 **products** (P3): id, tenant_id, name, slug (UNIQUE tenant), description, price_cents,
 currency, inventory_count, status (`draft|active|archived`), meta_title, meta_description,
 search_vector TSVECTOR generated (English `to_tsvector`), created_at,
@@ -127,6 +131,10 @@ search_vector TSVECTOR generated (English `to_tsvector`), created_at,
 **product_metafields** (P28): id, tenant_id, product_id (FK), key, value (TEXT),
 type (`string|number|boolean|json`), timestamps. UNIQUE (product_id, key).
 **product_categories** (P3): tenant_id, product_id, category_id. PK (product_id, category_id).
+**smart_collection_rules** (P31): id, tenant_id, category_id (FK, ON DELETE CASCADE), field
+(`price|inventory_count|status|name|description`), operator (`lt|gt|eq|contains`), value (TEXT),
+created_at. UNIQUE (tenant_id, category_id, field, operator, value). Rules are AND-combined; a
+smart category with no rules matches **every** product.
 **product_images** (P3): id, tenant_id, product_id, media_asset_id, sort_order. UNIQUE (product_id, media_asset_id).
 
 **carts** (P4): id, tenant_id, customer_session (UNIQUE per tenant), created_at,
@@ -242,6 +250,7 @@ status (`requested|paid`), created_at. Request blocked while one is already `req
 | **Metafields (28)** | Merchant: `GET/PUT/DELETE /products/:id/metafields[/:key]`; metafields embedded in public `GET /products/:id` |
 | **Bulk CSV (29)** | Merchant: `POST /products/import` (multipart CSV → job id), `GET /products/import/:jobId` (status + per-line report), `GET /products/export` (sync CSV of all products) |
 | **Feeds (30)** | Public w/ X-Tenant-ID: `GET /feeds/google-shopping.xml`, `GET /feeds/meta-catalog.csv` — active products only, storefront = custom_domain else `https://{subdomain}.{appBaseDomain}` |
+| **Smart Collections (31)** | Merchant: `POST /categories`, `PATCH/DELETE /categories/:id` (create/rename/toggle `is_smart`, replace rules); public `GET /categories` (catalsog) now also returns `is_smart` + `rules` per category; public `GET /products/:id` categories embed `is_smart`. Membership auto-derives on every product save (incl. bulk import) |
 
 Full contract in `shopkeet-agents-package (1)/docs/api-reference.md`.
 
@@ -362,6 +371,26 @@ Full contract in `shopkeet-agents-package (1)/docs/api-reference.md`.
   - Migration `0031` applied (`schema_migrations = 31 | f`); RLS `ENABLE + FORCE` on
     `product_metafields` as `shopkeet_app` w/ `tenant_isolation` ALL policy (NULLIF wrap).
     Seed tenants purged leaf-first, orphan sweep = 0.
+- **Phase 31 (PASS as `shopkeet_app` on DB 32):**
+  - `TestSmartCollections` — seeded `sc31-alpha/sc31-beta`; `POST /categories` with
+    `is_smart:true` + `price lt 2000` auto-adopts a new `POST /products` priced 1500 (spec
+    acceptance) and excludes one priced 5000; PATCH product price to 2500 drops it, back to 1500
+    rejoins; PATCH category rules to `<6000` recomputes existing membership (both included), a
+    product at exactly the `<5000` boundary stays out; empty rules → matches everything; manual
+    (non-smart) category + derived membership coexist through a `category_ids` re-listing;
+    product detail + public `GET /categories` expose `is_smart`/`rules`; toggling `is_smart:false`
+    clears rules and keeps membership; DELETE removes rules + membership rows; tenant B's smart
+    category never leaks to alpha; `bulkcsv.ProcessImport` feeds a `<2000` collection on insert;
+    invalid fields/operators/bad status `400`, duplicate slug `409`. **Bugs hit & fixed:** custom
+    `errorAs` couldn't unwrap pgconn → replaced with stdlib `errors.As` (`23505`); `description`
+    is NULLABLE so the recompute scan had to use `*string`; and the Fiber v2 footgun where a
+    `router.Group("/categories", TenantMW)` merges its middleware onto the later-registered public
+    `GET /categories` (401) — admin routes are registered with middleware inline instead.
+  - Migration `0032` applied (`schema_migrations = 32 | f`); `categories.is_smart` +
+    `smart_collection_rules` with `ENABLE+FORCE RLS` + NULLIF `tenant_isolation` policy as
+    `shopkeet_app`. Regression: `TestProductMetafields` (28), `TestProductCSVImportExport` (29),
+    `TestProductFeeds` (30) all still PASS. Seed tenants purged leaf-first, orphan sweep = 0
+    (incl. `smart_collection_rules`).
 
 ---
 
@@ -395,9 +424,9 @@ stage/commit the `shopkeet-agents-package*/` directories or `*.zip`.
 
 ---
 
-## 10. Git state (as of Phase 30)
+## 10. Git state (as of Phase 31)
 
-`main` = latest shipped code incl. Phases 28–30 (DB 31). Recent commits:
+`main` = latest shipped code incl. Phases 28–31 (DB 32). Recent commits:
 `4bc6780 feat(metafields,bulkcsv,feeds): Phases 28-30 metafields, bulk CSV import/export, product feeds (DB 31)` ·
 `f0edbdc feat(affiliates): Phase 27 affiliate program (DB 30)` ·
 `a0b89bb fix(rls): NULLIF-wrap tenant_isolation policies + fix Phase 26 acceptance tests (DB 29)` ·

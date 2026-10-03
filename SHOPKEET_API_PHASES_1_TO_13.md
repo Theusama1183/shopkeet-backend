@@ -39,6 +39,7 @@
 27. [Metafields / Custom Fields (Phase 28)](#metafields--custom-fields-phase-28)
 28. [Bulk CSV Import/Export (Phase 29)](#bulk-csv-importexport-phase-29)
 29. [Product Feeds (Phase 30)](#product-feeds-phase-30)
+30. [Smart (Rule-Based) Collections (Phase 31)](#smart-rule-based-collections-phase-31)
 26. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
@@ -1283,6 +1284,64 @@ formatter shared with orders.
 `<g:price>45.00 USD</g:price>` and `in_stock`, the active out-of-stock product gets
 `out_of_stock`, the draft product is absent; CSV rows match; missing `X-Tenant-ID` → `400`.
 `feed30-*` tenant purged; orphan sweep = 0.
+
+---
+
+## Smart (Rule-Based) Collections (Phase 31)
+
+Merchant-declared dynamic categories. A category flips to a *smart collection*
+(`categories.is_smart`) with a rule set; a product belongs to it when it satisfies
+**all** rules (AND logic). Membership lives in `product_categories` and is recomputed
+whenever a product is saved — never at query time — so the storefront listing path
+(`GET /products?category=`) stays unchanged and fast.
+
+### Model (migration `0032_smart_collections`)
+
+`categories` gains `is_smart BOOLEAN NOT NULL DEFAULT false`. New `smart_collection_rules`
+(id, tenant_id, category_id FK **ON DELETE CASCADE**, field, operator, value, created_at;
+UNIQUE (tenant_id, category_id, field, operator, value)) — RLS `ENABLE + FORCE` + NULLIF
+`tenant_isolation` policy + `OWNER TO shopkeet_app`, same contract as `0029`.
+
+Fields: `price`, `inventory_count` (integers, ops `lt|gt|eq`), `status` (`eq`, value one of
+`draft|active|archived`), `name`/`description` (`eq|contains`, case-insensitive contains).
+A smart category with **zero** rules matches every product.
+
+### Endpoints & scopes
+
+Merchant (inline `TenantMW`): `POST /categories` (name required, slug auto-derived when
+omitted, `is_smart` + `rules` optional), `PATCH /categories/:id` (rename / slug / toggle
+`is_smart` / replace rules — recomputes membership if rule-relevant), `DELETE /categories/:id`
+(removes memberships and rules first — `product_categories` FKs have no CASCADE step).
+Public (`PublicTenantMW`): `GET /categories` now returns `is_smart` + `rules`; product
+detail `categories` carry `is_smart`. Slug auto-derivation matches the bulk-CSV rules.
+
+### Hook — where membership is recomputed
+
+- `catalog.CreateProduct` / `catalog.UpdateProduct`: `smartcollections.RecomputeForProduct`
+  runs inside the request RLS tx right before the response is built, so price/status/name
+  edits and `category_ids` re-lists all reconcile derived membership (manual links survive).
+- `bulkcsv.insertRow` (async import): the stage recomputes per inserted row inside the
+  batch savepoint — an imported product immediately joins matching smart collections.
+- `RecomputeForCategory` runs on smart-category create / rule replace / toggles: rewrites
+  every product's membership for that category in one pass (small-merchant scale).
+
+### Acceptance (live, DB 32)
+
+`TestSmartCollections` green **as `shopkeet_app`** — the spec's exact case (smart `price lt
+2000` auto-adopts a new 1500 product, excludes 5000) plus price-crossing leaves/rejoins,
+rule-edit flips existing membership, empty rules match all, manual + derived membership
+coexist, `is_smart`/`rules` on public responses, smart-off clears rules, delete cleans
+membership, tenant isolation, and bulk-CSV auto-membership. Regression suites 28/29/30 all
+still green.
+
+### Routing gotcha (fiber v2, verified by probe)
+
+Do **not** mount the admin routes with `router.Group("/categories", TenantMW)` when the
+public `GET /categories` is later registered on the same router: Fiber v2 merges the group's
+middleware onto the exact-prefix public route, so the storefront list would start demanding
+a JWT (401 `missing bearer token`). Register the admin routes **inline** instead
+(`r.Post("/categories", authMW, h)` …). The `internal/smartcollections/routes.go` comment
+carries the verified warning.
 
 ---
 
