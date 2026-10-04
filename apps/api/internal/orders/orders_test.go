@@ -217,7 +217,7 @@ func TestOrdersRLSIsolation(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	cart.RegisterRoutes(v1, pool, secret, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
 
 	do := func(method, path, session, body string, want int) *http.Response {
@@ -661,7 +661,7 @@ func TestPostDiscountTax(t *testing.T) {
 	bus := events.NewBus()
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	cart.RegisterRoutes(v1, pool, secret, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
 
 	do := func(method, path, session, body string, want int) *http.Response {
@@ -831,7 +831,7 @@ func TestGiftCardCheckoutSnapshot(t *testing.T) {
 	bus := events.NewBus()
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	cart.RegisterRoutes(v1, pool, secret, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
 
 	do := func(method, path, session, body string, want int) *http.Response {
@@ -1048,7 +1048,7 @@ func TestGiftCardConcurrentDoubleSpend(t *testing.T) {
 	bus := events.NewBus()
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	cart.RegisterRoutes(v1, pool, secret, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
 
 	setup := func(session string) {

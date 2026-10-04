@@ -40,7 +40,7 @@ func TestCartRecoverySweep(t *testing.T) {
 	tid := mkTenantID(t, pool, "recover-alpha-"+sfx)
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
-	RegisterRoutes(app.Group("/api/v1"), pool, New(pool, NoopReserver{}), ratelimit.New(nil))
+	RegisterRoutes(app.Group("/api/v1"), pool, testSecret, New(pool, NoopReserver{}), ratelimit.New(nil))
 
 	cartIDOf := func(session string) string {
 		t.Helper()

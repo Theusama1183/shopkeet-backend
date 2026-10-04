@@ -25,6 +25,8 @@ func randSuffix4() string {
 	return hex.EncodeToString(b)
 }
 
+const testSecret = "test-secret"
+
 type tenantC struct {
 	id string
 }
@@ -120,7 +122,7 @@ func TestCartRLSIsolation(t *testing.T) {
 	_, archV := seedProduct(a.id, "arch", 999, 1, "archived")
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
-	RegisterRoutes(app.Group("/api/v1"), pool, New(pool, NoopReserver{}), ratelimit.New(nil))
+	RegisterRoutes(app.Group("/api/v1"), pool, testSecret, New(pool, NoopReserver{}), ratelimit.New(nil))
 
 	type resp struct {
 		httpResp *http.Response

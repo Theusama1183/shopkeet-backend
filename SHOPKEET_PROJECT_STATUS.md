@@ -1,9 +1,9 @@
-# Shopkeet — Project Status & Complete State (Phases 1–30)
+# Shopkeet — Project Status & Complete State (Phases 1–33)
 
-**Last verified:** 2026-10-03 against live prod (Phases 28–31 acceptance on `shopkeet_app` + DB 32)
-**DB version:** 31 (migrations 0001–0031 applied, `schema_migrations = 31 | dirty=f`)
+**Last verified:** 2026-10-04 against live prod (Phases 32–33 acceptance on `shopkeet_app` + DB 33)
+**DB version:** 33 (migrations 0001–0033 applied, `schema_migrations = 33 | dirty=f`)
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthz `200`) — deploy is not automatic on git push
-**Status:** Phases 1–27 complete, deployed, and verified live; **Phases 28–30 (metafields / bulk CSV import+export / product feeds) built, accepted live, and deployed.**
+**Status:** Phases 1–31 complete, deployed, and verified live; **Phases 32 (data-driven product recommendations scheduled job) and 33 (customer tags & segments with tag-gated discounts) built, accepted live, and deployed.**
 
 > Purpose of this file: one page a fresh Claude/agent can read to know **exactly how far
 > the project has gone** — every phase, every table + field, what succeeded, what broke and
@@ -31,11 +31,17 @@ with commissions paid on delivered orders and manual merchant-paid payouts,
 import/export, (Phase 30) Google Shopping + Meta product feeds, and (Phase 31)
 smart (rule-based) collections — a category declared smart adopts every product
 that satisfies its AND-combined rules automatically (`product_categories` is
-recomputed on product save, so the storefront list path stays query-time-free).
+recomputed on product save, so the storefront list path stays query-time-free),
+(Phase 32) a scheduled auto-recommendations job that derives
+`product_recommendations` rows (`type='auto'`, reserved since `0028`) from
+co-purchase data in `order_items`, and (Phase 33) customer tags & segments:
+merchants tag customers (`vip`, `wholesale`, …) and gate a discount code or an
+automatic promo on a required tag via `discounts.eligible_tag`, enforced at
+cart-apply and re-verified (authoritative) at checkout.
 Every tenant-scoped table ships with `tenant_id` + `ENABLE/FORCE ROW LEVEL SECURITY` +
 a `tenant_isolation` policy (NULLIF-wrapped since `0029`, see below) + `OWNER TO shopkeet_app`
 in **the same migration**.
-Prod runs 43 tables / migration 32; all acceptance tests PASS.
+Prod runs 44 tables / migration 33; all acceptance tests PASS.
 
 ---
 
@@ -74,9 +80,11 @@ Prod runs 43 tables / migration 32; all acceptance tests PASS.
 | 29 | Bulk CSV Import (async job + report) & Export | — (no migration) | `TestProductCSVImportExport` | ✅ deployed |
 | 30 | Product Feeds (Google Shopping XML + Meta Catalog CSV) | — (no migration) | `TestProductFeeds` | ✅ deployed |
 | 31 | Smart (Rule-Based) Collections (`smart_collection_rules`, `categories.is_smart`) | `0032` | `TestSmartCollections` | ✅ deployed |
+| 32 | Data-Driven Recommendations (scheduled job → `product_recommendations` `type='auto'` from co-purchases) | — (uses `0028`) | `TestDataDrivenRecommendations` | ✅ deployed |
+| 33 | Customer Tags & Segments (`customer_tags`, `discounts.eligible_tag`; tag-gated codes + tag-gated automatics) | `0033` | `TestCustomerTagsAndSegments` | ✅ deployed |
 
-All migrations applied on the VPS DB (`schema_migrations` = 32). The currently-deployed API image
-covers everything through Phase 31.
+All migrations applied on the VPS DB (`schema_migrations` = 33). The currently-deployed API image
+covers everything through Phase 33.
 
 ---
 
@@ -172,10 +180,23 @@ PK (variant_id, option_value_id).
 **shipping_zones** (P9): id, tenant_id, name, countries ARRAY, regions ARRAY, created_at.
 **shipping_rates** (P9): id, tenant_id, zone_id, name, rate_cents, free_over_cents, sort_order.
 
-**discounts** (P10 + P21): id, tenant_id, code, type, value_percent, value_cents,
+**discounts** (P10 + P21 + P33): id, tenant_id, code, type, value_percent, value_cents,
 min_subtotal_cents, starts_at, ends_at, usage_limit, times_used, status, created_at,
 **customer_id** (P20), **applies_to** (`order|shipping`, P21), **buy_quantity, get_quantity**
-(reserved BOGO → 400), **requires_code** (P21, auto promo).
+(reserved BOGO → 400), **requires_code** (P21, auto promo), **eligible_tag** (P33 — code/auto
+only applies for a signed-in customer carrying this tag; enforced at cart apply + checkout).
+
+**customer_tags** (P33): id, tenant_id, customer_id (FK CASCADE), tag TEXT, created_at.
+UNIQUE (tenant_id, customer_id, tag). Index `customer_tags_tag_idx (tenant_id, tag, created_at)`
+feeds the "list customers by tag" segment query. `discounts.eligible_tag` (nullable TEXT) gates a
+code/promo on a tag; a guest or untagged shopper is refused at cart-apply and the tag is
+re-verified inside the checkout transaction (authoritative), so a tag removed after apply still
+blocks checkout. Automatic promotions that are tag-gated simply stop matching (AutoPick skips) for
+shoppers who don't carry the tag.
+**product_recommendations** (P26 + P32): id, tenant_id, product_id, recommended_product_id,
+**type** (`manual` merchant-curated, `auto` = Phase 32 scheduled job), sort_order. UNIQUE
+(product_id, recommended_product_id, type); CHECK type IN ('manual','auto'); index
+`(product_id, type, sort_order)`.
 
 **customers** (P11): id, tenant_id, email (UNIQUE tenant), phone, password_hash, created_at,
 **loyalty_points** (P20).
@@ -218,7 +239,7 @@ merchant marking the payout `paid` flips `approved→paid`.
 status (`requested|paid`), created_at. Request blocked while one is already `requested`;
 `paid` covers all currently-`approved` commissions for that affiliate.
 
-**schema_migrations**: version (BIGINT), dirty. Currently `31 | f`.
+**schema_migrations**: version (BIGINT), dirty. Currently `33 | f`.
 
 ### Indexes worth knowing (beyond PKs/UNIQUEs)
 - `products_search_idx` GIN on `search_vector`.
@@ -226,6 +247,8 @@ status (`requested|paid`), created_at. Request blocked while one is already `req
 - `loyalty_ledger_customer_idx`, `loyalty_ledger_order_placed_once`, `loyalty_ledger_referral_once`.
 - **Phase 24:** `orders_created_at_idx (tenant_id, created_at DESC)`,
   `order_items_order_idx (order_id)`, `carts_created_at_idx (tenant_id, created_at)`.
+- **Phase 33:** `customer_tags_tag_idx (tenant_id, tag, created_at)` (segment listing).
+- **Phase 32:** `product_recommendations (product_id, type, sort_order)` (auto-recommendation feed).
 
 ---
 
@@ -243,6 +266,8 @@ status (`requested|paid`), created_at. Request blocked while one is already `req
 | Shipping (9) | `/shipping-zones`, `/shipping-rates` (+ public rates fetch for checkout) |
 | Discounts (10, 21) | `POST/GET/PATCH /discounts`, `/discounts/:id` |
 | Customers (11, 20, 22) | `/customers/me`, `/customers/me/wishlist`, `/customers/me/loyalty`, `/customers/me/referral`, `POST /loyalty/redeem` |
+| **Customer Tags (33)** | Merchant: `GET /customers?tag=vip` (segment list), `POST /customers/:id/tags` `{"tag":"vip"}`, `DELETE /customers/:id/tags?tag=vip`; tags embed on `GET /customers/:id` and the segment/followup listing |
+| **Recommendations (32)** | Reuses P26 surface — public `GET /products/:id/recommendations` now returns `manual` **and** `auto` (scheduled) rows; admin `GET/POST/DELETE /products/:id/recommendations` manage `manual` only |
 | Reviews (16) | `POST /products/:id/reviews`, list/fetch, admin reject/delete |
 | Settings (13) | `GET/PATCH /tenant/settings` |
 | **Analytics (24)** | `GET /analytics/sales?period=7d\|30d\|90d`, `GET /analytics/top-products?period=&metric=quantity\|revenue&limit=`, `GET /analytics/conversion?period=` — all Merchant |
@@ -288,6 +313,19 @@ Full contract in `shopkeet-agents-package (1)/docs/api-reference.md`.
 7. **Gift-card double spend** — prevented by idempotency keys + `FOR UPDATE`
    (`TestGiftCardConcurrentDoubleSpend`). Loyalty "one credit per order" enforced by partial
    unique indexes.
+8. **pgx v5: never query the same transaction connection while a `rows` cursor is
+   mid-iteration** — it fails `conn busy` (surfaced live on Phase 33). `AutoPick` used to run
+   the `customer_tags` eligibility `EXISTS` query *inside* its `FOR UPDATE` candidate loop; the
+   fix drains the candidate rows into a slice and closes them first (the row locks persist till
+   commit either way), then evaluates each candidate.
+9. **`array_agg` over a LEFT JOIN yields a `{NULL}` array** — pgx v5 cannot scan a NULL element
+   into `[]string` → 500 on `GET /customers`. Use
+   `COALESCE(array_agg(ct.tag ORDER BY ct.created_at) FILTER (WHERE ct.tag IS NOT NULL), '{}')`.
+10. **Test tenants can cross-reference each other** — a regression that leaves a stale
+    cart/order pins rows in *another* tenant (its `tenant_id` ≠ the variant's owner), so a
+    prefix purge can fail FK on `cart_items`/`order_items`/`notification_log`. Purge needed a
+    second pass that deletes the referencing rows under **both** tenants before the owner tenant
+    could be dropped.
 
 ---
 
@@ -391,6 +429,33 @@ Full contract in `shopkeet-agents-package (1)/docs/api-reference.md`.
     `shopkeet_app`. Regression: `TestProductMetafields` (28), `TestProductCSVImportExport` (29),
     `TestProductFeeds` (30) all still PASS. Seed tenants purged leaf-first, orphan sweep = 0
     (incl. `smart_collection_rules`).
+- **Phase 32 + 33 (PASS as `shopkeet_app` on DB 33; all 5 suites green in one pass):**
+  - Migration `0033` applied (`schema_migrations = 33 | f`) — `customer_tags` (+ `tenant_isolation`
+    NULLIF policy, `customer_tags_tag_idx`, `OWNER TO shopkeet_app`) and `discounts.eligible_tag`.
+    P32 needed no migration (`type='auto'` reserved in `0028`).
+  - `TestDataDrivenRecommendations` (P32) — seeds a tenant with 2 recommended products and 3 paid
+    orders each containing **both** products (co-occurrence ≥ 2), recomputes, and asserts the
+    auto rows plus the existing `TestRecommendationsAcceptance` (manual) both still PASS. Also
+    caught/isolated a test bug: a beta tenant product must be read under its OWN tenant context
+    (the public fetch returned 404 when the product was resolved under the alpha context).
+  - `TestCustomerTagsAndSegments` (P33) — segment via `GET /customers?tag=vip`, add/remove tag
+    (`POST`/`DELETE /customers/:id/tags`), guest cart-apply `400`, tagged customer cart shows
+    `VIPX/200` and checks out to `VIPX/200/2300`, tag removed before checkout still `400`
+    (authoritative re-check), automatic tag-gated promo skipped for untagged shopper and applied
+    for tagged one. **Bugs hit & fixed live:** (1) the cart preview recomputed `discount_cents`
+    with a `nil` customerID so tag-gated codes previewed as `200-0` — `loadCart` now passes the
+    signed-in customer to the preview resolver; (2) tag-gated checkout 500'd with pgx
+    `conn busy` — see issue #8 (AutoPick drain); (3) the lying test bug `'ap-'+`/`'bp-'+` SQL
+    concatenation (latent since Phase 21) fixed to `'bp-' ||`.
+  - Regression suites all still PASS as `shopkeet_app`: `TestCustomerTagsAndSegments`,
+    `TestDiscountsAcceptance` + `TestAutomaticDiscounts` (after fixing two stale test bugs in the
+    isolated usage-cap block: phone string built inside JSON quotes, and the checkout request was
+    missing `X-Tenant-ID`), `TestOrderTrackingAndInvoicePDF` (customer phone lookup — a raw `+`
+    in the query string decodes to a space, so the test now `url.QueryEscape`s it), the orders +
+    cart suites, and `TestDataDrivenRecommendations`.
+  - All acceptance binaries re-built with `-vet=off`, run with `-test.count=1` against prod as
+    `shopkeet_app`, EXIT=0 each. Leaf-first purge of every `rec32-*/tag33-*/rec-*/disc-*/ord-*/cart-*`
+    tenant (incl. the cross-tenant FK leftovers, issue #10); orphan sweep = 0.
 
 ---
 

@@ -14,11 +14,14 @@ import (
 // RegisterRoutes mounts the Phase 4 guest-cart surface on the /api/v1 router.
 // Every route resolves the tenant from X-Tenant-ID and the guest session from
 // the shopkeet_session cookie / X-Customer-Session header via auth.CustomerMW.
-// POST /cart/discount is idempotency-guarded and rate-limited (Phase 14) so a
-// retried apply doesn't double-apply a promo and a discount-code brute force
-// is throttled per cart session.
-func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, svc *Service, limiter *ratelimit.Limiter) {
-	g := router.Group("/cart", auth.CustomerMW(pool))
+// A signed-in customer's Bearer token is honored too (auth.CustomerOrGuestMW),
+// so a tag-gated promo preview (Phase 33) and a linked checkout both see the
+// customer's identity; guests behave exactly as before. POST /cart/discount is
+// idempotency-guarded and rate-limited (Phase 14) so a retried apply doesn't
+// double-apply a promo and a discount-code brute force is throttled per cart
+// session.
+func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, svc *Service, limiter *ratelimit.Limiter) {
+	g := router.Group("/cart", auth.CustomerOrGuestMW(pool, secret))
 	g.Get("/", svc.GetCart)
 	g.Post("/", svc.AddItem)
 	g.Post("/bundle", svc.AddBundle)

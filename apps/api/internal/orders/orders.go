@@ -411,7 +411,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	// cart earlier.
 	codeCents := 0
 	if discountCode != "" {
-		q, err := discounts.Resolve(ctx, tx, tid, discountCode, subtotal)
+		q, err := discounts.Resolve(ctx, tx, tid, discountCode, subtotal, customerID)
 		if err != nil {
 			var ce *discounts.CodeError
 			if errors.As(err, &ce) {
@@ -421,7 +421,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		}
 		codeCents = q.DiscountCents
 	}
-	auto, err := discounts.AutoPick(ctx, tx, tid, subtotal, quote.CostCents)
+	auto, err := discounts.AutoPick(ctx, tx, tid, subtotal, quote.CostCents, customerID)
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}
@@ -433,7 +433,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 	// discount_cents records the total savings (goods + shipping).
 	discountCents, shippingDiscountCents := 0, 0
 	if auto != nil && auto.DiscountCents > codeCents {
-		claimed, err := discounts.ClaimAuto(ctx, tx, tid, auto.ID, subtotal, quote.CostCents)
+		claimed, err := discounts.ClaimAuto(ctx, tx, tid, auto.ID, subtotal, quote.CostCents, customerID)
 		if err != nil {
 			var ce *discounts.CodeError
 			if errors.As(err, &ce) {
@@ -448,7 +448,7 @@ func (s *Service) Checkout(c *fiber.Ctx) error {
 		}
 		discountCode = "" // automatic — nothing to snapshot as a code
 	} else if codeCents > 0 {
-		q, err := discounts.Claim(ctx, tx, tid, discountCode, subtotal)
+		q, err := discounts.Claim(ctx, tx, tid, discountCode, subtotal, customerID)
 		if err != nil {
 			var ce *discounts.CodeError
 			if errors.As(err, &ce) {

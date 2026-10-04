@@ -22,6 +22,7 @@ import (
 	"github.com/shopkeet/api/internal/catalog"
 	"github.com/shopkeet/api/internal/content"
 	"github.com/shopkeet/api/internal/customers"
+	"github.com/shopkeet/api/internal/customertags"
 	"github.com/shopkeet/api/internal/discounts"
 	"github.com/shopkeet/api/internal/feeds"
 	"github.com/shopkeet/api/internal/giftcards"
@@ -147,6 +148,15 @@ func main() {
 		// Phase 29 — bulk product CSV import handler inserts the batch (valid
 		// rows land, per-row failures land in the task result report).
 		worker.Register(queue.TaskTypeProductImport, productImportHandler(pool))
+		// Phase 32 — weekly recompute of data-driven recommendations. The
+		// handler iterates every tenant and rebuilds its type='auto' rows from
+		// order co-occurrence in an RLS-scoped transaction.
+		worker.Register(queue.TaskTypeAutoRecommendations,
+			autoRecommendationsHandler(pool))
+		if err := worker.RegisterPeriodic("@weekly",
+			asynq.NewTask(queue.TaskTypeAutoRecommendations, nil)); err != nil {
+			log.Fatalf("failed to schedule auto recommendations: %v", err)
+		}
 		worker.Start()
 		log.Printf("redis rate limiting + asynq worker enabled at %s", cfg.RedisURL)
 	}
@@ -248,6 +258,11 @@ func main() {
 	scSvc := smartcollections.New(pool)
 	smartcollections.RegisterRoutes(v1, scSvc, pool, cfg.JWTSecret)
 
+	// Phase 33 — customer tags & segments. Admin tags/list surface on
+	// /customers; the public /customers/signup|login|me group (Phase 11) is
+	// untouched, and the Discounts gateway enforces eligible_tag at checkout.
+	customertags.RegisterRoutes(v1, customertags.New(pool), pool, cfg.JWTSecret)
+
 	// Phase 3 — catalog. Storefront routes resolve the tenant from the
 	// X-Tenant-ID header (Next.js middleware per docs/03-architecture.md §2);
 	// admin routes use the JWT via TenantMW. RLS scopes everything.
@@ -268,7 +283,7 @@ func main() {
 		defer rr.Close()
 		reserver = rr
 	}
-	cart.RegisterRoutes(v1, pool, cart.New(pool, reserver), rl)
+	cart.RegisterRoutes(v1, pool, cfg.JWTSecret, cart.New(pool, reserver), rl)
 
 	// Phase 5 — checkout & orders (COD). The payments registry has one provider
 	// (cod); events surface order.created / order.paid for future webhooks.
@@ -401,6 +416,23 @@ func cartAbandonmentHandler(pool *pgxpool.Pool, notifSvc *notifications.Service)
 		}
 		if n > 0 {
 			log.Printf("cart abandonment sweep emailed %d carts", n)
+		}
+		return nil
+	}
+}
+
+// autoRecommendationsHandler drains recommendations:auto (Phase 32, weekly).
+// The recommendations package owns the per-tenant RLS-scoped transaction loop
+// (RecomputeAllTenants); the handler just drives it and logs the row count.
+func autoRecommendationsHandler(pool *pgxpool.Pool) func(context.Context, *asynq.Task) error {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		n, err := recommendations.RecomputeAllTenants(ctx, pool)
+		if err != nil {
+			log.Printf("auto recommendations recompute failed: %v", err)
+			return err
+		}
+		if n > 0 {
+			log.Printf("auto recommendations recomputed (%d auto rows)", n)
 		}
 		return nil
 	}

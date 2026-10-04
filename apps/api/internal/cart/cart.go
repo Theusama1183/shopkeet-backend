@@ -46,6 +46,15 @@ func customerSession(c *fiber.Ctx) string {
 	return s
 }
 
+// customerID returns the signed-in customer's identity, or nil for a guest.
+func customerID(c *fiber.Ctx) *string {
+	cid, ok := c.Locals("customer_id").(string)
+	if !ok || cid == "" {
+		return nil
+	}
+	return &cid
+}
+
 type itemRow struct {
 	id             string
 	productID      string
@@ -150,7 +159,10 @@ func loadCart(c *fiber.Ctx, tx pgx.Tx, session string) (*cartPayload, error) {
 	cp.giftCardCode = giftCardCode
 	cp.email = email
 	if discountCode != "" {
-		if q, err := discounts.Resolve(ctx, tx, tid, discountCode, cp.total); err == nil {
+		// Preview only: checkout re-validates. Passing nil customerID here means
+		// the cart never predicts a tag-gated code for a signed-in customer; the
+		// Apply endpoint re-resolves with the customer when it pins the code.
+		if q, err := discounts.Resolve(ctx, tx, tid, discountCode, cp.total, customerID(c)); err == nil {
 			cp.discountCents = q.DiscountCents
 		}
 	}
@@ -412,7 +424,10 @@ func (s *Service) ApplyDiscount(c *fiber.Ctx) error {
 	if cp != nil {
 		subtotal = cp.total
 	}
-	if _, err := discounts.Resolve(ctx, tx, tid, code, subtotal); err != nil {
+	// Preview-side eligibility: honor a signed-in customer's tags when we have
+	// them; anonymous carts always resolve as guests. Checkout re-validates
+	// anyway, so this only shapes the cart's predicted cents.
+	if _, err := discounts.Resolve(ctx, tx, tid, code, subtotal, customerID(c)); err != nil {
 		return translateDiscountErr(err)
 	}
 

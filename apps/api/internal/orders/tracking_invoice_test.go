@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -134,7 +135,7 @@ func TestOrderTrackingAndInvoicePDF(t *testing.T) {
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
 	bus := events.NewBus()
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	cart.RegisterRoutes(v1, pool, secret, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	RegisterRoutes(v1, pool, secret, New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
 
 	do := func(method, path, session, bearer, body string, want int) *http.Response {
@@ -167,6 +168,9 @@ func TestOrderTrackingAndInvoicePDF(t *testing.T) {
 	}
 
 	phone := "+1-555-" + sfx
+	// The phone must be query-escaped: a raw "+" decodes to a space and would
+	// 404 the customer lookup (same convention as orders_test.go).
+	encPhone := url.QueryEscape(phone)
 	session := "sess-" + sfx
 	do("POST", "/api/v1/cart", session, "", `{"variant_id":"`+variantID+`","quantity":1}`, fiber.StatusOK)
 	res := do("POST", "/api/v1/checkout", session, "", `{"customer_name":"Ada",`+
@@ -185,7 +189,10 @@ func TestOrderTrackingAndInvoicePDF(t *testing.T) {
 		t.Fatalf("checkout gave order %q total %d, want 2500", ord.ID, ord.TotalCents)
 	}
 
-	// Admin advances to shipped and attaches tracking (Phase 23).
+	// Checkout lands on 'pending'; walk to confirmed, then advance to shipped
+	// and attach tracking (Phase 23).
+	res = do("PATCH", "/api/v1/orders/"+ord.ID+"/status", "", adminToken,
+		`{"status":"confirmed"}`, fiber.StatusOK)
 	res = do("PATCH", "/api/v1/orders/"+ord.ID+"/status", "", adminToken,
 		`{"status":"shipped","tracking_number":"TRK123","tracking_carrier":"DHL",`+
 			`"tracking_url":"https://dhl.com/TRK123"}`,
@@ -206,7 +213,7 @@ func TestOrderTrackingAndInvoicePDF(t *testing.T) {
 	}
 
 	// Customer-facing lookup returns the tracking fields.
-	res = do("GET", "/api/v1/orders/"+ord.ID+"?phone="+phone, "", "", "", fiber.StatusOK)
+	res = do("GET", "/api/v1/orders/"+ord.ID+"?phone="+encPhone, "", "", "", fiber.StatusOK)
 	var looked struct {
 		Status          string `json:"status"`
 		TrackingNumber  string `json:"tracking_number"`
@@ -221,12 +228,12 @@ func TestOrderTrackingAndInvoicePDF(t *testing.T) {
 	}
 
 	// Wrong phone sees nothing.
-	do("GET", "/api/v1/orders/"+ord.ID+"?phone=+1-000-000-0000", "", "", "", fiber.StatusNotFound)
+	do("GET", "/api/v1/orders/"+ord.ID+"?phone="+url.QueryEscape("+1-000-000-0000"), "", "", "", fiber.StatusNotFound)
 
 	// Absent tracking fields are preserved on later transitions.
 	do("PATCH", "/api/v1/orders/"+ord.ID+"/status", "", adminToken,
 		`{"status":"delivered"}`, fiber.StatusOK)
-	res = do("GET", "/api/v1/orders/"+ord.ID+"?phone="+phone, "", "", "", fiber.StatusOK)
+	res = do("GET", "/api/v1/orders/"+ord.ID+"?phone="+encPhone, "", "", "", fiber.StatusOK)
 	var after struct {
 		Status          string `json:"status"`
 		TrackingNumber  string `json:"tracking_number"`
@@ -246,7 +253,7 @@ func TestOrderTrackingAndInvoicePDF(t *testing.T) {
 		bearer string
 	}{
 		{"admin", "/api/v1/orders/" + ord.ID + "/invoice.pdf", adminToken},
-		{"customer", "/api/v1/orders/" + ord.ID + "/invoice.pdf?phone=" + phone, ""},
+		{"customer", "/api/v1/orders/" + ord.ID + "/invoice.pdf?phone=" + encPhone, ""},
 	} {
 		res = do("GET", tc.path, "", tc.bearer, "", fiber.StatusOK)
 		if ct := res.Header.Get("Content-Type"); ct != "application/pdf" {

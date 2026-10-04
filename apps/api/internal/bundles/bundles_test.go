@@ -156,7 +156,7 @@ func TestBundlesAcceptance(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	cart.RegisterRoutes(v1, pool, secret, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	bundles.RegisterRoutes(v1, pool, secret, bundles.New(pool))
 	bus := events.NewBus()
 	orders.RegisterRoutes(v1, pool, secret, orders.New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))

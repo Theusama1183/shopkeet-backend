@@ -1,7 +1,7 @@
-# Shopkeet API — Complete Reference (Phases 1–13)
+# Shopkeet API — Complete Reference (Phases 1–33)
 
-**Last updated:** 2026-10-02  
-**DB version:** 26 (migrations 0001–0026 applied on VPS)  
+**Last updated:** 2026-10-04  
+**DB version:** 33 (migrations 0001–0033 applied on VPS)  
 **Deployment:** live on `https://api.shopkeet.com` (Coolify-managed, healthy)  
 **All acceptance tests:** PASS  
 **Stack:** Go 1.27 · Fiber · pgx/pgxpool · PostgreSQL 16 (RLS + FORCE) · Redis 7 · golang-migrate (embedded)
@@ -40,6 +40,8 @@
 28. [Bulk CSV Import/Export (Phase 29)](#bulk-csv-importexport-phase-29)
 29. [Product Feeds (Phase 30)](#product-feeds-phase-30)
 30. [Smart (Rule-Based) Collections (Phase 31)](#smart-rule-based-collections-phase-31)
+31. [Data-Driven Recommendations (Phase 32)](#data-driven-recommendations-phase-32)
+32. [Customer Tags & Segments (Phase 33)](#customer-tags--segments-phase-33)
 26. [Database Schema Summary](#database-schema-summary)
 16. [Auth Scopes & Middleware](#auth-scopes--middleware)
 17. [Error Shape](#error-shape)
@@ -1342,6 +1344,91 @@ middleware onto the exact-prefix public route, so the storefront list would star
 a JWT (401 `missing bearer token`). Register the admin routes **inline** instead
 (`r.Post("/categories", authMW, h)` …). The `internal/smartcollections/routes.go` comment
 carries the verified warning.
+
+---
+
+## Data-Driven Recommendations (Phase 32)
+
+A scheduled job turns purchase history into `product_recommendations` rows automatically.
+Phase 26 shipped the schema with `type` reserved: `manual` (merchant-curated) vs
+`auto` (reserved for the Phase 32 job) — so **Phase 32 needed no migration**.
+
+### How it works
+
+An `@weekly` cron (`/recommendations/recompute`, registered in `cmd/api/main.go`) runs for
+**every active tenant**: for each product the tenant actually sold, it finds the products most
+frequently bought *together* in the same order (`order_items` joined by `order_id`), then
+upserts the top-N as `type='auto'` rows (`UNIQUE (product_id, recommended_product_id, type)`
+`ON CONFLICT DO NOTHING`, so a manual pick on the same pair is never stomped). The
+white-label co-occurrence threshold (≥ 2 shared orders) and the per-product cap (top 3) are
+package constants. Only `status='paid'` orders count; a product's own row is never
+recommended; `exclude`d sources are skipped by recompute but kept for manual rows.
+Recommended products must be `active`; archived products don't become recommendations and
+existing auto rows pointing at archived or deleted products are pruned.
+
+### Surface (unchanged routes, enriched results)
+
+- Public `GET /products/:id/recommendations` — now returns both `manual` and `auto` rows
+  (active picks only).
+- Admin `GET /products/:id/recommendations` (Bearer) — returns all + `status`; a source
+  column marks each row `manual`/`auto`.
+- Admin `POST`/`DELETE` still manage `manual` rows only.
+
+### Acceptance (live, DB 33)
+
+`TestDataDrivenRecommendations` green **as `shopkeet_app`**: seeds a tenant with 2 products and
+3 paid orders *each* containing **both** products (co-occurrence = 3), recomputes, and asserts
+the auto rows appear; the P26 manual-suite `TestRecommendationsAcceptance` still passes. A
+test-bug detour: the beta product's public fetch had to be read under its **own** tenant
+context (resolving it under the alpha context 404'd) — fixed in the test, not the API.
+
+---
+
+## Customer Tags & Segments (Phase 33)
+
+Merchant-tagged customer segments with **tag-gated discounts**: tag a customer (`vip`,
+`wholesale`, …) from the admin panel, then gate a discount code — or an automatic promo — on a
+required tag. A code only applies at checkout when the signed-in customer carries the tag.
+
+### Model (migration `0033_customer_tags`, DB 33)
+
+- **`customer_tags`**: id, tenant_id, customer_id (FK `ON DELETE CASCADE`), tag (TEXT),
+  created_at; `UNIQUE (tenant_id, customer_id, tag)`. RLS `ENABLE + FORCE` + NULLIF
+  `tenant_isolation` policy + `OWNER TO shopkeet_app` (the `0029` contract). Index
+  `customer_tags_tag_idx (tenant_id, tag, created_at)` feeds segment listing.
+- **`discounts.eligible_tag`** (nullable TEXT): a code/promo is only good for a customer
+  carrying this tag.
+
+### Endpoints & scopes
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/customers` | Merchant | List all, or `?tag=vip` for the segment (customers whose tags include `vip`). |
+| POST | `/customers/:id/tags` | Merchant | Body `{"tag":"vip"}` — idempotent (existing tag → `200`, new → `201`). |
+| DELETE | `/customers/:id/tags?tag=vip` | Merchant | Removes the tag (`204`); `404` when the customer or tag doesn't exist. |
+
+Gate semantics: `tagEligible` enforces `eligible_tag` against `customer_tags` at **cart
+apply** (guest → `400` "discount requires the vip tag (sign in to use this code)"; untagged
+signed-in customer → `400`) **and re-verifies it inside the checkout transaction** — a tag
+removed after apply still blocks checkout (authoritative, matching the expiry/cap re-checks).
+Automatic (requires_code=false) promotions that are tag-gated are skipped by `AutoPick` for
+shoppers who don't carry the tag; tagged shoppers get them. Public-facing cart/checkout now
+runs the guest-or-customer auth (`CustomerOrGuestMW`) so a signed-in customer's identity is
+available when the preview and checkout resolve tag-gated discounts.
+
+### Acceptance (live, DB 33)
+
+`TestCustomerTagsAndSegments` green **as `shopkeet_app`** — segment → add/remove → guest
+cart-apply `400` → tagged customer carts `VIPX/200` and checks out `VIPX/200/2300` → tag
+removed between apply & checkout still `400` → untagged customer can't apply → automatic
+tag-gated promo skipped for untagged and applied for tagged. Bugs found & fixed live:
+(1) the cart preview resolved discounts with a nil customer so tag-gated codes previewed
+`200`/`0` — `loadCart` now passes the signed-in customer (cart.go `customerID` helper);
+(2) tag-gated checkout 500'd `conn busy` — `AutoPick` ran the tag `EXISTS` query *while* its
+`FOR UPDATE` candidate rows were open on the same connection; it now drains the candidates
+first (issue #8 in the status doc); (3) two latent test bugs: `'ap-'+`/`'bp-'+` SQL string
+concatenation (Phase 21 era) → `||`, and the isolated usage-cap block built the checkout JSON
+with the phone fragment outside the string literal and no `X-Tenant-ID` header.
 
 ---
 

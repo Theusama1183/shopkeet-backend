@@ -29,6 +29,12 @@ const (
 	// never executed as SQL); the handler writes a JSON per-row report to the
 	// task result, which GET /products/import/:jobId surfaces.
 	TaskTypeProductImport = "products:import"
+
+	// TaskTypeAutoRecommendations (Phase 32) recomputes each tenant's
+	// type='auto' product recommendations from order co-occurrence. Scheduled
+	// weekly ("@weekly" in main.go); the payload is empty — the job owns the
+	// tenant iteration.
+	TaskTypeAutoRecommendations = "recommendations:auto"
 )
 
 // ClientOpts converts a redis:// URL into the options both the enqueuer

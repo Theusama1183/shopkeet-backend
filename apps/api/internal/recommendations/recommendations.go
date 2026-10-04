@@ -119,8 +119,13 @@ func (s *Service) ListRecommendations(c *fiber.Ctx) error {
 	if public {
 		where += " AND p.status = 'active'"
 	}
+	// Phase 32 — manual curation wins: a hand-picked recommendation hides a
+	// computed (auto) row for the same pair, and manual rows sort first.
+	where += manualPriority
 	rows, err := tx.Query(ctx,
-		recommendationSelect+" "+where+" ORDER BY r.type, r.sort_order, p.name", c.Params("id"))
+		recommendationSelect+" "+where+
+			" ORDER BY CASE WHEN r.type = 'manual' THEN 0 ELSE 1 END, r.sort_order, p.name",
+		c.Params("id"))
 	if err != nil {
 		return httperr.ErrInternalServerError
 	}

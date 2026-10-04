@@ -147,7 +147,7 @@ func TestDiscountsAcceptance(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	cart.RegisterRoutes(v1, pool, secret, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	discounts.RegisterRoutes(v1, pool, secret, discounts.New(pool))
 	bus := events.NewBus()
 	orders.RegisterRoutes(v1, pool, secret, orders.New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
@@ -492,7 +492,7 @@ func TestAutomaticDiscounts(t *testing.T) {
 		var prodID string
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO products (tenant_id, name, slug, price_cents, currency, inventory_count, status)
-			VALUES ($1, 'ap', 'ap-'+replace(gen_random_uuid()::text,'-',''), $2, 'usd', $3, 'active') RETURNING id`,
+			VALUES ($1, 'ap', 'ap-' || replace(gen_random_uuid()::text,'-',''), $2, 'usd', $3, 'active') RETURNING id`,
 			tid, price, inv).Scan(&prodID); err != nil {
 			t.Fatalf("seed product: %v", err)
 		}
@@ -537,7 +537,7 @@ func TestAutomaticDiscounts(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	cart.RegisterRoutes(v1, pool, secret, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	discounts.RegisterRoutes(v1, pool, secret, discounts.New(pool))
 	bus := events.NewBus()
 	orders.RegisterRoutes(v1, pool, secret, orders.New(pool, bus, payments.NewRegistry()), ratelimit.New(nil))
@@ -663,7 +663,7 @@ func TestAutomaticDiscounts(t *testing.T) {
 			RequiresCode bool    `json:"requires_code"`
 		}
 		decode(res, &d)
-		if d.AppliesTo != "shipping" || !d.RequiresCode || d.Code != nil {
+		if d.AppliesTo != "shipping" || d.RequiresCode || d.Code != nil {
 			t.Fatalf("auto discount invalid echo: %+v", d)
 		}
 	}
@@ -763,10 +763,14 @@ func TestAutomaticDiscounts(t *testing.T) {
 			t.Fatalf("B cart: %v", err)
 		}
 		res.Body.Close()
-		res, err = app.Test(httptest.NewRequest("POST", "/api/v1/checkout", strings.NewReader(
-			`{"customer_name":"Ada","customer_phone":"+1-555-B"+`+sfx+`",`+
+		req = httptest.NewRequest("POST", "/api/v1/checkout", strings.NewReader(
+			`{"customer_name":"Ada","customer_phone":"+1-555-`+sfx+`",`+
 				`"shipping_address_line1":"1 Main St","shipping_city":"Lahore","shipping_country":"PK",`+
-				`"shipping_rate_id":"`+rateB+`"}`)), -1)
+				`"shipping_rate_id":"`+rateB+`"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Tenant-ID", tidB)
+		req.Header.Set("X-Customer-Session", s)
+		res, err = app.Test(req, -1)
 		if err != nil {
 			t.Fatalf("B checkout: %v", err)
 		}
@@ -777,7 +781,7 @@ func TestAutomaticDiscounts(t *testing.T) {
 		var want int
 		if s == sB1 {
 			if bods.DiscountCents != 500 || bods.TotalCents != 2000 {
-				t.Fatalf("B first checkout should use the cap-1 auto, got %+v", bods)
+				t.Fatalf("B first checkout should use the cap-1 auto, got %+v (status %d, raw %s)", bods, res.StatusCode, raw)
 			}
 			want = fiber.StatusCreated
 		} else {
@@ -808,7 +812,7 @@ func seedProductFor(t *testing.T, pool *pgxpool.Pool, ctx context.Context, tid s
 	var prodID string
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO products (tenant_id, name, slug, price_cents, currency, inventory_count, status)
-		VALUES ($1, 'bp', 'bp-'+replace(gen_random_uuid()::text,'-',''), $2, 'usd', 30, 'active') RETURNING id`,
+		VALUES ($1, 'bp', 'bp-' || replace(gen_random_uuid()::text,'-',''), $2, 'usd', 30, 'active') RETURNING id`,
 		tid, price).Scan(&prodID); err != nil {
 		t.Fatalf("seed product: %v", err)
 	}

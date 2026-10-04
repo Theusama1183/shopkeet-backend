@@ -55,12 +55,13 @@ type discountRow struct {
 	buyQuantity  *int
 	getQuantity  *int
 	requiresCode bool
+	eligibleTag  *string
 }
 
 const discountSelect = `
 	SELECT id, code, type, value_percent, value_cents, min_subtotal_cents,
 	       starts_at, ends_at, usage_limit, times_used, status, created_at,
-	       applies_to, buy_quantity, get_quantity, requires_code
+	       applies_to, buy_quantity, get_quantity, requires_code, eligible_tag
 	FROM discounts`
 
 // Quote is the resolved discount line for a cart or checkout: the snapshotted
@@ -129,8 +130,33 @@ func scanDiscount(row pgx.Row) (discountRow, error) {
 	var d discountRow
 	err := row.Scan(&d.id, &d.code, &d.dType, &d.valuePercent, &d.valueCents,
 		&d.minSubtotal, &d.startsAt, &d.endsAt, &d.usageLimit, &d.timesUsed, &d.status, &d.createdAt,
-		&d.appliesTo, &d.buyQuantity, &d.getQuantity, &d.requiresCode)
+		&d.appliesTo, &d.buyQuantity, &d.getQuantity, &d.requiresCode, &d.eligibleTag)
 	return d, err
+}
+
+// tagEligible enforces discounts.eligible_tag (Phase 33): a code gated on a tag
+// is only good for a signed-in customer who carries it. A nil customerID (guest
+// checkout, unsigned cart apply) can never prove the tag, so the discount is
+// refused there too — the checkout stays authoritative, like the expiry/cap
+// re-validation it sits beside. Automatic (requires_code=false) promotions that
+// are tag-gated simply stop matching for untagged/anonymous shoppers.
+func tagEligible(ctx context.Context, tx pgx.Tx, d discountRow, customerID *string) error {
+	if d.eligibleTag == nil {
+		return nil
+	}
+	if customerID == nil {
+		return invalid(fiber.StatusBadRequest, "discount requires the "+*d.eligibleTag+" tag (sign in to use this code)")
+	}
+	var has bool
+	if err := tx.QueryRow(ctx,
+		"SELECT EXISTS (SELECT 1 FROM customer_tags WHERE customer_id = $1 AND tag = $2)",
+		*customerID, *d.eligibleTag).Scan(&has); err != nil {
+		return err
+	}
+	if !has {
+		return invalid(fiber.StatusBadRequest, "discount code requires the "+*d.eligibleTag+" tag")
+	}
+	return nil
 }
 
 // Resolve validates a code against a subtotal without writing, scoped to
@@ -146,7 +172,7 @@ func scanDiscount(row pgx.Row) (discountRow, error) {
 // code — they are not-for-entry, so entering one behaves like an unknown code.
 // This also keeps them out of the checkout code-claim path where they would
 // otherwise be double-applied (once as a code, once by AutoPick).
-func Resolve(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents int) (*Quote, error) {
+func Resolve(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents int, customerID *string) (*Quote, error) {
 	d, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE tenant_id = $1 AND code = $2", tenantID, code))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalid(fiber.StatusNotFound, "discount code not found")
@@ -160,6 +186,9 @@ func Resolve(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCent
 	if err := d.validate(subtotalCents); err != nil {
 		return nil, err
 	}
+	if err := tagEligible(ctx, tx, d, customerID); err != nil {
+		return nil, err
+	}
 	return &Quote{Code: *d.code, DiscountCents: d.discount(subtotalCents)}, nil
 }
 
@@ -167,7 +196,7 @@ func Resolve(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCent
 // inside the caller's (checkout) transaction, scoped to tenantID. The FOR UPDATE
 // lock serializes concurrent checkouts so a usage_limit=1 code is consumed
 // exactly once. Automatic discounts are not claimable as codes (see Resolve).
-func Claim(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents int) (*Quote, error) {
+func Claim(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents int, customerID *string) (*Quote, error) {
 	d, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE tenant_id = $1 AND code = $2 FOR UPDATE", tenantID, code))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalid(fiber.StatusNotFound, "discount code not found")
@@ -179,6 +208,9 @@ func Claim(ctx context.Context, tx pgx.Tx, tenantID, code string, subtotalCents 
 		return nil, invalid(fiber.StatusNotFound, "discount code not found")
 	}
 	if err := d.validate(subtotalCents); err != nil {
+		return nil, err
+	}
+	if err := tagEligible(ctx, tx, d, customerID); err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(ctx,
@@ -213,7 +245,7 @@ type AutoQuote struct {
 // discount's times_used is only burned when it is actually applied.
 //
 // Returns nil when nothing qualifies or every candidate is worth <= 0.
-func AutoPick(ctx context.Context, tx pgx.Tx, tenantID string, subtotalCents, shippingCents int) (*AutoQuote, error) {
+func AutoPick(ctx context.Context, tx pgx.Tx, tenantID string, subtotalCents, shippingCents int, customerID *string) (*AutoQuote, error) {
 	rows, err := tx.Query(ctx, discountSelect+`
 		WHERE tenant_id = $1 AND status = 'active' AND requires_code = false
 		  AND (starts_at IS NULL OR starts_at <= now())
@@ -224,15 +256,33 @@ func AutoPick(ctx context.Context, tx pgx.Tx, tenantID string, subtotalCents, sh
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var best *AutoQuote
+	// Drain the candidate rows and release the connection BEFORE evaluating
+	// eligibility. Per-candidate checks like tagEligible issue their own
+	// queries against the same transaction, and pgx forbids issuing a statement
+	// while a previous result set is still open (would surface as "conn busy").
+	// The FOR UPDATE locks are held until the transaction ends regardless.
+	var cands []discountRow
 	for rows.Next() {
 		d, err := scanDiscount(rows)
 		if err != nil {
-			return nil, err
+			rows.Close()
+				return nil, err
 		}
+		cands = append(cands, d)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	var best *AutoQuote
+	for _, d := range cands {
 		if err := d.validate(subtotalCents); err != nil {
 			continue // e.g. subtotal below min_subtotal_cents — not eligible now
+		}
+		if err := tagEligible(ctx, tx, d, customerID); err != nil {
+			continue // tag-gated promo — shopper/anonymous doesn't carry the tag
 		}
 		var cents int
 		switch d.appliesTo {
@@ -252,9 +302,6 @@ func AutoPick(ctx context.Context, tx pgx.Tx, tenantID string, subtotalCents, sh
 			best = &AutoQuote{ID: d.id, AppliesTo: d.appliesTo, DiscountCents: cents}
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
 	return best, nil
 }
 
@@ -263,7 +310,7 @@ func AutoPick(ctx context.Context, tx pgx.Tx, tenantID string, subtotalCents, sh
 // AutoPick's FOR UPDATE, so the validation/usage-check cannot observe a stale
 // count; re-validating anyway keeps a single source of truth. Returns the
 // computed quote for the discount's scope.
-func ClaimAuto(ctx context.Context, tx pgx.Tx, tenantID, id string, subtotalCents, shippingCents int) (*AutoQuote, error) {
+func ClaimAuto(ctx context.Context, tx pgx.Tx, tenantID, id string, subtotalCents, shippingCents int, customerID *string) (*AutoQuote, error) {
 	d, err := scanDiscount(tx.QueryRow(ctx, discountSelect+" WHERE id = $1 AND tenant_id = $2 FOR UPDATE", id, tenantID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, invalid(fiber.StatusNotFound, "discount not found")
@@ -272,6 +319,9 @@ func ClaimAuto(ctx context.Context, tx pgx.Tx, tenantID, id string, subtotalCent
 		return nil, err
 	}
 	if err := d.validate(subtotalCents); err != nil {
+		return nil, err
+	}
+	if err := tagEligible(ctx, tx, d, customerID); err != nil {
 		return nil, err
 	}
 	var cents int
@@ -317,6 +367,7 @@ func toJSON(d discountRow) fiber.Map {
 		"requires_code":      d.requiresCode,
 		"buy_quantity":       intOrNil(d.buyQuantity),
 		"get_quantity":       intOrNil(d.getQuantity),
+		"eligible_tag":       strp(d.eligibleTag),
 		"created_at":         d.createdAt.Format(time.RFC3339),
 	}
 }
@@ -446,6 +497,21 @@ type discountRequest struct {
 	BuyQuantity      *int   `json:"buy_quantity"`
 	GetQuantity      *int   `json:"get_quantity"`
 	RequiresCode     *bool  `json:"requires_code"`
+	EligibleTag      *string `json:"eligible_tag"`
+}
+
+// normalizeEligibleTag canonicalizes an optional tag gate: trimmed, lowercased;
+// an empty value clears the gate (currently only meaningful on PATCH, where a
+// nil EligibleTag preserves the existing gate and "" removes it).
+func normalizeEligibleTag(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	tag := strings.ToLower(strings.TrimSpace(*v))
+	if tag == "" {
+		return nil
+	}
+	return &tag
 }
 
 // CreateDiscount handles POST /discounts (Admin).
@@ -485,6 +551,7 @@ func (s *Service) CreateDiscount(c *fiber.Ctx) error {
 	if codeVal := strings.TrimSpace(req.Code); codeVal != "" {
 		code = ptr(strings.ToUpper(codeVal))
 	}
+	eligibleTag := normalizeEligibleTag(req.EligibleTag)
 
 	tx, ok := txFrom(c)
 	if !ok {
@@ -492,13 +559,13 @@ func (s *Service) CreateDiscount(c *fiber.Ctx) error {
 	}
 	d, err := scanDiscount(tx.QueryRow(c.Context(), `
 		INSERT INTO discounts (tenant_id, code, type, value_percent, value_cents,
-			min_subtotal_cents, starts_at, ends_at, usage_limit, status, applies_to, requires_code)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			min_subtotal_cents, starts_at, ends_at, usage_limit, status, applies_to, requires_code, eligible_tag)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id, code, type, value_percent, value_cents, min_subtotal_cents,
 			starts_at, ends_at, usage_limit, times_used, status, created_at,
-			applies_to, buy_quantity, get_quantity, requires_code`,
+			applies_to, buy_quantity, get_quantity, requires_code, eligible_tag`,
 		tenantID(c), code, req.Type, req.ValuePercent, req.ValueCents, req.MinSubtotalCents,
-		startsAt, endsAt, req.UsageLimit, status, appliesTo, requiresCode))
+		startsAt, endsAt, req.UsageLimit, status, appliesTo, requiresCode, eligibleTag))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return httperr.C(fiber.StatusConflict, "discount code already exists")
@@ -563,6 +630,7 @@ func (s *Service) UpdateDiscount(c *fiber.Ctx) error {
 	start, end := cur.startsAt, cur.endsAt
 	appliesTo, requiresCode := cur.appliesTo, cur.requiresCode
 	buyQuantity, getQuantity := cur.buyQuantity, cur.getQuantity
+	eligibleTag := cur.eligibleTag
 	if v := strings.TrimSpace(req.Code); v != "" {
 		code = ptr(strings.ToUpper(v))
 	}
@@ -596,6 +664,9 @@ func (s *Service) UpdateDiscount(c *fiber.Ctx) error {
 	if req.GetQuantity != nil {
 		getQuantity = req.GetQuantity
 	}
+	if req.EligibleTag != nil {
+		eligibleTag = normalizeEligibleTag(req.EligibleTag)
+	}
 	if req.StartsAt != "" {
 		t, err := parseTimePtr(req.StartsAt)
 		if err != nil {
@@ -621,13 +692,13 @@ func (s *Service) UpdateDiscount(c *fiber.Ctx) error {
 	d, err := scanDiscount(tx.QueryRow(ctx, `
 		UPDATE discounts SET code = $1, type = $2, value_percent = $3, value_cents = $4,
 			min_subtotal_cents = $5, starts_at = $6, ends_at = $7, usage_limit = $8, status = $9,
-			applies_to = $10, requires_code = $11
-		WHERE id = $12 AND tenant_id = $13
+			applies_to = $10, requires_code = $11, eligible_tag = $12
+		WHERE id = $13 AND tenant_id = $14
 		RETURNING id, code, type, value_percent, value_cents, min_subtotal_cents,
 			starts_at, ends_at, usage_limit, times_used, status, created_at,
-			applies_to, buy_quantity, get_quantity, requires_code`,
+			applies_to, buy_quantity, get_quantity, requires_code, eligible_tag`,
 		code, dType, valuePercent, valueCents, minSubtotal, start, end, usageLimit, status,
-		appliesTo, requiresCode, c.Params("id"), tenantID(c)))
+		appliesTo, requiresCode, eligibleTag, c.Params("id"), tenantID(c)))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return httperr.C(fiber.StatusConflict, "discount code already exists")

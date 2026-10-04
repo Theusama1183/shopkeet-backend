@@ -477,7 +477,7 @@ func TestReturnRestocksCorrectVariant(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	cart.RegisterRoutes(v1, pool, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
+	cart.RegisterRoutes(v1, pool, secret, cart.New(pool, cart.NoopReserver{}), ratelimit.New(nil))
 	RegisterRoutes(v1, pool, secret, svc, ratelimit.New(nil))
 
 	do := func(method, path, tenantID, session, bearer, body string, want int) *http.Response {
