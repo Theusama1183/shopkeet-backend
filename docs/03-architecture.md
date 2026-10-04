@@ -13,13 +13,16 @@ This replaces the original "Shopify-at-scale" design with an architecture sized 
                   │                                       │
                   └───────────────────┬───────────────────┘
                                        ▼
-                [ Caddy — on-demand TLS per domain ]
+                [ Coolify proxy — auto TLS (API app only, today) ]
                                        │
                     ┌──────────────────┴──────────────────┐
                     ▼                                       ▼
       [ Next.js app (storefronts + admin) ]   [ Go API — modular monolith ]
+                                                (Coolify-managed app)
                                                 modules: tenants, media, catalog,
-                                                cart, orders, payments, content
+                                                cart, orders, payments, content,
+                                                shipping, discounts, customers,
+                                                notifications
                                                    │              │
                                                    ▼              ▼
                                             [ PostgreSQL ]   [ Redis ]
@@ -109,23 +112,22 @@ All three store content the same way: structured JSON (never raw HTML), keyed by
 
 ## 7. Deployment
 
-> **Revisited 2026-09-25:** the earlier "compose + Caddy for RAM savings" preference is superseded. The project deploys via **Coolify** (the API now lives in a Coolify app); Caddy was dropped. Re-decided because the frontend will deploy on Coolify too, so there's no Vercel/Optimizely split and one management surface. `backend-constraints.md` was updated to match.
+**Coolify** (open-source, self-hosted PaaS) manages the API application on the VPS — a deliberate choice made after weighing the RAM trade-off discussed earlier; Coolify-managed deploys and Coolify's proxy/TLS handling won out over running everything as plain containers.
 
-**Coolify** is the deploy layer on the single VPS — git-push deploys from `main`, one management surface for the API app and (soon) the frontend:
+> Note on "git-push auto-deploy": `settings.is_auto_deploy_enabled=true` is set on the app, but **no Git source/webhook is connected** (`source_id=0`, `webhook_token_url=null` — verified against the Coolify API 2026-10-04). Git pushes therefore never trigger a build; releases are deployed manually via `POST /api/v1/deploy?force=true` (see `p21-deploy.ps1`). If auto-deploy is ever wanted, it requires connecting the GitHub source / webhook in Coolify first — the settings flag alone is inert.
 
 ```
-Internet → Coolify proxy (a Managed Traefik / Traefik in Coolify)
-             ├── shopkeet.com, *.shopkeet.com  → Next.js app (future)
-             └── api.shopkeet.com               → Go API app (live)
+Internet → Coolify's proxy (Traefik, auto TLS)
+             └── api.shopkeet.com  → Coolify-managed Go API app
 ```
 
-- **Hybrid data layer (current state):** the Coolify API app (`l6modsyezs1vlrv6ly1oqz4i`) is Coolify-managed, but `shopkeet-postgres` and `shopkeet-redis` are still the original manual containers, attached to Coolify's Docker network. The app reaches them by hostname `shopkeet-postgres` / `shopkeet-redis`. ⚠️ Never use `postgres` on that network — `coolify-db` owns the alias and it points at Coolify's own DB. Migration of PG/Redis under Coolify is a candidate follow-up once the current network arrangement is good enough.
-- Mailpit (a Coolify service) is the dev/staging email sink; real customer email uses Resend or a real SMTP relay (see `backend-constraints.md`).
-- **Merchant custom domains still open:** the on-demand-TLS design originally planned with Caddy doesn't exist yet. Coolify's Traefik can proxy custom domains, but the per-domain cert issuance / tenant-ownership gating needs to be re-designed against Coolify (or a standalone Caddy) before merchant custom domains ship. This is deferred, not dropped.
-- **Cloudflare** fronts `shopkeet.com` for DNS, edge caching, and DDoS. Merchant custom domains typically point at the VPS directly by the merchant's own DNS.
-- **GitHub Actions** runs tests/builds on every PR; Coolify's auto-deploy (or `POST /applications/{uuid}/start?force=true`) handles release.
+- **API app** is Coolify-managed (built from the git repo, built via `POST /api/v1/deploy?force=true`). Despite `settings.is_auto_deploy_enabled=true`, no Git source/webhook is connected to the app (`source_id=0`), so pushes to `main` do **not** trigger a build — deploy manually after every release (`p21-deploy.ps1`). Coolify's proxy issues and renews its TLS certificate.
+- **Data layer is currently a hybrid, not fully migrated:** Postgres and Redis still run as the original manually-managed containers (`shopkeet-postgres`, `shopkeet-redis`), attached to Coolify's Docker network by alias so the Coolify-managed API can reach them — they are not Coolify **services**. This means the VPS is running Coolify's own management stack (including its own `coolify-db`/`coolify-redis`) *alongside* the manual data containers. Worth a conscious decision at some point: either bring Postgres/Redis fully under Coolify as services too (one consistent management path, one more data-migration step), or accept the hybrid permanently. Neither is wrong, but drifting into it by default is worth avoiding.
+- **`apps/web` (Next.js) and merchant custom domains** aren't deployed yet. When that work starts, decide explicitly whether new custom domains are attached via a Coolify API call per domain (straightforward, matches how the API app is managed today) or via Caddy's `on_demand_tls` running alongside Coolify (fully automatic, no per-domain API call needed, but a second proxy layer to reason about). Don't let this get decided implicitly by whatever the frontend agent finds easiest.
+- **Cloudflare** sits in front of `shopkeet.com` for DNS, edge caching, and DDoS protection — no Enterprise tier needed. If Cloudflare's proxy (orange cloud) is enabled, set SSL mode to **Full (Strict)**.
+- **GitHub Actions** runs tests/builds on every PR; Coolify's own deploy handles the release.
 
-**Trade-off worth knowing:** Coolify's management stack costs some RAM compared to bare docker-compose, but buys git-push deploys plus a managed proxy/TLS story and (decided) a single deploy surface for backend + frontend.
+**Notifications provider (production):** **Resend** (not open source — flagged, same category as Cloudflare/R2) is the live provider — `RESEND_API_KEY` + `NOTIFICATIONS_FROM_EMAIL` set, SMTP env vars removed so Resend wins the provider-resolution order. SMTP (e.g. Mailpit) is for local/dev only — it's a testing catcher, not a real delivery path, and must never be the configured provider in a live environment a real merchant depends on. See `07-expansion-build-spec.md` Phase 12 for the full provider design.
 
 **Media storage sits outside this VPS entirely.** Product and content images live in **Cloudflare R2**, not on local disk — the Go API issues short-lived presigned upload URLs, and the browser uploads bytes directly to R2 (see `04-agent-build-spec.md` Phase 2). This keeps the VPS stateless for media and avoids needing a backup strategy for locally-stored files. R2 is the second deliberate non-open-source exception in this stack, alongside Cloudflare itself — see `02-tech-stack.md` for the reasoning.
 

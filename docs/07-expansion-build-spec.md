@@ -143,7 +143,7 @@ CREATE POLICY tenant_isolation ON shipping_rates
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/shipping/rates?country=&state=` | Public | Matching rates for checkout to present as options. Response adds `state_required: true` when the country has region-restricted zones and no state was given, so the frontend can require the state field before checkout |
+| GET | `/shipping/rates?country=&state=` | Public | Matching rates for checkout to present as options |
 | POST/PATCH/DELETE | `/shipping/zones[/:id]` | Admin | Manage zones |
 | POST/PATCH/DELETE | `/shipping/rates[/:id]` | Admin | Manage rates |
 
@@ -320,7 +320,7 @@ ALTER TABLE orders
 | GET/PATCH | `/tenant/settings` | Admin | Store name, logo, currency, timezone, support contact, tax rate |
 | PATCH | `/orders/:id/note` | Admin | Set/update the internal note |
 
-**Checkout impact:** `tax_cents = (subtotal_cents - discount_cents) * tenants.tax_rate_percent / 100` — tax applies to what the customer actually pays for goods (post-discount), then shipping is added into `total_cents`.
+**Checkout impact:** `tax_cents = subtotal_cents * tenants.tax_rate_percent / 100`, added into `total_cents` alongside `shipping_cost_cents` and minus `discount_cents`.
 
 **Acceptance:** a tenant with a 5% tax rate shows the correct `tax_cents` on a new order; an internal note set by the merchant never appears in any customer-facing (`Public`/`Customer`-auth) response.
 
