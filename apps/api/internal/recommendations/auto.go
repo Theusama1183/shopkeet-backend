@@ -63,6 +63,7 @@ func RecomputeAuto(ctx context.Context, tx pgx.Tx, tenantID string) (int, error)
 			FROM order_items a
 			JOIN order_items b ON b.order_id = a.order_id AND b.product_id <> a.product_id
 			JOIN orders o ON o.id = a.order_id AND o.status <> 'cancelled'
+			WHERE a.tenant_id = $3 AND b.tenant_id = $3 AND o.tenant_id = $3
 		),
 		counts AS (
 			SELECT a, b, count(*) AS cnt
@@ -78,8 +79,8 @@ func RecomputeAuto(ctx context.Context, tx pgx.Tx, tenantID string) (int, error)
 			SELECT r.a, r.b, r.rn
 			FROM ranked r
 			WHERE r.rn <= $2
-			  AND EXISTS (SELECT 1 FROM products pa WHERE pa.id = r.a AND pa.status = 'active')
-			  AND EXISTS (SELECT 1 FROM products pb WHERE pb.id = r.b AND pb.status = 'active')
+			  AND EXISTS (SELECT 1 FROM products pa WHERE pa.id = r.a AND pa.tenant_id = $3 AND pa.status = 'active')
+			  AND EXISTS (SELECT 1 FROM products pb WHERE pb.id = r.b AND pb.tenant_id = $3 AND pb.status = 'active')
 			  AND NOT EXISTS (
 				  SELECT 1 FROM product_recommendations m
 				  WHERE m.tenant_id = $3 AND m.product_id = r.a

@@ -326,6 +326,15 @@ Full contract in `shopkeet-agents-package (1)/docs/api-reference.md`.
     prefix purge can fail FK on `cart_items`/`order_items`/`notification_log`. Purge needed a
     second pass that deletes the referencing rows under **both** tenants before the owner tenant
     could be dropped.
+11. **Phase 32 recompute was not tenant-scoped in SQL** (found by the live smoke, fixed the same
+    day): `RecomputeAuto`'s `pairs` CTE joined `order_items` across the whole DB, so under a
+    superuser/RIS-bypassed run it generated `auto` rows pairing *another tenant's* products into
+    your tenant and collided on `product_recommendations`' tenant-less
+    `UNIQUE (product_id, recommended_product_id, type)` (a bare recompute aborted 0 rows).
+    Harmless in prod (the worker sets `app.current_tenant`, RLS scopes the job) but wrong SQL —
+    now `pairs`/`eligible` filter `a/b/o.tenant_id` and the products `EXISTS` pin the same tenant.
+    Note the UNIQUE is intentionally tenant-less (manual-vs-auto dedupe per pair, P26); the job
+    and RLS keep it in-bounds.
 
 ---
 
