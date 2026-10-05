@@ -48,7 +48,9 @@ func TestLoginUnderRLS(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
 	v1 := app.Group("/api/v1")
-	RegisterRoutes(v1, pool, secret, ratelimit.New(nil))
+	// nil mailer: OTP disabled, signup/login hand tokens straight back — the
+	// legacy shape this test asserts.
+	RegisterRoutes(v1, pool, secret, ratelimit.New(nil), nil)
 
 	type store struct {
 		TenantID            string `json:"tenant_id"`

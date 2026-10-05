@@ -9,17 +9,15 @@ export const metadata: Metadata = {
 };
 
 interface OtpPageProps {
-  searchParams: Promise<{ email?: string; method?: "email" | "sms" }>;
+  searchParams: Promise<{ email?: string }>;
 }
 
 export default async function OtpPage({ searchParams }: OtpPageProps) {
-  const { email, method } = await searchParams;
+  const { email } = await searchParams;
 
   if (!email) {
     redirect("/login");
   }
-
-  const contactMethod = method === "sms" ? "sms" : "email";
 
   return (
     <AuthShell
@@ -35,10 +33,7 @@ export default async function OtpPage({ searchParams }: OtpPageProps) {
         </span>
       }
     >
-      <OtpFormClient
-        email={email}
-        contactMethod={contactMethod}
-      />
+      <OtpFormClient email={email} />
     </AuthShell>
   );
 }

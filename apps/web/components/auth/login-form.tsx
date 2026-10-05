@@ -24,7 +24,8 @@ const loginSchema = z.object({
 type LoginValues = z.infer<typeof loginSchema>;
 
 interface LoginResult {
-  mode?: "session" | "choose_store";
+  mode?: "session" | "choose_store" | "otp_required";
+  email?: string;
   error?: { code?: string; message?: string };
 }
 
@@ -55,6 +56,13 @@ export function LoginForm() {
           type: "server",
           message: payload?.error?.message ?? "Log in failed. Please try again.",
         });
+        return;
+      }
+      // Password passed but verification is owed: park on the OTP page with
+      // the address to send the code to (same host — /otp rewrites to /auth/otp).
+      if (payload?.mode === "otp_required") {
+        const params = new URLSearchParams({ email: payload.email ?? values.email, method: "email" });
+        window.location.assign(`/otp?${params.toString()}`);
         return;
       }
       // Several stores: pick one on the store list. One store: straight through.

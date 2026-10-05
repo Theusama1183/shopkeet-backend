@@ -25,7 +25,8 @@ CREATE TABLE tenants (
 );
 
 -- ============================================================
--- Tenants & Auth (Phase 1 + multi-store identity, migration 0034)
+-- Tenants & Auth (Phase 1 + multi-store identity, migration 0034;
+-- account verification codes, migration 0035)
 -- ============================================================
 
 -- The login identity: one row per merchant account (email + password), holding
@@ -74,6 +75,30 @@ CREATE TABLE merchant_account_stores (
     FOREIGN KEY (account_id, tenant_id)
     REFERENCES merchant_users (account_id, tenant_id) ON DELETE CASCADE
 );
+
+-- Account verification codes (migration 0035): the email OTP gating
+-- signup/login, and the single-use token behind password reset. Account-scoped
+-- and deliberately NOT RLS-scoped — same reasoning as merchant_accounts (no
+-- tenant scope exists mid-auth, no merchant business data here), and only the
+-- SHA-256 of the code/token is stored, so a database read never exposes a live
+-- credential. The API keeps one live row per (email, purpose): issuing a new
+-- code consumes the predecessor, and `attempts` bounds guesses per code.
+CREATE TABLE auth_verification_codes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id UUID NOT NULL REFERENCES merchant_accounts(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,              -- lower(email); the lookup identity
+  purpose TEXT NOT NULL,            -- 'otp' | 'password_reset'
+  code_hash TEXT NOT NULL,          -- sha256 hex of the code/token
+  expires_at TIMESTAMPTZ NOT NULL,
+  attempts INT NOT NULL DEFAULT 0,  -- failed guesses against THIS code
+  consumed_at TIMESTAMPTZ,          -- set on success (or on too many tries)
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (purpose IN ('otp', 'password_reset'))
+);
+-- Serves every auth lookup: live-code fetch, resend guard, the per-hour
+-- attempt sum, and the per-email cleanup delete.
+CREATE INDEX auth_verification_codes_lookup_idx
+  ON auth_verification_codes (email, purpose, created_at DESC);
 
 -- ============================================================
 -- Media library — Cloudflare R2 (Phase 2)

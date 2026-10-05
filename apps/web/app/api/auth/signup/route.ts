@@ -14,11 +14,20 @@ interface SignupBody {
   password?: string
 }
 
-interface SignupResponse {
+interface SignupSuccess {
+  /** Discriminator: absent on a full session, "otp_required" on the pending answer. */
+  mode?: undefined
   token: string
   user: { id: string; email: string; role: string }
   store: AuthStore
   onboarding_completed: boolean
+}
+
+/** The API's answer when verification is on: account created, no session yet. */
+interface SignupOtpPending {
+  mode: "otp_required"
+  email: string
+  method: string
 }
 
 /**
@@ -35,9 +44,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: { code: "invalid_body", message: "Invalid request body." } }, { status: 400 })
   }
 
-  let data: SignupResponse
+  let data: SignupSuccess | SignupOtpPending
   try {
-    data = await apiRequest<SignupResponse>("/auth/signup", { method: "POST", body: input })
+    data = await apiRequest<SignupSuccess | SignupOtpPending>("/auth/signup", { method: "POST", body: input })
   } catch (error) {
     if (error instanceof ApiError) {
       return NextResponse.json({ error: { code: error.code, message: error.message } }, { status: error.status })
@@ -46,6 +55,15 @@ export async function POST(request: Request) {
   }
 
   const jar = await cookies()
+  if (data.mode === "otp_required") {
+    // Mid-signup, not signed in: never leave a previous account's session
+    // sitting in the jar where it could mask the pending verification.
+    const options = sessionCookieOptions()
+    jar.set(SESSION_COOKIE, "", { ...options, maxAge: 0 })
+    jar.set(STORE_PICK_COOKIE, "", { ...options, maxAge: 0 })
+    return NextResponse.json({ mode: "otp_required" as const, email: data.email, method: data.method })
+  }
+
   jar.set(SESSION_COOKIE, data.token, {
     ...sessionCookieOptions(),
     maxAge: SESSION_MAX_AGE_SECONDS,

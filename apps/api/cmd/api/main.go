@@ -16,8 +16,8 @@ import (
 	"github.com/shopkeet/api/internal/affiliates"
 	"github.com/shopkeet/api/internal/analytics"
 	"github.com/shopkeet/api/internal/auth"
-	"github.com/shopkeet/api/internal/bundles"
 	"github.com/shopkeet/api/internal/bulkcsv"
+	"github.com/shopkeet/api/internal/bundles"
 	"github.com/shopkeet/api/internal/cart"
 	"github.com/shopkeet/api/internal/catalog"
 	"github.com/shopkeet/api/internal/content"
@@ -93,6 +93,20 @@ func main() {
 		log.Printf("notifications: using log provider (set SMTP_HOST or RESEND_API_KEY + NOTIFICATIONS_FROM_EMAIL to enable email)")
 	}
 	notifSvc := notifications.New(pool, notifProv, cfg.AppBaseDomain)
+
+	// Account verification (signup/login OTP + password-reset email) rides the
+	// same provider, but only when it is a REAL one. With the log provider no
+	// human can read a code, so auth gets a nil mailer and keeps issuing
+	// sessions directly — nobody gets locked behind an inbox that doesn't
+	// exist. SMTP and Resend both qualify; the adapter is structurally an
+	// auth.Mailer so the import direction stays notifications → auth-free.
+	var authMailer auth.Mailer
+	if notifProv.Name() != "log" {
+		authMailer = notifications.NewAuthMailer(notifProv, cfg.AuthOrigin, fromEmail)
+		log.Printf("auth: OTP verification enabled (mail=%s, origin=%s)", notifProv.Name(), cfg.AuthOrigin)
+	} else {
+		log.Printf("auth: OTP verification disabled — no mail provider configured (set SMTP_HOST or RESEND_API_KEY + NOTIFICATIONS_FROM_EMAIL)")
+	}
 
 	// Phase 14 — Redis-backed reliability layer: the per-route rate limiter
 	// and the Asynq job worker share the same Redis the cart Reserver uses.
@@ -208,7 +222,7 @@ func main() {
 	// New tenants get their storefront chrome (home page post, the required
 	// templates, header/footer sections) inside the signup transaction.
 	auth.RegisterTenantCreatedHook(content.SeedDefaults)
-	auth.RegisterRoutes(v1, pool, cfg.JWTSecret, rl)
+	auth.RegisterRoutes(v1, pool, cfg.JWTSecret, rl, authMailer)
 
 	// Phase 6 — content & page builder. Placeholder JSON feeds the Puck editor;
 	// onPublish saves the Puck layout verbatim through the admin endpoints.

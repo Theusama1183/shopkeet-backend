@@ -37,10 +37,16 @@ Middleware wraps `POST /checkout`, `POST /customers/signup`, `POST /cart/discoun
 | Route | Limit | Key |
 |---|---|---|
 | `POST /auth/login` | 5 / 15 min | IP + email |
+| `POST /auth/otp/send` | 5 / 15 min | IP + email |
+| `POST /auth/otp/verify` | 15 / 15 min | IP + email |
+| `POST /auth/forgot-password` | 5 / hour | IP + email |
+| `POST /auth/reset-password` | 10 / 15 min | IP |
 | `POST /customers/login` | 5 / 15 min | IP + email |
 | `POST /auth/signup`, `POST /customers/signup` | 10 / hour | IP |
 | `POST /cart/discount` | 20 / hour | cart/session |
 | `POST /checkout` | 30 / hour | IP |
+
+`POST /auth/otp/verify` additionally carries a **per-email guess budget in the database**, not Redis: failed attempts accumulate across code reissues (a re-login mints a fresh code but the old rows still count) and 20 within an hour answer `429 too_many_attempts`. The IP half of the key can be rotated away by a distributed attacker; this sum cannot.
 
 429 responses include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, `Retry-After`. A single global limit that punishes all traffic equally is the wrong shape — these are per-route because a login brute-force and a checkout burst are different problems.
 

@@ -27,9 +27,18 @@ const newPasswordSchema = z
 
 type NewPasswordValues = z.infer<typeof newPasswordSchema>;
 
+/**
+ * What a successful reset answered. The proxy signs the merchant in and says
+ * where they should land — same contract as a completed OTP verify.
+ */
+export interface ResetSuccess {
+  mode?: "session" | "choose_store";
+  onboarding_completed?: boolean;
+}
+
 interface NewPasswordFormProps {
   token: string;
-  onSuccess: () => void;
+  onSuccess: (result: ResetSuccess) => void;
 }
 
 export function NewPasswordForm({ token, onSuccess }: NewPasswordFormProps) {
@@ -55,7 +64,7 @@ export function NewPasswordForm({ token, onSuccess }: NewPasswordFormProps) {
         body: JSON.stringify({ token, password: values.password }),
       });
       const payload = (await res.json().catch(() => null)) as
-        | { error?: { message?: string } }
+        | ({ error?: { message?: string } } & ResetSuccess)
         | null;
       if (!res.ok) {
         setError("root", {
@@ -64,7 +73,7 @@ export function NewPasswordForm({ token, onSuccess }: NewPasswordFormProps) {
         });
         return;
       }
-      onSuccess();
+      onSuccess(payload ?? {});
     } catch {
       apiErrorToast(new Error("Could not reach the server. Check your connection."));
     } finally {

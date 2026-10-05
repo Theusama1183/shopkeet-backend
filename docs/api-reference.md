@@ -8,14 +8,22 @@ This is the contract Frontend and Backend agents build against in parallel — i
 
 The merchant is the **account** (email + password); a store is a tenant the account owns or staffs. A merchant on a paid plan can run several stores, so login authenticates the account and never asks which store — it returns every store the account can open.
 
+When a mail provider is configured (SMTP or Resend), signup and login are gated by an **email OTP**: the password is only half the check, and neither endpoint returns a token until `/auth/otp/verify` accepts the 6-digit code. Without a mail provider the endpoints answer directly (a box that cannot send mail must not lock its users out), and the verification endpoints return `503 verification_unavailable`.
+
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/auth/signup` | Public | Create an account, a provisional store and its owner membership in one transaction. Body `{email, password}` — no store name, no subdomain. Returns `{token, user, store, onboarding_completed:false, expires}`; the session is flagged for the one-time onboarding wizard |
-| POST | `/auth/login` | Public | Body `{email, password}`. Returns `{user, stores[]}`. **One store:** also returns `token` + `store` + `onboarding_completed`. **Several stores:** no tenant JWT — only a 10-minute `store_pick_token` |
+| POST | `/auth/signup` | Public | Create an account, a provisional store and its owner membership in one transaction. Body `{email, password}` — no store name, no subdomain. **Verification on:** `201 {mode:"otp_required", email, method:"email"}`, no token — the code mails a 6-digit OTP (10 min). **Off:** `{token, user, store, onboarding_completed:false, expires}`, session flagged for the onboarding wizard |
+| POST | `/auth/login` | Public | Body `{email, password}`. **Verification on:** `200 {mode:"otp_required", email, method:"email"}` after the password checks out — no token yet. **Off:** returns `{user, stores[]}`. **One store:** also `token` + `store` + `onboarding_completed`. **Several stores:** no tenant JWT — only a 10-minute `store_pick_token` |
+| POST | `/auth/otp/send` | Public | Re-issues the code for a login/signup in flight. Body `{email, contactMethod:"email"}`. `200 {sent:true}`; `400 verification_expired` when there is no live code or the original issue is older than 30 min (same error whether the row never existed — anti-enumeration); `400 sms_unavailable` for any non-email channel. Refreshes the live code in place: new code, same 10-minute window, failed-guess count carried over |
+| POST | `/auth/otp/verify` | Public | Body `{email, code}`. Correct code → same payload login would have given: one store → `{token, store, onboarding_completed, user, expires}`; several → `{store_pick_token, stores[]}`. Wrong code → `400 invalid_code` (5 per code burns it: `400 too_many_attempts`); 20 failed guesses per email per hour → `429 too_many_attempts` |
+| POST | `/auth/forgot-password` | Public | Body `{email}`. **Always** `200 {sent:true}`, whatever the address — the endpoint is not an account oracle. For a known address, mails a single-use link (`https://auth.<base>/reset-password?token=…`, valid 1 h, stored as SHA-256) and invalidates any older link |
+| POST | `/auth/reset-password` | Public | Body `{token, password}` (min 8 chars). `400 invalid_token` for a bad/expired/already-used link. On success rewrites the password on the account **and** every store membership, kills any in-flight OTP, and returns the same session payload as login/verify |
 | GET | `/auth/stores` | store_pick token or merchant JWT | List the stores an authenticated account can open: `{stores[]}` |
 | POST | `/auth/select-store` | store_pick token or merchant JWT | Exchange a store pick for a tenant session. Body `{tenant_id}`; membership is re-checked, so a ticket alone grants nothing. Returns `{token, user, store, onboarding_completed, expires}` |
 
 A merchant token may be used for `/auth/stores` and `/auth/select-store`, which is how a signed-in merchant switches stores without logging in again.
+
+Codes and reset tokens live in `auth_verification_codes` (migration 0035) as SHA-256 hashes only, one live row per account+purpose, pruned after a day.
 
 ### Store onboarding
 

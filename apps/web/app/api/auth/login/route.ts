@@ -17,6 +17,10 @@ export interface AuthSuccess {
   store?: AuthStore
   store_pick_token?: string
   onboarding_completed?: boolean
+  /** Set instead of a token when the account passed the password but still owes an OTP. */
+  mode?: "session" | "choose_store" | "otp_required"
+  email?: string
+  method?: string
 }
 
 interface LoginBody {
@@ -27,10 +31,12 @@ interface LoginBody {
 /**
  * Password in, session cookie out. The browser never sees a JWT.
  *
- * A merchant can own several stores, so this handler has two outcomes: one store
- * means a session cookie and straight to the dashboard; several means no session
- * yet — just the API's 10-minute store_pick ticket in an httpOnly cookie, and the
- * store list, so the browser can ask which store to open. The ticket carries no
+ * Three outcomes: the account's password passed and a single store exists →
+ * session cookie and straight to the dashboard; several stores → no session
+ * yet, just the API's 10-minute store_pick ticket in an httpOnly cookie plus
+ * the store list; verification is enabled and the password merely passed →
+ * {mode:"otp_required"} with neither cookie, because the emailed code is the
+ * half of the login that actually proves the mailbox. The ticket carries no
  * tenant, so nothing is scoped until a store is actually chosen.
  */
 export async function POST(request: Request) {
@@ -53,6 +59,19 @@ export async function POST(request: Request) {
 
   const jar = await cookies()
   const options = sessionCookieOptions()
+
+  // Password checked out but the OTP is still owed: no token exists yet, so
+  // hand the step back verbatim. Drop any half-finished credentials first —
+  // this browser is mid-login, not logged in.
+  if (data.mode === "otp_required") {
+    jar.set(SESSION_COOKIE, "", { ...options, maxAge: 0 })
+    jar.set(STORE_PICK_COOKIE, "", { ...options, maxAge: 0 })
+    return NextResponse.json({
+      mode: "otp_required" as const,
+      email: data.email,
+      method: data.method ?? "email",
+    })
+  }
 
   if (data.token) {
     jar.set(SESSION_COOKIE, data.token, { ...options, maxAge: SESSION_MAX_AGE_SECONDS })

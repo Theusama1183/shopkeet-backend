@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Config holds all runtime configuration loaded from environment variables.
@@ -12,6 +13,12 @@ type Config struct {
 	Port          string
 	JWTSecret     string
 	AppBaseDomain string
+
+	// AuthOrigin is where the auth pages (login, OTP, reset) are served —
+	// https://auth.<APP_BASE_DOMAIN> in production, http://auth.localhost:3000
+	// in dev. AUTH_ORIGIN overrides the derived value; it is only used to build
+	// links that go OUT in email (the password-reset URL).
+	AuthOrigin string
 
 	// MetricsToken gates GET /metrics (Phase 7). When empty the endpoint is
 	// still served but is only safe behind a network-level proxy rule.
@@ -47,6 +54,7 @@ func Load() (*Config, error) {
 		Port:                   os.Getenv("PORT"),
 		JWTSecret:              os.Getenv("JWT_SECRET"),
 		AppBaseDomain:          os.Getenv("APP_BASE_DOMAIN"),
+		AuthOrigin:             os.Getenv("AUTH_ORIGIN"),
 		MetricsToken:           os.Getenv("METRICS_TOKEN"),
 		R2AccountID:            os.Getenv("R2_ACCOUNT_ID"),
 		R2AccessKeyID:          os.Getenv("R2_ACCESS_KEY_ID"),
@@ -70,6 +78,21 @@ func Load() (*Config, error) {
 	}
 	if c.Port == "" {
 		c.Port = "3001"
+	}
+
+	// Derive the auth origin for email links when it isn't set explicitly: a
+	// real base domain gets the canonical https://auth.<domain>, a dev-style
+	// hostname gets the *.localhost convention the web app uses, and no domain
+	// at all falls back to the bare dev origin.
+	if c.AuthOrigin == "" {
+		switch {
+		case c.AppBaseDomain == "":
+			c.AuthOrigin = "http://auth.localhost:3000"
+		case strings.Contains(c.AppBaseDomain, "."):
+			c.AuthOrigin = "https://auth." + c.AppBaseDomain
+		default:
+			c.AuthOrigin = "http://auth." + c.AppBaseDomain + ":3000"
+		}
 	}
 
 	// R2 is required together: either all of account/creds/bucket/public URL

@@ -130,13 +130,11 @@ cookies().set('shopkeet_session', jwt, {
 
 `Domain=.shopkeet.com` is what makes a cookie set during login on `auth.shopkeet.com` readable on `admin.shopkeet.com` afterward — this is the whole mechanism that makes "log in once, land on the unified admin" work. The **customer** session cookie (set from `{tenant}.shopkeet.com/account/login`) should **not** use this shared domain — scope it to that one tenant subdomain only, so one store's customer session can never be read on another tenant's storefront, even accidentally.
 
-## Flagged: OTP needs a backend decision before that page is real
+## Decided: Email OTP (SMS deferred)
 
-`04-agent-build-spec.md` Phase 1 only has email+password signup/login today — no OTP delivery mechanism exists. Before `auth/otp/page.tsx` can do anything real, decide:
-- **Email OTP** — reuses Resend, already live, no new dependency.
-- **SMS OTP** — needs a new provider (Twilio or similar), another flagged non-open-source exception, and has a real per-message cost at scale.
+**Decision (resolved):** the OTP gate is **email-based, delivered through Resend** (the same provider production transactional mail already uses; SMTP/Mailpit in dev). `auth/otp/page.tsx` is real: signup and login return `{mode:"otp_required", email, method:"email"}` until `/auth/otp/verify` accepts the code — see `docs/api-reference.md` §Auth and migration 0035.
 
-Given the target market, SMS is probably what's actually wanted, but that's a product/cost call, not an engineering default — worth deciding explicitly rather than building toward an assumption. Once decided, it's a small addition to `internal/tenants` (an OTP table + send/verify endpoints), not a big one.
+**SMS OTP stays deferred** — it needs a new provider (Twilio or similar), another flagged non-open-source exception, and a real per-message cost at scale. That's a product/cost call to revisit deliberately, not an engineering default. When it happens, the backend shape is ready for it: `POST /auth/otp/send` already rejects non-email channels with `400 sms_unavailable`, so adding SMS is a new `method` branch plus a provider, not a schema change.
 
 ## Note: custom domains, for later
 

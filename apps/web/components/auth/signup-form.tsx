@@ -47,14 +47,21 @@ export function SignupForm() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(values),
       });
+      const payload = (await res.json().catch(() => null)) as
+        | { mode?: string; email?: string; error?: { code?: string; message?: string } }
+        | null;
       if (!res.ok) {
-        const payload = (await res.json().catch(() => null)) as
-          | { error?: { code?: string; message?: string } }
-          | null;
         setError("root", {
           type: "server",
           message: payload?.error?.message ?? "Signup failed. Please try again.",
         });
+        return;
+      }
+      // Account created but unverified: the code proves the mailbox before any
+      // session exists. Same-host jump; /otp rewrites to /auth/otp.
+      if (payload?.mode === "otp_required") {
+        const params = new URLSearchParams({ email: payload.email ?? values.email, method: "email" });
+        window.location.assign(`/otp?${params.toString()}`);
         return;
       }
       // The account exists and is signed in, but its store is still unnamed, so the

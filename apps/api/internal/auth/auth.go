@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"log"
 	"strings"
 	"time"
 
@@ -98,11 +99,11 @@ type storeRow struct {
 
 func storeJSON(s storeRow) fiber.Map {
 	return fiber.Map{
-		"tenant_id":           s.TenantID,
-		"name":                s.Name,
-		"subdomain":           s.Subdomain,
-		"role":                s.Role,
-		"status":              s.Status,
+		"tenant_id":            s.TenantID,
+		"name":                 s.Name,
+		"subdomain":            s.Subdomain,
+		"role":                 s.Role,
+		"status":               s.Status,
 		"onboarding_completed": s.OnboardingCompleted,
 	}
 }
@@ -180,9 +181,12 @@ type signupRequest struct {
 }
 
 // SignupHandler creates the account, a provisional store and its owner
-// membership in one transaction, then mints a tenant JWT whose onboarding claim
-// is false — that claim is what routes the merchant into the wizard.
-func SignupHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
+// membership in one transaction. With a mailer configured the response is the
+// OTP step ({mode:"otp_required"}) and NO token — the JWT only exists after
+// the emailed code verifies (docs/05 §login). Without one (no real mail
+// provider configured) it falls back to minting the onboarding JWT straight
+// away, which is what routes the merchant into the wizard.
+func SignupHandler(pool *pgxpool.Pool, secret string, mailer Mailer) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		var req signupRequest
 		if err := c.BodyParser(&req); err != nil {
@@ -248,14 +252,31 @@ func SignupHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 			return httperr.ErrInternalServerError
 		}
 
+		if mailer != nil {
+			// The account exists but is not authenticated: issue the code
+			// before answering. A send failure still returns otp_required (log
+			// it, don't 500) — a 500 here would strand the merchant retrying
+			// into a 409 conflict, while the resend button on the OTP page is
+			// the proper retry path and surfaces real errors. A code-row
+			// failure likewise degrades to "log in again", which re-issues.
+			if code, err := issueCode(ctx, pool, accountID, req.Email, otpTTL); err != nil {
+				log.Printf("[auth] otp issue failed for signup %s: %v", req.Email, err)
+			} else if err := mailer.SendOTP(ctx, req.Email, code); err != nil {
+				log.Printf("[auth] otp send failed for signup %s: %v", req.Email, err)
+			}
+			return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+				"mode": "otp_required", "email": req.Email, "method": "email",
+			})
+		}
+
 		onboarding := false
 		token, err := SignMerchant(secret, tenantID, userID, accountID, "owner", &onboarding, 24*time.Hour)
 		if err != nil {
 			return httperr.ErrInternalServerError
 		}
 		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-			"token":   token,
-			"user":    fiber.Map{"id": accountID, "email": req.Email, "role": "owner"},
+			"token": token,
+			"user":  fiber.Map{"id": accountID, "email": req.Email, "role": "owner"},
 			"store": fiber.Map{
 				"tenant_id": tenantID, "name": "My store", "subdomain": subdomain,
 				"role": "owner", "status": "active", "onboarding_completed": false,
@@ -276,12 +297,15 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
-// LoginHandler authenticates the account (email + password) and returns every
-// store it can open. One store: the tenant JWT comes straight back and the
-// merchant lands on the dashboard. Several: no tenant JWT is issued — only a
-// short-lived store_pick ticket — so a store cannot be chosen without a
-// membership row saying the account may act on it.
-func LoginHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
+// LoginHandler authenticates the account (email + password). With a mailer
+// configured that is only HALF the gate: a correct password issues the OTP and
+// returns {mode:"otp_required"} with no token — the session payload (shared
+// with OTP verify and reset via sessionPayload) comes back only after the
+// emailed code verifies. Without a mailer it returns the payload directly:
+// one store → the tenant JWT; several → only a short-lived store_pick ticket,
+// so a store cannot be chosen without a membership row saying the account may
+// act on it.
+func LoginHandler(pool *pgxpool.Pool, secret string, mailer Mailer) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		var req loginRequest
 		if err := c.BodyParser(&req); err != nil {
@@ -308,45 +332,24 @@ func LoginHandler(pool *pgxpool.Pool, secret string) fiber.Handler {
 			return httperr.C(fiber.StatusUnauthorized, "invalid credentials")
 		}
 
-		stores, err := listStores(ctx, pool, accountID)
-		if err != nil {
-			return httperr.ErrInternalServerError
-		}
-		if len(stores) == 0 {
-			return httperr.C(fiber.StatusForbidden, "this account has no store yet")
-		}
-
-		payload := fiber.Map{
-			"user":   fiber.Map{"id": accountID, "email": req.Email},
-			"stores": storeListJSON(stores),
-		}
-
-		if len(stores) == 1 {
-			s := stores[0]
-			// The JWT's user_id must be the tenant-scoped merchant_users row id —
-			// admin routes key off it — so resolve it before signing.
-			userID, err := membershipUserID(ctx, pool, accountID, s.TenantID)
-			if err != nil {
+		if mailer != nil {
+			// Password good, second factor pending. Same stance as signup: a
+			// send failure is logged, not surfaced — otp_required still goes
+			// back so the OTP page's Resend button owns the retry UX.
+			if code, err := issueCode(ctx, pool, accountID, req.Email, otpTTL); err != nil {
 				return httperr.ErrInternalServerError
+			} else if err := mailer.SendOTP(ctx, req.Email, code); err != nil {
+				log.Printf("[auth] otp send failed for login %s: %v", req.Email, err)
 			}
-			onboarding := s.OnboardingCompleted
-			token, err := SignMerchant(secret, s.TenantID, userID, accountID, s.Role, &onboarding, 24*time.Hour)
-			if err != nil {
-				return httperr.ErrInternalServerError
-			}
-			payload["token"] = token
-			payload["user"] = fiber.Map{"id": accountID, "email": req.Email, "role": s.Role}
-			payload["store"] = storeJSON(s)
-			payload["onboarding_completed"] = s.OnboardingCompleted
-			payload["expires"] = time.Now().Add(24 * time.Hour).Format(time.RFC3339)
-			return c.JSON(payload)
+			return c.JSON(fiber.Map{
+				"mode": "otp_required", "email": req.Email, "method": "email",
+			})
 		}
 
-		ticket, err := SignStorePick(secret, accountID, 10*time.Minute)
+		payload, err := sessionPayload(ctx, pool, secret, accountID, req.Email)
 		if err != nil {
-			return httperr.ErrInternalServerError
+			return err
 		}
-		payload["store_pick_token"] = ticket
 		return c.JSON(payload)
 	}
 }
@@ -877,17 +880,28 @@ func CustomerOrGuestMW(pool *pgxpool.Pool, secret string) fiber.Handler {
 // RegisterRoutes mounts the auth surface onto an existing router that already
 // carries the /api/v1 prefix (so later phases can share the group):
 //
-//	POST /api/v1/auth/signup       (public, rate-limited)
-//	POST /api/v1/auth/login        (public, rate-limited)
-//	GET  /api/v1/auth/stores       (store_pick ticket or merchant token)
-//	POST /api/v1/auth/select-store (store_pick ticket or merchant token)
+//	POST /api/v1/auth/signup          (public, rate-limited)
+//	POST /api/v1/auth/login           (public, rate-limited)
+//	POST /api/v1/auth/otp/send        (public, rate-limited)
+//	POST /api/v1/auth/otp/verify      (public, rate-limited)
+//	POST /api/v1/auth/forgot-password (public, rate-limited)
+//	POST /api/v1/auth/reset-password  (public, rate-limited)
+//	GET  /api/v1/auth/stores          (store_pick ticket or merchant token)
+//	POST /api/v1/auth/select-store    (store_pick ticket or merchant token)
 //
-// limiter applies per-route Redis limits: login brute-force at 5/15min per
-// IP+email, signup at 10/hour per IP (docs/08-hardening… §14). A nil limiter
-// disables limiting entirely. The two store endpoints sit behind a verified
-// token rather than a limiter — they cannot be called without one, and a
-// merchant switching stores should not be rate-limited like a login.
-func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, limiter *ratelimit.Limiter) {
+// limiter applies per-route Redis limits (docs/08-hardening… §14): login
+// brute-force at 5/15min per IP+email, signup at 10/hour per IP, plus the
+// OTP/reset budgets in verification.go — resend/verify/forgot/reset all
+// keyed IP+email where the body carries one, so a guesser rotating IPs still
+// trips the per-email bucket. A nil limiter disables limiting entirely. The
+// two store endpoints sit behind a verified token rather than a limiter —
+// they cannot be called without one, and a merchant switching stores should
+// not be rate-limited like a login.
+//
+// mailer gates every verification endpoint: nil (no real mail provider
+// configured) leaves OTP/reset disabled and signup/login issue sessions
+// directly, so a box that cannot send mail never locks its users out.
+func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, limiter *ratelimit.Limiter, mailer Mailer) {
 	g := router.Group("/auth")
 	g.Post("/signup",
 		limiter.Middleware(ratelimit.Entry{
@@ -896,7 +910,7 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, limi
 			Window:  time.Hour,
 			KeyFunc: ratelimit.ByIP(),
 		}),
-		SignupHandler(pool, secret))
+		SignupHandler(pool, secret, mailer))
 	g.Post("/login",
 		limiter.Middleware(ratelimit.Entry{
 			Route:   "POST /auth/login",
@@ -904,7 +918,39 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, limi
 			Window:  15 * time.Minute,
 			KeyFunc: ratelimit.ByIPAndBodyField("email"),
 		}),
-		LoginHandler(pool, secret))
+		LoginHandler(pool, secret, mailer))
+	g.Post("/otp/send",
+		limiter.Middleware(ratelimit.Entry{
+			Route:   "POST /auth/otp/send",
+			Limit:   5,
+			Window:  15 * time.Minute,
+			KeyFunc: ratelimit.ByIPAndBodyField("email"),
+		}),
+		OTPSendHandler(pool, mailer))
+	g.Post("/otp/verify",
+		limiter.Middleware(ratelimit.Entry{
+			Route:   "POST /auth/otp/verify",
+			Limit:   15,
+			Window:  15 * time.Minute,
+			KeyFunc: ratelimit.ByIPAndBodyField("email"),
+		}),
+		OTPVerifyHandler(pool, secret, mailer))
+	g.Post("/forgot-password",
+		limiter.Middleware(ratelimit.Entry{
+			Route:   "POST /auth/forgot-password",
+			Limit:   5,
+			Window:  time.Hour,
+			KeyFunc: ratelimit.ByIPAndBodyField("email"),
+		}),
+		ForgotPasswordHandler(pool, mailer))
+	g.Post("/reset-password",
+		limiter.Middleware(ratelimit.Entry{
+			Route:   "POST /auth/reset-password",
+			Limit:   10,
+			Window:  15 * time.Minute,
+			KeyFunc: ratelimit.ByIP(),
+		}),
+		ResetPasswordHandler(pool, secret))
 	g.Get("/stores", StoresHandler(pool, secret))
 	g.Post("/select-store", SelectStoreHandler(pool, secret))
 }

@@ -4,7 +4,7 @@ import * as React from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import { Loader2Icon, MailIcon, PhoneIcon } from "lucide-react";
+import { Loader2Icon } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { apiErrorToast } from "@/lib/api";
@@ -12,7 +12,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const otpSchema = z.object({
   code: z.string().trim().min(1, "Enter the code.").length(6, "Code must be 6 digits."),
@@ -20,13 +19,27 @@ const otpSchema = z.object({
 
 type OtpValues = z.infer<typeof otpSchema>;
 
-interface OtpProps {
-  email: string;
-  contactMethod: "email" | "sms";
-  onSuccess: () => void;
+/**
+ * What a successful verify answered — everything the caller needs to choose a
+ * destination. The proxy fills mode in ("session" | "choose_store"); a single
+ * store also carries onboarding_completed, which decides wizard vs dashboard.
+ */
+export interface OtpSuccess {
+  mode?: "session" | "choose_store";
+  onboarding_completed?: boolean;
 }
 
-export function OtpForm({ email, contactMethod, onSuccess }: OtpProps) {
+interface OtpProps {
+  email: string;
+  onSuccess: (result: OtpSuccess) => void;
+}
+
+/**
+ * The second factor. Email only: SMS is deliberately out of scope for now
+ * (docs/13), so there is no channel switcher — just where the code went and
+ * how to get another one.
+ */
+export function OtpForm({ email, onSuccess }: OtpProps) {
   const [pending, setPending] = React.useState(false);
   const [resendCooldown, setResendCooldown] = React.useState(0);
 
@@ -56,7 +69,7 @@ export function OtpForm({ email, contactMethod, onSuccess }: OtpProps) {
       const res = await fetch("/api/auth/otp/send", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ email, contactMethod }),
+        body: JSON.stringify({ email, contactMethod: "email" }),
       });
       if (!res.ok) {
         const payload = (await res.json().catch(() => null)) as
@@ -80,10 +93,10 @@ export function OtpForm({ email, contactMethod, onSuccess }: OtpProps) {
       const res = await fetch("/api/auth/otp/verify", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ email, code: values.code, contactMethod }),
+        body: JSON.stringify({ email, code: values.code, contactMethod: "email" }),
       });
       const payload = (await res.json().catch(() => null)) as
-        | { error?: { message?: string }; mode?: string }
+        | ({ error?: { message?: string } } & OtpSuccess)
         | null;
       if (!res.ok) {
         setError("code", {
@@ -92,7 +105,7 @@ export function OtpForm({ email, contactMethod, onSuccess }: OtpProps) {
         });
         return;
       }
-      onSuccess();
+      onSuccess(payload ?? {});
     } catch {
       apiErrorToast(new Error("Could not reach the server. Check your connection."));
     } finally {
@@ -102,31 +115,10 @@ export function OtpForm({ email, contactMethod, onSuccess }: OtpProps) {
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className={cn("grid gap-4")} noValidate>
-      <div className="grid gap-2">
-        <Label>Verification code sent via</Label>
-        <Tabs defaultValue={contactMethod} className="w-full">
-          <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="email">
-              <MailIcon className="mr-2 h-4 w-4" aria-hidden="true" />
-              Email
-            </TabsTrigger>
-            <TabsTrigger value="sms">
-              <PhoneIcon className="mr-2 h-4 w-4" aria-hidden="true" />
-              SMS
-            </TabsTrigger>
-          </TabsList>
-          <TabsContent value="email" className="mt-2 p-0">
-            <p className="text-sm text-muted-foreground">
-              Code sent to <strong>{email}</strong>
-            </p>
-          </TabsContent>
-          <TabsContent value="sms" className="mt-2 p-0">
-            <p className="text-sm text-muted-foreground">
-              Code sent via SMS (number on file)
-            </p>
-          </TabsContent>
-        </Tabs>
-      </div>
+      <p className="text-sm text-muted-foreground">
+        We sent a 6-digit code to <strong className="text-foreground">{email}</strong>. It expires
+        in 10 minutes.
+      </p>
 
       {errors.root ? (
         <Alert variant="destructive">
