@@ -39,14 +39,28 @@ export function proxy(request: NextRequest) {
     if (pathname === "/auth" || pathname.startsWith("/auth/")) {
       return NextResponse.redirect(selfUrl(request, stripPrefix(pathname, "/auth") || "/login"), 308)
     }
-    return NextResponse.rewrite(new URL(`/auth${stripPrefix(pathname, "/auth")}`, request.url))
+    // The rewrite target must carry the query string: /otp?email=… and
+    // /reset-password?token=… are how those pages receive their inputs, and a
+    // rebuilt URL silently drops them (an emailed reset link would render the
+    // empty forgot-password form instead of the set-new-password one).
+    return NextResponse.rewrite(new URL(`/auth${stripPrefix(pathname, "/auth")}${request.nextUrl.search}`, request.url))
   }
 
   if (isAdminHost) {
     // A stray auth link on the admin host must cross back to the auth origin
-    // instead of being rewritten into /admin/auth/* (which 404s).
-    if (pathname === "/auth" || pathname.startsWith("/auth/") || pathname === "/login" || pathname === "/signup") {
-      return NextResponse.redirect(authUrl(request, pathname === "/login" || pathname === "/signup" ? pathname : "/login"))
+    // instead of being rewritten into /admin/auth/* (which 404s). /otp and
+    // /reset-password are auth-host pages too — login's post-redirect and the
+    // emailed reset link live there, never under /admin.
+    if (
+      pathname === "/auth" || pathname.startsWith("/auth/") ||
+      pathname === "/login" || pathname === "/signup" ||
+      pathname === "/otp" || pathname === "/reset-password"
+    ) {
+      const authPath =
+        pathname === "/login" || pathname === "/signup" || pathname === "/otp" || pathname === "/reset-password"
+          ? pathname
+          : "/login"
+      return NextResponse.redirect(authUrl(request, authPath))
     }
     if (pathname === "/") return NextResponse.rewrite(new URL("/admin", request.url))
     return NextResponse.rewrite(new URL(`/admin${stripPrefix(pathname, "/admin")}`, request.url))
@@ -82,7 +96,7 @@ function stripPrefix(pathname: string, prefix: string): string {
  * bare host — which is exactly what multi-domain routing must never do.
  */
 function selfUrl(request: NextRequest, pathname: string): URL {
-  const url = new URL(pathname, request.url)
+  const url = new URL(pathname + request.nextUrl.search, request.url)
   const hostWithPort = request.headers.get("host")
   if (hostWithPort) url.host = hostWithPort
   return url
@@ -99,9 +113,9 @@ function authUrl(request: NextRequest, pathname: string): URL {
   const port = hostWithPort.includes(":") ? `:${hostWithPort.split(":")[1]}` : ""
   const protocol = request.nextUrl.protocol
   if (host.endsWith(".localhost") || host === "localhost" || host === "127.0.0.1") {
-    return new URL(`${protocol}//auth.localhost${port}${pathname}`)
+    return new URL(`${protocol}//auth.localhost${port}${pathname}${request.nextUrl.search}`)
   }
-  return new URL(`${protocol}//auth.${ROOT_DOMAIN}${pathname}`)
+  return new URL(`${protocol}//auth.${ROOT_DOMAIN}${pathname}${request.nextUrl.search}`)
 }
 
 export const config = {
