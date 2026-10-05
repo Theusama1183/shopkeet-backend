@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto"
 
 import { cookies } from "next/headers"
+import { NextResponse } from "next/server"
 
 export const SESSION_COOKIE = "shopkeet_session"
 /**
@@ -136,6 +137,20 @@ export function sessionCookieOptions(): {
     path: "/",
     domain: SESSION_COOKIE_DOMAIN,
   }
+}
+
+/**
+ * Sets the session cookie on a response. Server-side only (API routes).
+ */
+export function setSessionCookie(
+  response: NextResponse,
+  token: string,
+  maxAge = SESSION_MAX_AGE_SECONDS
+): void {
+  response.cookies.set(SESSION_COOKIE, token, {
+    ...sessionCookieOptions(),
+    maxAge,
+  })
 }
 
 /**

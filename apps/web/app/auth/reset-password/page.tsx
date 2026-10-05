@@ -1,13 +1,31 @@
 import type { Metadata } from "next";
 
 import { AuthShell } from "@/components/auth/auth-shell";
-import { PendingAuthFlow } from "@/components/auth/pending-auth-flow";
+import { ForgotPasswordFormClient } from "@/components/auth/forgot-password-form-client";
+import { NewPasswordFormClient } from "@/components/auth/new-password-form-client";
 
 export const metadata: Metadata = {
   title: "Reset your password · Shopkeet",
 };
 
-export default function ResetPasswordPage() {
+interface ResetPasswordPageProps {
+  searchParams: Promise<{ token?: string; sent?: string }>;
+}
+
+export default async function ResetPasswordPage({ searchParams }: ResetPasswordPageProps) {
+  const { token, sent } = await searchParams;
+
+  if (token) {
+    return (
+      <AuthShell
+        title="Set new password"
+        description="Your reset link is valid. Choose a new password below."
+      >
+        <NewPasswordFormClient token={token} />
+      </AuthShell>
+    );
+  }
+
   return (
     <AuthShell
       title="Reset your password"
@@ -21,12 +39,7 @@ export default function ResetPasswordPage() {
         </span>
       }
     >
-      <PendingAuthFlow
-        title="Password reset isn't wired up yet"
-        description="Signup accepts email and password today, but there's no reset endpoint on the API yet. We'll flip this on once the email-versus-SMS decision for verification codes lands."
-        href="/login"
-        hrefLabel="Back to log in"
-      />
+      <ForgotPasswordFormClient sent={sent === "true"} />
     </AuthShell>
   );
 }

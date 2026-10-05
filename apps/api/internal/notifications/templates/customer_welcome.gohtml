@@ -1,0 +1,51 @@
+{{define "content"}}
+<!-- Customer Welcome Email -->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+  <tr>
+    <td style="text-align:center;padding-bottom:32px;">
+      <div style="display:inline-block;width:72px;height:72px;border-radius:50%;background:#3b82f6;display:flex;align-items:center;justify-content:center;margin-bottom:24px;">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+          <circle cx="12" cy="7" r="4"/>
+        </svg>
+      </div>
+      <h1 style="margin:0 0 8px 0;font-size:28px;font-weight:700;color:#111827;letter-spacing:-0.02em;">Welcome to {{.StoreName}}!</h1>
+      <p style="margin:0;font-size:16px;color:#6b7280;">Thanks for creating an account</p>
+    </td>
+  </tr>
+  
+  <tr>
+    <td style="padding-bottom:24px;">
+      <p style="margin:0 0 16px 0;font-size:16px;color:#374151;">Hi there,</p>
+      <p style="margin:0 0 16px 0;font-size:16px;color:#374151;">Your account is now set up and ready to go. Here&rsquo;s what you can do:</p>
+      
+      <ul style="margin:0 0 24px 0;padding-left:24px;font-size:16px;color:#374151;line-height:2;">
+        <li style="margin-bottom:8px;">Track your orders in real time</li>
+        <li style="margin-bottom:8px;">Save multiple shipping addresses</li>
+        <li style="margin-bottom:8px;">Reorder with one click</li>
+        <li style="margin-bottom:8px;">Get exclusive updates and offers</li>
+      </ul>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td align="center">
+            <a href="{{.StoreURL}}/account" style="display:inline-block;background:#111827;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;padding:14px 32px;border-radius:8px;text-align:center;">
+              Go to your account
+            </a>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  
+  <tr>
+    <td style="padding-top:24px;">
+      <p style="margin:0;font-size:14px;color:#6b7280;text-align:center;">Questions? We&rsquo;re here to help. <a href="mailto:{{.ReplyTo}}" style="color:#3b82f6;">Contact support</a></p>
+    </td>
+  </tr>
+</table>
+{{end}}

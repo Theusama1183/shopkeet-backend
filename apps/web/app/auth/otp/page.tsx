@@ -1,31 +1,43 @@
 import type { Metadata } from "next";
+import { redirect } from "next/navigation";
 
 import { AuthShell } from "@/components/auth/auth-shell";
-import { PendingAuthFlow } from "@/components/auth/pending-auth-flow";
+import { OtpFormClient } from "@/components/auth/otp-form-client";
 
 export const metadata: Metadata = {
   title: "Verify your account · Shopkeet",
 };
 
-export default function OtpPage() {
+interface OtpPageProps {
+  searchParams: Promise<{ email?: string; method?: "email" | "sms" }>;
+}
+
+export default async function OtpPage({ searchParams }: OtpPageProps) {
+  const { email, method } = await searchParams;
+
+  if (!email) {
+    redirect("/login");
+  }
+
+  const contactMethod = method === "sms" ? "sms" : "email";
+
   return (
     <AuthShell
       title="Verify your account"
-      description="Enter the code we sent you to finish logging in."
+      description="Enter the 6-digit code we sent to complete your login."
       footer={
         <span>
-          No code yet? Go back to{" "}
+          No code yet?{" "}
           <a className="font-medium text-foreground underline underline-offset-3" href="/login">
-            log in
+            Go back to log in
           </a>
           .
         </span>
       }
     >
-      <PendingAuthFlow
-        title="Two-factor codes aren't live yet"
-        description="The API doesn't deliver OTP codes yet — the Email-versus-SMS decision is still open (see the 13-spec). Until then, email and password keep working as usual."
-        href="/login"
+      <OtpFormClient
+        email={email}
+        contactMethod={contactMethod}
       />
     </AuthShell>
   );

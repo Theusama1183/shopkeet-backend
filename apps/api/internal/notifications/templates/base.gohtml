@@ -1,0 +1,83 @@
+{{define "base"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light">
+  <meta name="supported-color-schemes" content="light">
+  <title>{{.Subject}}</title>
+  <!--[if mso]>
+  <noscript>
+    <xml>
+      <o:OfficeDocumentSettings>
+        <o:PixelsPerInch>96</o:PixelsPerInch>
+      </o:OfficeDocumentSettings>
+    </xml>
+  </noscript>
+  <![endif]-->
+</head>
+<body style="margin:0;padding:0;background-color:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;line-height:1.6;color:#1f2937;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
+  <!--[if mso]>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+    <tr><td>
+  <![endif]-->
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f3f4f6;padding:40px 16px;">
+    <tr>
+      <td align="center">
+        <!--[if mso]>
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0">
+          <tr><td>
+        <![endif]-->
+        <table role="presentation" width="100%" max-width="600" cellpadding="0" cellspacing="0" border="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+          
+          <!-- Header -->
+          <tr>
+            <td style="background:linear-gradient(135deg,#111827 0%,#1f2937 100%);padding:32px 40px;text-align:center;">
+              <a href="{{.StoreURL}}" style="display:inline-block;text-decoration:none;color:#ffffff;font-size:24px;font-weight:700;letter-spacing:-0.02em;">
+                {{.StoreName}}
+              </a>
+            </td>
+          </tr>
+          
+          <!-- Content -->
+          <tr>
+            <td style="padding:40px;">
+              {{template "content" .}}
+            </td>
+          </tr>
+          
+          <!-- Footer -->
+          <tr>
+            <td style="background-color:#f9fafb;padding:24px 40px;border-top:1px solid #e5e7eb;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="font-size:13px;color:#6b7280;text-align:center;">
+                    <p style="margin:0 0 8px 0;">This email was sent to <strong>{{.Recipient}}</strong> from {{.StoreName}}.</p>
+                    <p style="margin:0 0 8px 0;">
+                      <a href="{{.StoreURL}}" style="color:#6b7280;text-decoration:underline;">Visit store</a>
+                      <span style="margin:0 8px;color:#d1d5db;">|</span>
+                      <a href="mailto:{{.ReplyTo}}" style="color:#6b7280;text-decoration:underline;">Contact support</a>
+                    </p>
+                    <p style="margin:8px 0 0 0;color:#9ca3af;">&copy; {{.Year}} {{.StoreName}}. All rights reserved.</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          
+        </table>
+        <!--[if mso]>
+          </td></tr>
+        </table>
+        <![endif]-->
+      </td>
+    </tr>
+  </table>
+  <!--[if mso]>
+    </td></tr>
+  </table>
+  <![endif]-->
+</body>
+</html>
+{{end}}

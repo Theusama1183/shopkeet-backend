@@ -1,0 +1,48 @@
+{{define "content"}}
+<!-- OTP Email -->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+  <tr>
+    <td style="text-align:center;padding-bottom:32px;">
+      <div style="display:inline-block;width:72px;height:72px;border-radius:50%;background:#111827;display:flex;align-items:center;justify-content:center;margin-bottom:24px;">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="2" y="5" width="20" height="14" rx="2"/>
+          <path d="M2 10h20M2 14h20M2 18h20"/>
+        </svg>
+      </div>
+      <h1 style="margin:0 0 8px 0;font-size:28px;font-weight:700;color:#111827;letter-spacing:-0.02em;">Your verification code</h1>
+      <p style="margin:0;font-size:16px;color:#6b7280;">Enter this 6-digit code to complete your login</p>
+    </td>
+  </tr>
+  
+  <tr>
+    <td style="padding:24px 0 32px 0;">
+      <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;padding:24px;text-align:center;">
+        <div style="font-family:'SF Mono','Fira Code','Fira Mono',Menlo,Consolas,monospace;font-size:36px;font-weight:700;letter-spacing:8px;color:#111827;background:#ffffff;border:1px solid #e5e7eb;border-radius:8px;padding:16px 24px;display:inline-block;min-width:280px;text-align:center;word-break:break-all;">
+          {{.Code}}
+        </div>
+        <p style="margin:16px 0 0 0;font-size:14px;color:#9ca3af;">This code expires in <strong>10 minutes</strong></p>
+      </div>
+    </td>
+  </tr>
+  
+  <tr>
+    <td style="padding-top:8px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td align="center">
+            <a href="{{.StoreURL}}/login" style="display:inline-block;background:#111827;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;padding:14px 32px;border-radius:8px;text-align:center;">
+              Open login page
+            </a>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  
+  <tr>
+    <td style="padding-top:24px;">
+      <p style="margin:0;font-size:14px;color:#6b7280;text-align:center;">Didn&rsquo;t request this code? You can safely ignore this email &mdash; no account changes will be made without verification.</p>
+    </td>
+  </tr>
+</table>
+{{end}}

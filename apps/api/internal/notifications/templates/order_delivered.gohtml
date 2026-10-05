@@ -1,0 +1,45 @@
+{{define "content"}}
+<!-- Order Delivered Email -->
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+  <tr>
+    <td style="text-align:center;padding-bottom:32px;">
+      <div style="display:inline-block;width:72px;height:72px;border-radius:50%;background:#111827;display:flex;align-items:center;justify-content:center;margin-bottom:24px;">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+      </div>
+      <h1 style="margin:0 0 8px 0;font-size:28px;font-weight:700;color:#111827;letter-spacing:-0.02em;">Your order has been delivered</h1>
+      <p style="margin:0;font-size:16px;color:#6b7280;">Order <strong>{{.OrderID}}</strong> is now in your hands</p>
+    </td>
+  </tr>
+  
+  <tr>
+    <td style="padding-bottom:24px;">
+      <p style="margin:0 0 16px 0;font-size:16px;color:#374151;">Hi {{.CustomerName}},</p>
+      <p style="margin:0 0 16px 0;font-size:16px;color:#374151;">Your order <strong>{{.OrderID}}</strong> has been marked as delivered. We hope you love your purchase!</p>
+    </td>
+  </tr>
+  
+  <tr>
+    <td>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+        <tr>
+          <td align="center">
+            <a href="{{.OrderURL}}" style="display:inline-block;background:#111827;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;padding:14px 32px;border-radius:8px;text-align:center;">
+              View order
+            </a>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  
+  <tr>
+    <td style="padding-top:24px;">
+      <p style="margin:0;font-size:14px;color:#6b7280;text-align:center;">Have questions about your order? <a href="mailto:{{.ReplyTo}}" style="color:#3b82f6;">Contact support</a></p>
+    </td>
+  </tr>
+</table>
+{{end}}

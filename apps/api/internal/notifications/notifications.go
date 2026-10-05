@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shopkeet/api/internal/platform/events"
@@ -236,44 +237,75 @@ func (s *Service) deliverOrder(ctx context.Context, tenantID, orderID, typ strin
 		storeName = "Shopkeet"
 	}
 
-	// Shopify-style: the store's own domain addresses the customer. Order
-	// confirmations come from the store host and replies land back on the
-	// store's support address (<subdomain>.<base>).
-	from := fmt.Sprintf("%s via Shopkeet <no-reply@%s>", storeName, s.storeHost(storeSubdomain))
-	replyTo := fmt.Sprintf("support@%s", s.storeHost(storeSubdomain))
+	baseData, from, replyTo := s.buildCommonData(tx, ctx, tenantID, storeSubdomain, recipient)
+	
+	// Load order items for the template
+	type line struct {
+		name     string
+		qty      int
+		price    int
+		currency string
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT p.name, oi.quantity, oi.price_cents, p.currency
+		FROM order_items oi
+		JOIN products p ON p.id = oi.product_id
+		WHERE oi.order_id = $1 AND oi.tenant_id = $2
+		ORDER BY p.name`, orderID, tenantID)
+	if err != nil {
+		log.Printf("[notifications] load order items %s failed: %v", orderID, err)
+	} else {
+		var itemsHTML string
+		for rows.Next() {
+			var l line
+			if err := rows.Scan(&l.name, &l.qty, &l.price, &l.currency); err == nil {
+				itemsHTML += fmt.Sprintf("<li>%dx %s — %d %s</li>", l.qty, l.name, l.qty*l.price, l.currency)
+			}
+		}
+		rows.Close()
+		baseData.ItemsHTML = itemsHTML
+	}
 
-	var subject, html string
+	var subject string
+	var renderFunc func(TemplateData) (string, error)
+	
 	switch typ {
 	case "order_confirmation":
 		subject = fmt.Sprintf("Order confirmation #%s from %s", orderID[:8], storeName)
-		html = fmt.Sprintf("<p>Hi %s,</p><p>Thanks for your order <strong>%s</strong> (total: %d %s). We'll let you know when it ships.</p>", customerName, orderID, totalCents, currency)
+		orderURL := fmt.Sprintf("%s/orders/%s", baseData.StoreURL, orderID)
+		renderFunc = func(d TemplateData) (string, error) {
+			return RenderOrderConfirmation(OrderEmailData{
+				TemplateData: d,
+				OrderID:       orderID,
+				CustomerName:  customerName,
+				TotalCents:    totalCents,
+				Currency:      currency,
+				ItemsHTML:     baseData.ItemsHTML,
+				OrderURL:      orderURL,
+				TotalFormatted: formatCurrency(totalCents, currency),
+			})
+		}
 	case "order_delivered":
 		subject = fmt.Sprintf("Your order #%s has been delivered", orderID[:8])
-		html = fmt.Sprintf("<p>Hi %s,</p><p>Your order <strong>%s</strong> has been delivered. Enjoy!</p>", customerName, orderID)
+		orderURL := fmt.Sprintf("%s/orders/%s", baseData.StoreURL, orderID)
+		renderFunc = func(d TemplateData) (string, error) {
+			return RenderOrderDelivered(OrderEmailData{
+				TemplateData: d,
+				OrderID:       orderID,
+				CustomerName:  customerName,
+				OrderURL:      orderURL,
+			})
+		}
 	default:
 		return
 	}
 
-	status := "sent"
-	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := s.prov.Send(sendCtx, Notification{
-		TenantID:  tenantID,
-		Type:      typ,
-		Recipient: recipient,
-		From:      from,
-		ReplyTo:   replyTo,
-		OrderID:   orderID,
-		Subject:   subject,
-		Body:      html,
-	}); err != nil {
-		status = "failed"
+	status, err := s.renderAndSend(ctx, tenantID, typ, recipient, from, replyTo, subject, renderFunc, baseData)
+	if err != nil {
 		log.Printf("[notifications] %s send failed for order %s: %v", typ, orderID, err)
 	}
 
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO notification_log (tenant_id, notification_type, recipient, order_id, status)
-		VALUES ($1, $2, $3, $4, $5)`, tenantID, typ, recipient, orderID, status); err != nil {
+	if err := s.logNotification(tx, ctx, tenantID, typ, recipient, orderID, status); err != nil {
 		log.Printf("[notifications] log insert failed: %v", err)
 		return
 	}
@@ -303,34 +335,23 @@ func (s *Service) deliverWelcome(ctx context.Context, tenantID, email string) {
 		storeName = "Shopkeet"
 	}
 
-	// Account emails come from the platform brand but still let the customer
-	// reply on the store's own support address.
-	from := fmt.Sprintf("%s via Shopkeet <no-reply@%s>", storeName, s.storeHost(storeSubdomain))
-	replyTo := fmt.Sprintf("support@%s", s.storeHost(storeSubdomain))
-
+	baseData, from, replyTo := s.buildCommonData(tx, ctx, tenantID, storeSubdomain, email)
+	
 	subject := fmt.Sprintf("Welcome to %s!", storeName)
-	html := fmt.Sprintf("<p>Hi,</p><p>Thanks for creating an account at <strong>%s</strong>. You can now track orders and save addresses.</p>", storeName)
+	
+	renderFunc := func(d TemplateData) (string, error) {
+		return RenderCustomerWelcome(WelcomeData{
+			TemplateData: d,
+			StoreURL:     baseData.StoreURL,
+		})
+	}
 
-	status := "sent"
-	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := s.prov.Send(sendCtx, Notification{
-		TenantID:  tenantID,
-		Type:      "customer_welcome",
-		Recipient: email,
-		From:      from,
-		ReplyTo:   replyTo,
-		OrderID:   "",
-		Subject:   subject,
-		Body:      html,
-	}); err != nil {
-		status = "failed"
+	status, err := s.renderAndSend(ctx, tenantID, "customer_welcome", email, from, replyTo, subject, renderFunc, baseData)
+	if err != nil {
 		log.Printf("[notifications] welcome send failed: %v", err)
 	}
 
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO notification_log (tenant_id, notification_type, recipient, order_id, status)
-		VALUES ($1, 'customer_welcome', $2, NULL, $3)`, tenantID, email, status); err != nil {
+	if err := s.logNotification(tx, ctx, tenantID, "customer_welcome", email, "", status); err != nil {
 		log.Printf("[notifications] log insert failed: %v", err)
 		return
 	}
@@ -408,6 +429,8 @@ func (s *Service) deliverBackInStock(ctx context.Context, tenantID, variantID, p
 	replyTo := fmt.Sprintf("support@%s", s.storeHost(storeSubdomain))
 	storeURL := fmt.Sprintf("https://%s", s.storeHost(storeSubdomain))
 
+	baseData, _, _ := s.buildCommonData(tx, ctx, tenantID, storeSubdomain, "")
+	
 	for _, x := range subs {
 		tag, err := tx.Exec(ctx, `
 			UPDATE back_in_stock_subscriptions
@@ -422,29 +445,24 @@ func (s *Service) deliverBackInStock(ctx context.Context, tenantID, variantID, p
 		}
 
 		subject := fmt.Sprintf("Back in stock at %s", storeName)
-		html := fmt.Sprintf(
-			"<p>Hi,</p><p><strong>%s</strong> is back in stock at <strong>%s</strong>.</p><p><a href=\"%s\">Shop now</a></p>",
-			productName, storeName, storeURL)
+		
+		subData := baseData
+		subData.Recipient = x.email
+		
+		renderFunc := func(d TemplateData) (string, error) {
+			return RenderBackInStock(BackInStockData{
+				TemplateData: d,
+				ProductName:  productName,
+				StoreURL:     storeURL,
+			})
+		}
 
-		status := "sent"
-		sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		if err := s.prov.Send(sendCtx, Notification{
-			TenantID:  tenantID,
-			Type:      "back_in_stock",
-			Recipient: x.email,
-			From:      from,
-			ReplyTo:   replyTo,
-			Subject:   subject,
-			Body:      html,
-		}); err != nil {
-			status = "failed"
+		status, err := s.renderAndSend(ctx, tenantID, "back_in_stock", x.email, from, replyTo, subject, renderFunc, subData)
+		if err != nil {
 			log.Printf("[notifications] back_in_stock send failed for %s: %v", x.email, err)
 		}
-		cancel()
 
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO notification_log (tenant_id, notification_type, recipient, status)
-			VALUES ($1, 'back_in_stock', $2, $3)`, tenantID, x.email, status); err != nil {
+		if err := s.logNotification(tx, ctx, tenantID, "back_in_stock", x.email, "", status); err != nil {
 			log.Printf("[notifications] log insert failed: %v", err)
 		}
 	}
@@ -531,38 +549,32 @@ func (s *Service) SendCartAbandoned(ctx context.Context, tenantID, cartID string
 		storeName = "Shopkeet"
 	}
 
-	from := fmt.Sprintf("%s via Shopkeet <no-reply@%s>", storeName, s.storeHost(storeSubdomain))
-	replyTo := fmt.Sprintf("support@%s", s.storeHost(storeSubdomain))
-	cartURL := fmt.Sprintf("https://%s/cart", s.storeHost(storeSubdomain))
-
+	baseData, from, replyTo := s.buildCommonData(tx, ctx, tenantID, storeSubdomain, emailAddr)
+	
 	var itemsHTML string
 	for _, l := range lines {
 		itemsHTML += fmt.Sprintf("<li>%dx %s — %d %s</li>", l.qty, l.name, l.qty*l.price, l.currency)
 	}
+	baseData.ItemsHTML = itemsHTML
+	
+	cartURL := fmt.Sprintf("https://%s/cart", s.storeHost(storeSubdomain))
 	subject := fmt.Sprintf("Your cart is waiting at %s", storeName)
-	html := fmt.Sprintf(
-		"<p>Hi,</p><p>You left a few things in your cart at <strong>%s</strong>. They're saved — ready to finish when you are.</p><ul>%s</ul><p><strong>Total: %d %s</strong></p><p><a href=\"%s\">Return to your cart</a></p>",
-		storeName, itemsHTML, total, currency, cartURL)
 
-	status := "sent"
-	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := s.prov.Send(sendCtx, Notification{
-		TenantID:  tenantID,
-		Type:      "cart_abandoned",
-		Recipient: emailAddr,
-		From:      from,
-		ReplyTo:   replyTo,
-		Subject:   subject,
-		Body:      html,
-	}); err != nil {
-		status = "failed"
+	renderFunc := func(d TemplateData) (string, error) {
+		return RenderCartAbandoned(CartAbandonedData{
+			TemplateData:    d,
+			ItemsHTML:       baseData.ItemsHTML,
+			TotalFormatted:  formatCurrency(total, currency),
+			CartURL:         cartURL,
+		})
+	}
+
+	status, err := s.renderAndSend(ctx, tenantID, "cart_abandoned", emailAddr, from, replyTo, subject, renderFunc, baseData)
+	if err != nil {
 		log.Printf("[notifications] cart_abandoned send failed for cart %s: %v", cartID, err)
 	}
 
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO notification_log (tenant_id, notification_type, recipient, order_id, status)
-		VALUES ($1, 'cart_abandoned', $2, NULL, $3)`, tenantID, email, status); err != nil {
+	if err := s.logNotification(tx, ctx, tenantID, "cart_abandoned", emailAddr, "", status); err != nil {
 		log.Printf("[notifications] log insert failed: %v", err)
 		return
 	}
@@ -570,6 +582,63 @@ func (s *Service) SendCartAbandoned(ctx context.Context, tenantID, cartID string
 	if err := tx.Commit(ctx); err != nil {
 		log.Printf("[notifications] commit failed: %v", err)
 	}
+}
+
+// buildCommonData builds the common TemplateData for a tenant
+func (s *Service) buildCommonData(tx pgx.Tx, ctx context.Context, tenantID, storeSubdomain, recipient string) (TemplateData, string, string) {
+	var storeName string
+	_ = tx.QueryRow(ctx, `SELECT name FROM tenants WHERE id = $1`, tenantID).Scan(&storeName)
+	if storeName == "" {
+		storeName = "Shopkeet"
+	}
+	
+	storeHost := s.storeHost(storeSubdomain)
+	storeURL := fmt.Sprintf("https://%s", storeHost)
+	from := fmt.Sprintf("%s via Shopkeet <no-reply@%s>", storeName, storeHost)
+	replyTo := fmt.Sprintf("support@%s", storeHost)
+	
+	data := TemplateData{
+		StoreName:     storeName,
+		StoreSubdomain: storeSubdomain,
+		StoreURL:      storeURL,
+		ReplyTo:       replyTo,
+		Recipient:     recipient,
+		Year:          time.Now().Year(),
+	}
+	
+	return data, from, replyTo
+}
+
+// renderAndSend renders a template and sends the notification
+func (s *Service) renderAndSend(ctx context.Context, tenantID, typ, recipient, from, replyTo, subject string, renderFunc func(TemplateData) (string, error), baseData TemplateData) (string, error) {
+	html, err := renderFunc(baseData)
+	if err != nil {
+		return "failed", err
+	}
+	
+	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	
+	if err := s.prov.Send(sendCtx, Notification{
+		TenantID:  tenantID,
+		Type:      typ,
+		Recipient: recipient,
+		From:      from,
+		ReplyTo:   replyTo,
+		Subject:   subject,
+		Body:      html,
+	}); err != nil {
+		return "failed", err
+	}
+	return "sent", nil
+}
+
+// logNotification logs the notification attempt
+func (s *Service) logNotification(tx pgx.Tx, ctx context.Context, tenantID, typ, recipient, orderID, status string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO notification_log (tenant_id, notification_type, recipient, order_id, status)
+		VALUES ($1, $2, $3, $4, $5)`, tenantID, typ, recipient, orderID, status)
+	return err
 }
 
 // storeHost builds the public host for a tenant storefront: <sub>.<base>. The
