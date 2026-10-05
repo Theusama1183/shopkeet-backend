@@ -6,10 +6,26 @@ This is the contract Frontend and Backend agents build against in parallel — i
 
 ## Auth
 
+The merchant is the **account** (email + password); a store is a tenant the account owns or staffs. A merchant on a paid plan can run several stores, so login authenticates the account and never asks which store — it returns every store the account can open.
+
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/auth/signup` | Public | Create a tenant + owner user in one transaction |
-| POST | `/auth/login` | Public | Returns a JWT (`tenant_id`, `user_id`, `role`) |
+| POST | `/auth/signup` | Public | Create an account, a provisional store and its owner membership in one transaction. Body `{email, password}` — no store name, no subdomain. Returns `{token, user, store, onboarding_completed:false, expires}`; the session is flagged for the one-time onboarding wizard |
+| POST | `/auth/login` | Public | Body `{email, password}`. Returns `{user, stores[]}`. **One store:** also returns `token` + `store` + `onboarding_completed`. **Several stores:** no tenant JWT — only a 10-minute `store_pick_token` |
+| GET | `/auth/stores` | store_pick token or merchant JWT | List the stores an authenticated account can open: `{stores[]}` |
+| POST | `/auth/select-store` | store_pick token or merchant JWT | Exchange a store pick for a tenant session. Body `{tenant_id}`; membership is re-checked, so a ticket alone grants nothing. Returns `{token, user, store, onboarding_completed, expires}` |
+
+A merchant token may be used for `/auth/stores` and `/auth/select-store`, which is how a signed-in merchant switches stores without logging in again.
+
+### Store onboarding
+
+`tenants.onboarding_completed` is `false` only for a store created by signup. While it is false the admin surface routes the merchant through the one-time wizard; after completion it is `true` forever.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/tenant/onboarding/complete` | Admin | Closes the wizard: flips `onboarding_completed`, returns a refreshed `token` plus the settings, so the session stops asking for the wizard. Idempotent |
+
+`GET/PATCH /tenant/settings` also carries `onboarding_completed`, and `PATCH /tenant/settings` now accepts `subdomain` — that is where a merchant claims their store link (normalised to lowercase; `409` when taken).
 
 ## Media (Cloudflare R2)
 
@@ -88,7 +104,7 @@ Merchants attach a carrier + tracking number as an order advances to `shipped`; 
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | PATCH | `/orders/:id/status` | Admin | Existing transition body, now also accepting optional `tracking_number`, `tracking_carrier`, `tracking_url`. Persisted on **advance** transitions (not cancelled); absent fields preserved; `""` clears. |
-| GET | `/orders/:id` | Customer | Response includes `tracking_number`, `tracking_carrier`, `tracking_url`. |
+| GET | `/orders/:id` | Admin **or** Customer | Order detail. Admin (Phase B admin pages): any order in the tenant by id, `internal_note` included. Customer: id + `?phone=`, optional `?email=` (verified) → `404` on mismatch. |
 | GET | `/orders/:id/invoice.pdf` | Admin **or** Customer (`?phone=` lookup) | `application/pdf` body starting `%PDF-`. Admin = by id only. Customer path requires the matching `?phone=` → `404` on mismatch. |
 
 ## Wishlist (Phase 22)
@@ -129,9 +145,10 @@ Merchants tune the program via `loyalty_points_per_currency_unit` (points earned
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | POST | `/checkout` | Customer | Validates stock, creates the order (`payment_method=cod`), decrements inventory, clears cart |
-| GET | `/orders/:id` | Customer | Order lookup by id + phone/email |
-| GET | `/orders` | Admin | List tenant's orders, filterable by status |
+| GET | `/orders/:id` | Admin **or** Customer | Order detail. Admin: by id, `internal_note` included. Customer: id + `?phone=` (verifed), optional `?email=` |
+| GET | `/orders` | Admin | List tenant's orders, each filter optional and combinable: `?status=`, `?payment_status=`, `?source=` (the Drafts view uses `source=draft`) |
 | PATCH | `/orders/:id/status` | Admin | Move order through `pending → confirmed → shipped → delivered`; `delivered` sets `payment_status=paid` |
+| GET | `/carts/abandoned` | Admin | Unconverted checkouts — carts with a captured `customer_email` that still have items (checkout deletes the cart, so a surviving row with lines produced no order). `{carts:[{id, customer_email, created_at, last_activity_at, recovery_sent_at, item_count, total_cents}]}` |
 
 ## Content & Page Builder
 

@@ -19,25 +19,61 @@ CREATE TABLE tenants (
   subdomain TEXT UNIQUE NOT NULL,
   custom_domain TEXT UNIQUE,
   status TEXT NOT NULL DEFAULT 'active', -- active, suspended
+  -- false only for a store created by signup: the one-time wizard sets it true.
+  onboarding_completed BOOLEAN NOT NULL DEFAULT true,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- ============================================================
--- Tenants & Auth (Phase 1)
+-- Tenants & Auth (Phase 1 + multi-store identity, migration 0034)
 -- ============================================================
+
+-- The login identity: one row per merchant account (email + password), holding
+-- every store that account can open. Deliberately NOT RLS-scoped, for the same
+-- reason `tenants` is not: login must resolve an account before any tenant
+-- scope exists. No merchant business data lives here — only an identity and a
+-- password hash, reachable solely after a password check.
+CREATE TABLE merchant_accounts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Case-insensitive: one address must not be able to hold two accounts.
+CREATE UNIQUE INDEX merchant_accounts_email_key ON merchant_accounts (lower(email));
 
 CREATE TABLE merchant_users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id),
+  -- The account this membership belongs to. Same person in several stores =
+  -- several merchant_users rows sharing one account_id.
+  account_id UUID NOT NULL REFERENCES merchant_accounts(id),
   email TEXT NOT NULL,
-  password_hash TEXT NOT NULL,
+  password_hash TEXT NOT NULL,   -- mirrors merchant_accounts; auth reads the account's
   role TEXT NOT NULL DEFAULT 'owner', -- owner, staff
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (tenant_id, email)
+  UNIQUE (tenant_id, email),
+  -- One membership per (account, store); also the FK target below.
+  UNIQUE (account_id, tenant_id)
 );
 ALTER TABLE merchant_users ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON merchant_users
   USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+
+-- An account's stores and its role in each — the login-side view of the same
+-- memberships, readable before a tenant scope exists. The FK into
+-- merchant_users means a mapping row cannot exist without a real membership;
+-- role is written to both tables in one transaction by the API.
+CREATE TABLE merchant_account_stores (
+  account_id UUID NOT NULL,
+  tenant_id UUID NOT NULL,
+  role TEXT NOT NULL DEFAULT 'owner', -- owner, staff
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, tenant_id),
+  CONSTRAINT merchant_account_stores_membership_fk
+    FOREIGN KEY (account_id, tenant_id)
+    REFERENCES merchant_users (account_id, tenant_id) ON DELETE CASCADE
+);
 
 -- ============================================================
 -- Media library — Cloudflare R2 (Phase 2)

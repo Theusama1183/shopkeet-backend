@@ -16,6 +16,12 @@ import (
 //   - customer tokens: scope="customer", customer_id (the tenant's shoppers)
 //   - affiliate tokens: scope="affiliate", affiliate_id (the tenant's partners)
 //
+// plus two auth-flow tokens that are not identities in themselves:
+//
+//   - store_pick: scope="store_pick", account_id only. Minted after login when an
+//     account owns more than one store, so the browser can ask for the store list
+//     and exchange it for a tenant token without re-sending the password.
+//
 // Middleware checks scope per route group so a customer token can never pass an
 // Admin check and an affiliate token can never pass a merchant- or
 // customer-scoped route.
@@ -25,18 +31,58 @@ type Claims struct {
 	Role       string `json:"role"`
 	CustomerID string `json:"customer_id"`
 	AffiliateID string `json:"affiliate_id"`
-	Scope      string `json:"scope"`
+	// AccountID is the merchant account (email identity) the token belongs to.
+	// Empty on customer/affiliate tokens. Present on merchant and store_pick
+	// tokens so a signed-in merchant can list and switch stores.
+	AccountID string `json:"account_id,omitempty"`
+	// OnboardingCompleted is a POINTER on purpose. Tokens minted before the
+	// one-time wizard existed — and every token from Sign, which many tests
+	// still use — decode to nil, and nil means "already onboarded". Only the
+	// signup path sets an explicit false, so the admin guard never bounces an
+	// existing merchant into the wizard on a missing claim.
+	OnboardingCompleted *bool  `json:"onboarding_completed,omitempty"`
+	Scope               string `json:"scope"`
 	jwt.RegisteredClaims
 }
 
-// Sign mints a merchant-scoped tenant JWT. ttl is usually 24h.
+// Sign mints a merchant-scoped tenant JWT. ttl is usually 24h. It is the
+// no-onboarding, no-account form kept for existing callers (and tests); new auth
+// paths use SignMerchant so the guard can see the wizard state.
 func Sign(secret, tenantID, userID, role string, ttl time.Duration) (string, error) {
+	return SignMerchant(secret, tenantID, userID, "", role, nil, ttl)
+}
+
+// SignMerchant mints a merchant-scoped tenant JWT carrying the account identity
+// and the store's onboarding state. Pass onboarding == nil for a token whose
+// onboarding state is unknown (treated as onboarded).
+func SignMerchant(secret, tenantID, userID, accountID, role string, onboarding *bool, ttl time.Duration) (string, error) {
 	now := time.Now()
 	claims := Claims{
-		TenantID: tenantID,
-		UserID:   userID,
-		Role:     role,
-		Scope:    "merchant",
+		TenantID:            tenantID,
+		UserID:              userID,
+		Role:                role,
+		AccountID:           accountID,
+		OnboardingCompleted: onboarding,
+		Scope:               "merchant",
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			Issuer:    "shopkeet",
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+}
+
+// SignStorePick mints the short-lived ticket that stands in for the password
+// between a successful login and the merchant picking one of their stores. It
+// carries an account id and nothing else: no tenant, no role, so it cannot be
+// used to act on a store until SelectStore exchanges it for a merchant token.
+// ttl is deliberately short (minutes, not hours).
+func SignStorePick(secret, accountID string, ttl time.Duration) (string, error) {
+	now := time.Now()
+	claims := Claims{
+		AccountID: accountID,
+		Scope:     "store_pick",
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
@@ -94,4 +140,29 @@ func Parse(secret, token string) (*Claims, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// ParseStorePickAuthorizes reports whether token may act on behalf of an account
+// for store selection, and returns that account id. It accepts two token kinds:
+// the store_pick ticket minted by login, and an already-issued merchant token —
+// so a signed-in merchant can switch stores from the sidebar without re-entering
+// a password. A token with no account id, or any other scope (customer,
+// affiliate), is refused.
+func ParseStorePickAuthorizes(secret, token string) (string, bool) {
+	claims, err := Parse(secret, token)
+	if err != nil || claims.AccountID == "" {
+		return "", false
+	}
+	switch claims.Scope {
+	case "store_pick", "merchant":
+		return claims.AccountID, true
+	}
+	return "", false
+}
+
+// NeedsOnboarding reports whether this token's bearer must still run the one-time
+// store wizard. Only an explicit onboarding_completed=false qualifies; a nil claim
+// (an older token, or one from Sign) counts as onboarded.
+func NeedsOnboarding(claims *Claims) bool {
+	return claims.OnboardingCompleted != nil && !*claims.OnboardingCompleted
 }

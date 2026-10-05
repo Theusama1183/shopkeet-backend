@@ -605,17 +605,32 @@ func distinctBundleIDs(lines []line) []string {
 
 // --- customer order lookup -----------------------------------------------------
 
-// GetOrder handles GET /orders/:id (Customer). Verified by phone (required)
-// and, if provided, email in query params — a random order id alone reveals
-// nothing, and the tenant header + RLS scope the lookup to this store.
+// GetOrder handles GET /orders/:id (Merchant or Customer, via
+// MerchantOrCustomerMW). A merchant reads any order in the tenant — the admin
+// order-detail page, internal note included. A customer's view is verified by
+// phone (required) and, if provided, email in query params — a random order id
+// alone reveals nothing, and the tenant header + RLS scope the lookup to this
+// store.
 func (s *Service) GetOrder(c *fiber.Ctx) error {
-	phone := c.Query("phone")
-	if phone == "" {
-		return httperr.C(fiber.StatusBadRequest, "phone query param required")
-	}
 	tx, ok := txFrom(c)
 	if !ok {
 		return httperr.ErrInternalServerError
+	}
+
+	if actor, _ := c.Locals("actor").(string); actor == "merchant" {
+		order, err := loadOrder(c, tx, "id = $1", c.Params("id"))
+		if err != nil {
+			return httperr.ErrInternalServerError
+		}
+		if order == nil {
+			return httperr.C(fiber.StatusNotFound, "order not found")
+		}
+		return c.JSON(orderJSON(order, true))
+	}
+
+	phone := c.Query("phone")
+	if phone == "" {
+		return httperr.C(fiber.StatusBadRequest, "phone query param required")
 	}
 	var order *orderRow
 	var err error
@@ -786,10 +801,22 @@ func (s *Service) ListOrders(c *fiber.Ctx) error {
 
 	where := "1 = 1"
 	var args []any
-	if st := c.Query("status"); st != "" {
-		where = "status = $1"
-		args = append(args, st)
+	add := func(column, raw string) {
+		if raw == "" {
+			return
+		}
+		args = append(args, raw)
+		if where == "1 = 1" {
+			where = column + " = $" + fmt.Sprintf("%d", len(args))
+		} else {
+			where += " AND " + column + " = $" + fmt.Sprintf("%d", len(args))
+		}
 	}
+	// Admin list filters, each optional and combined with AND. `source` powers
+	// the Drafts view ('draft'), payment_status the orders list's filter bar.
+	add("status", c.Query("status"))
+	add("payment_status", c.Query("payment_status"))
+	add("source", c.Query("source"))
 	rows, err := tx.Query(ctx, orderSelect+" WHERE "+where+" ORDER BY created_at DESC, id", args...)
 	if err != nil {
 		return httperr.ErrInternalServerError

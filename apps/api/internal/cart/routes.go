@@ -46,4 +46,8 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, svc 
 	g.Patch("/items/:id", svc.UpdateItemQuantity)
 	g.Delete("/items/:id", svc.RemoveItem)
 	g.Post("/email", svc.CaptureEmail)
+
+	// Admin surface (Phase A/B admin pages): the abandoned-checkouts list. A
+	// merchant Bearer token scopes the query to their tenant via TenantMW.
+	router.Get("/carts/abandoned", auth.TenantMW(pool, secret), svc.ListAbandoned)
 }

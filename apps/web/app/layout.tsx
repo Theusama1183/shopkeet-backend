@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+
+import { TooltipProvider } from "@/components/ui/tooltip";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -27,7 +29,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full flex flex-col">
+        {/* One provider for every Tooltip in the app — shadcn's sidebar menu
+            buttons and the sales chart both render <Tooltip> directly, and
+            without an ancestor provider they throw at render. */}
+        <TooltipProvider>{children}</TooltipProvider>
+      </body>
     </html>
   );
 }

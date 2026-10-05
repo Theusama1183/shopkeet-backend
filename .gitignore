@@ -5,3 +5,5 @@ tmp/
 *.exe
 !shopkeet-agents-package/**
 .DS_Store
+# local compiled test/regression binaries
+*-linux

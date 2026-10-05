@@ -109,8 +109,10 @@ export async function apiRequest<T>(
       body: body !== undefined ? JSON.stringify(body) : undefined,
     })
   } catch {
+    // 503, never 0: this status gets forwarded into a ResponseInit by route
+    // handlers, and Next throws "status must be in the range of 200 to 599" on 0.
     throw new ApiError({
-      status: 0,
+      status: 503,
       code: "network_error",
       message: "Could not reach the Shopkeet API. Check your connection and try again.",
     })
@@ -185,22 +187,64 @@ export function apiErrorToast(error: unknown): void {
    they land; below are the shared shapes every screen depends on.
 --------------------------------------------------------------------------- */
 
-export interface Credentials {
+/**
+ * POST /auth/login body. The account is the identity, so there is no store
+ * field: login never asks which store, it returns every store the account owns.
+ */
+export interface LoginCredentials {
   email: string
   password: string
 }
 
-export interface AuthSession {
-  token: string
-  tenant_id: string
-  user_id: string
+/** POST /auth/signup body — the account only. The store is named in the wizard. */
+export interface SignupCredentials {
+  email: string
+  password: string
+}
+
+export interface AuthUser {
+  id: string
+  email: string
   role: string
 }
 
+/** One store an account can open, as the auth endpoints report it. */
+export interface AuthStore {
+  tenant_id: string
+  name: string
+  subdomain: string
+  role: string
+  status: string
+  onboarding_completed: boolean
+}
+
+/**
+ * The Go API's auth responses. `token` is present only when the account has
+ * exactly one store, or after a store was selected — several stores yield a
+ * short-lived `store_pick_token` instead, and the merchant picks before any
+ * tenant-scoped session exists.
+ */
+export interface AuthSession {
+  token?: string
+  user: AuthUser
+  stores: AuthStore[]
+  store?: AuthStore
+  store_pick_token?: string
+  onboarding_completed?: boolean
+  expires?: string
+}
+
+/** POST /auth/select-store body. */
+export interface SelectStoreBody {
+  tenant_id: string
+}
+
 export const authApi = {
-  login: (credentials: Credentials) => api.post<AuthSession>("/auth/login", credentials),
-  signup: (body: { store_name: string; subdomain: string; email: string; password: string }) =>
-    api.post<AuthSession>("/auth/signup", body),
+  login: (credentials: LoginCredentials) => api.post<AuthSession>("/auth/login", credentials),
+  signup: (body: SignupCredentials) => api.post<AuthSession>("/auth/signup", body),
+  stores: (token: string) => api.get<{ stores: AuthStore[] }>("/auth/stores", { token }),
+  selectStore: (body: SelectStoreBody, token: string) =>
+    api.post<AuthSession>("/auth/select-store", body, { token }),
 }
 
 export interface MediaAsset {

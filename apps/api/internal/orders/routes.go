@@ -46,8 +46,8 @@ func RegisterRoutes(router fiber.Router, pool *pgxpool.Pool, secret string, svc 
 	router.Post("/orders/:id/returns",
 		auth.MerchantOrCustomerMW(pool, secret),
 		svc.CreateReturn)
-	router.Get("/orders/:id", auth.CustomerMW(pool), svc.GetOrder)
 	router.Get("/orders/:id/invoice.pdf", auth.MerchantOrCustomerMW(pool, secret), svc.GetInvoice)
+	router.Get("/orders/:id", auth.MerchantOrCustomerMW(pool, secret), svc.GetOrder)
 	router.Post("/orders/:id/add-item", auth.CustomerMW(pool), svc.AddOrderItem)
 
 	admin := router.Group("/orders", auth.TenantMW(pool, secret))
