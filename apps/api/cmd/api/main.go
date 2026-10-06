@@ -43,6 +43,7 @@ import (
 	"github.com/shopkeet/api/internal/platform/ratelimit"
 	"github.com/shopkeet/api/internal/recommendations"
 	"github.com/shopkeet/api/internal/reviews"
+	"github.com/shopkeet/api/internal/search"
 	"github.com/shopkeet/api/internal/shipping"
 	"github.com/shopkeet/api/internal/smartcollections"
 	"github.com/shopkeet/api/internal/tenants"
@@ -330,6 +331,12 @@ func main() {
 	// Phase 24 — analytics dashboard. Merchant-only SQL aggregation over the
 	// order/cart tables that already exist; no new tables.
 	analytics.RegisterRoutes(v1, pool, cfg.JWTSecret, analytics.New(pool))
+
+	// Admin command palette — record search over products/orders/customers
+	// (0006 catalog search_vector + migration 0036 order/customer tsvectors).
+	// Merchant-only behind TenantMW; the palette proxy in the web app queries
+	// this one endpoint and gets back the three groups it renders.
+	search.RegisterRoutes(v1, pool, cfg.JWTSecret, search.New(pool))
 
 	// Phase 18 — gift cards. Admin issue/list behind TenantMW; the customer
 	// apply endpoint lives in the cart package and checkout claims the balance.

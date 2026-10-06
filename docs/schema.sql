@@ -223,11 +223,20 @@ CREATE TABLE orders (
   status TEXT NOT NULL DEFAULT 'pending', -- pending, confirmed, shipped, delivered, cancelled
   total_cents INTEGER NOT NULL,
   currency TEXT NOT NULL DEFAULT 'usd', -- tenant-configurable; illustrative default
+  search_vector TSVECTOR GENERATED ALWAYS AS (
+    to_tsvector('english',
+      coalesce(customer_name, '') || ' ' ||
+      coalesce(customer_phone, '') || ' ' ||
+      coalesce(customer_email, '') || ' ' ||
+      coalesce(shipping_address, '')
+    )
+  ) STORED,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON orders
   USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+CREATE INDEX orders_search_idx ON orders USING GIN (search_vector);
 
 CREATE TABLE order_items (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -240,6 +249,51 @@ CREATE TABLE order_items (
 ALTER TABLE order_items ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON order_items
   USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+
+-- ============================================================
+-- Customer Accounts (Phase 11)
+-- Guests (cart/checkout, customer_id NULL) stay fully supported; registered
+-- shoppers get a phone-or-email record + saved addresses. Both customer
+-- records carry the same generated search_vector the admin palette matches on
+-- (migration 0036), like orders.
+-- ============================================================
+
+CREATE TABLE customers (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL REFERENCES tenants(id),
+  email TEXT,              -- unique per tenant; NULL = no login set up yet
+  phone TEXT,
+  password_hash TEXT,      -- NULL = record not yet set up for login
+  search_vector TSVECTOR GENERATED ALWAYS AS (
+    to_tsvector('english', coalesce(email, '') || ' ' || coalesce(phone, ''))
+  ) STORED,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, email)
+);
+ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON customers
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+CREATE INDEX customers_search_idx ON customers USING GIN (search_vector);
+
+CREATE TABLE customer_addresses (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL REFERENCES tenants(id),
+  customer_id UUID NOT NULL REFERENCES customers(id),
+  label TEXT,                    -- e.g. "Home", "Office"
+  address_line1 TEXT NOT NULL,
+  address_line2 TEXT,
+  city TEXT NOT NULL,
+  state TEXT,
+  postal_code TEXT,
+  country TEXT NOT NULL,
+  is_default BOOLEAN NOT NULL DEFAULT false
+);
+ALTER TABLE customer_addresses ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON customer_addresses
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '')::uuid);
+CREATE INDEX customer_addresses_customer_idx ON customer_addresses (customer_id);
+
+ALTER TABLE orders ADD COLUMN customer_id UUID REFERENCES customers(id); -- nullable: guest checkout still allowed
 
 -- ============================================================
 -- Content & Page Builder (Phase 6)

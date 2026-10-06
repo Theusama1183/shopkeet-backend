@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { ShoppingBagIcon } from "lucide-react";
 
 import { adminRequest } from "@/lib/admin-api";
 import type { AdminProductsResponse, ShippingRatesResponse } from "@/lib/admin-types";
@@ -22,6 +23,7 @@ export default async function NewDraftPage() {
         <PageHeader
           crumbs={[{ label: "Orders", href: "/admin/orders" }, { label: "New draft" }]}
           title="New draft"
+          icon={ShoppingBagIcon}
           description="A phone or in-person sale, created by you."
         />
         <Button asChild>
@@ -36,6 +38,7 @@ export default async function NewDraftPage() {
       <PageHeader
         crumbs={[{ label: "Orders", href: "/admin/orders" }, { label: "New draft" }]}
         title="New draft"
+        icon={ShoppingBagIcon}
         description="A phone or in-person sale, created by you."
       />
       <NewDraftForm products={sellable} rates={ratesData.rates} stateRequired={ratesData.state_required} />

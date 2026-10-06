@@ -153,6 +153,19 @@ export interface AdminProductsResponse {
   products: AdminProduct[];
 }
 
+/** Grouped record search backing the admin command palette (/search). */
+export interface SearchResponse {
+  products: Array<{ id: string; name: string; status: string }>;
+  orders: Array<{
+    id: string;
+    customer_name: string;
+    status: string;
+    total_cents: number;
+    currency: string;
+  }>;
+  customers: Array<{ id: string; email: string; phone: string }>;
+}
+
 export const ORDER_SOURCES = ["storefront", "draft"] as const;
 // --- store profile (the one-time onboarding wizard + settings) ---------------
 

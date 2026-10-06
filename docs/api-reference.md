@@ -105,6 +105,14 @@ Three merchant-only aggregation endpoints over existing data — no new tables. 
 | GET | `/analytics/top-products?period=&metric=quantity\|revenue&limit=` | Admin | `{period, metric, currency, items:[{product_id, product_name, quantity, revenue_cents}]}` — best sellers grouped by product (variant sales roll up), ranked by `metric` (default `quantity`), `limit` default 10 max 50. Cancelled orders contribute nothing. |
 | GET | `/analytics/conversion?period=` | Admin | `{period, carts_created, orders_placed, conversion_rate}` — carts present vs. orders placed (incl. cancelled) in the window; `conversion_rate = orders_placed / carts_created`, 4dp. |
 
+## Record Search (Admin command palette)
+
+One merchant endpoint powering the admin search/command palette. It queries products, orders and customers in a single round trip, grouped the way the palette renders them. Each table matches on a GENERATED `search_vector` tsvector column (products: migration 0006; orders/customers: 0036) behind a GIN index, using the same `plainto_tsquery('english', q)` predicate the catalog's product list uses. Groups are always present (empty arrays when nothing matches). Merchant-only; RLS scopes every group to the caller's tenant.
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/search?q=` | Admin | `{products:[{id, name, status}], orders:[{id, customer_name, status, total_cents, currency}], customers:[{id, email, phone}]}` — newest-first matches, max 8 per group. `q` required, ≤ 100 chars; empty/over-long → `400`. |
+
 ## Order Tracking & Invoice PDF (Phase 23)
 
 Merchants attach a carrier + tracking number as an order advances to `shipped`; the customer-facing order lookup surfaces it; `invoice.pdf` streams a server-generated A4 PDF whose itemized money block derives from the same columns checkout snapshots (so the total always equals `orders.total_cents`). Tracking fields are always included on the order response (`null` until set) — nothing private to scrub.

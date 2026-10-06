@@ -245,11 +245,14 @@
 
   --chart-1: #008060;
 
-  --sidebar: #f1f1f1;
-  --sidebar-foreground: #303030;
-  --sidebar-accent: #e5e5e5;
-  --sidebar-accent-foreground: #303030;
-  --sidebar-border: #e3e3e3;
+  --sidebar: #f6f6f3;
+  --sidebar-foreground: #2f3030;
+  --sidebar-accent: #e9e9e4;
+  --sidebar-accent-foreground: #2f3030;
+  --sidebar-border: #e1e1dc;
+  --sidebar-primary: #7f22fe;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-ring: #7f22fe;
 
   /* Shopify admin density: 20px page titles, 14px body. Storefront/auth keep
      the global scale because these overrides live inside .admin-surface only. */
@@ -287,11 +290,14 @@
 
   --chart-1: #3eb68a;
 
-  --sidebar: #1a1a1a;
-  --sidebar-foreground: #ebebeb;
-  --sidebar-accent: #262626;
-  --sidebar-accent-foreground: #ebebeb;
-  --sidebar-border: #3a3a3a;
+  --sidebar: #101210;
+  --sidebar-foreground: #d0d3d0;
+  --sidebar-accent: #191c19;
+  --sidebar-accent-foreground: #f2f4f2;
+  --sidebar-border: #20241f;
+  --sidebar-primary: #ac6fff;
+  --sidebar-primary-foreground: #101228;
+  --sidebar-ring: #ac6fff;
 }
 
 /* ---------------------------------------------------------------------------

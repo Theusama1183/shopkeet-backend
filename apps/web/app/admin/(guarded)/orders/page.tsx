@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 
-import { PlusIcon } from "lucide-react";
+import { PlusIcon, ShoppingBagIcon } from "lucide-react";
 
 import { adminRequest } from "@/lib/admin-api";
 import type { AdminOrdersResponse, AbandonedCartsResponse } from "@/lib/admin-types";
@@ -37,6 +37,7 @@ export default async function OrdersPage({ searchParams }: OrdersPageProps) {
       <>
         <PageHeader
           title="Orders"
+          icon={ShoppingBagIcon}
           description="Shoppers who entered an email but never completed payment."
           actions={<OrdersViews current={view} />}
         />
@@ -59,6 +60,7 @@ export default async function OrdersPage({ searchParams }: OrdersPageProps) {
     <>
       <PageHeader
         title="Orders"
+        icon={ShoppingBagIcon}
         description={isDrafts ? "Sales you created for a phone or in-person order." : "Every order across your store."}
         actions={
           <>

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { ChevronRightIcon, FileTextIcon, HomeIcon, PackagePlusIcon, SettingsIcon } from "lucide-react";
 
 import { adminRequest } from "@/lib/admin-api";
 import { formatMoney, formatDate, formatPercent } from "@/lib/format";
@@ -8,6 +9,7 @@ import type {
   TopProductsAnalytics,
   ConversionAnalytics,
   AdminOrdersResponse,
+  AdminProductsResponse,
 } from "@/lib/admin-types";
 import { PageHeader } from "@/components/admin/page-header";
 import { StatCard } from "@/components/admin/stat-card";
@@ -29,23 +31,94 @@ interface HomePageProps {
   searchParams: Promise<{ period?: string }>;
 }
 
+const FIRST_RUN_STEPS = [
+  {
+    href: "/admin/products",
+    title: "Add your first product",
+    blurb: "Sell something you make or source — name it, price it, go live.",
+    icon: PackagePlusIcon,
+  },
+  {
+    href: "/admin/content",
+    title: "Customize your storefront",
+    blurb: "Tweak pages, copy and the feel of your shop before you share it.",
+    icon: FileTextIcon,
+  },
+  {
+    href: "/admin/settings",
+    title: "Confirm shipping & payments",
+    blurb: "Set rates and make sure cash-on-delivery is ready to take orders.",
+    icon: SettingsIcon,
+  },
+];
+
 /**
  * Home is hierarchy-first: one hero number (total sales for the period) sits
  * directly on the canvas, secondary metrics cluster beside it at a fraction of
  * its weight, and the chart is the only thing on the page worth a strong box.
  * No row of identical stat cards — that shape is what makes dashboards read as
  * generated rather than designed (docs/05).
+ *
+ * A store with nothing to report yet (no products, no orders) gets a welcome
+ * panel and a three-step checklist instead of a wall of zeroes.
  */
 export default async function HomePage({ searchParams }: HomePageProps) {
   const { period = "30d" } = await searchParams;
 
   const q = `?period=${period}`;
-  const [sales, topProducts, conversion, orders] = await Promise.all([
+  const [sales, topProducts, conversion, orders, products] = await Promise.all([
     adminRequest<SalesAnalytics>(`/analytics/sales${q}`),
     adminRequest<TopProductsAnalytics>(`/analytics/top-products${q}&limit=5`),
     adminRequest<ConversionAnalytics>(`/analytics/conversion${q}`),
     adminRequest<AdminOrdersResponse>("/orders"),
+    adminRequest<AdminProductsResponse>("/products"),
   ]);
+
+  const isFirstRun = products.products.length === 0 && orders.orders.length === 0;
+
+  if (isFirstRun) {
+    return (
+      <>
+        <PageHeader
+          title="Home"
+          icon={HomeIcon}
+          description="How your store is doing."
+          actions={<PeriodSwitcher />}
+        />
+
+        <section>
+          <h2 className="text-h2 font-semibold tracking-tight text-foreground">
+            Welcome to your new store
+          </h2>
+          <p className="mt-1 max-w-xl text-body text-muted-foreground">
+            Nothing to report yet — this canvas is yours. Three steps and you can
+            take your first order.
+          </p>
+
+          <ol className="mt-6 divide-y divide-border border-y border-border">
+            {FIRST_RUN_STEPS.map((step) => (
+              <li key={step.href}>
+                <Link
+                  href={step.href}
+                  className="group flex items-center gap-4 py-4 transition-colors hover:bg-card"
+                >
+                  <step.icon className="size-5 shrink-0 text-primary" aria-hidden="true" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-body font-medium text-foreground">{step.title}</p>
+                    <p className="mt-0.5 text-caption text-muted-foreground">{step.blurb}</p>
+                  </div>
+                  <ChevronRightIcon
+                    className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5"
+                    aria-hidden="true"
+                  />
+                </Link>
+              </li>
+            ))}
+          </ol>
+        </section>
+      </>
+    );
+  }
 
   const recent = orders.orders.slice(0, 5);
   const currency = sales.currency;
@@ -57,6 +130,7 @@ export default async function HomePage({ searchParams }: HomePageProps) {
     <>
       <PageHeader
         title="Home"
+        icon={HomeIcon}
         description="How your store is doing."
         actions={<PeriodSwitcher />}
       />
@@ -100,32 +174,32 @@ export default async function HomePage({ searchParams }: HomePageProps) {
         <div className="lg:col-span-2">
           <SalesChart buckets={sales.buckets} currency={currency} conversionRate={conversion.conversion_rate} />
         </div>
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between">
-            <CardTitle className="text-h3">Top products</CardTitle>
+
+        {/* Top products sit on the canvas — the chart is the only strong box. */}
+        <section className="lg:min-w-0">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-h3 font-medium tracking-tight text-foreground">Top products</h2>
             <span className="text-caption text-muted-foreground">{period}</span>
-          </CardHeader>
-          <CardContent className="p-4">
-            <ul className="divide-y divide-border">
-              {topProducts.items.length === 0 ? (
-                <li className="text-body text-muted-foreground">Nothing sold yet in this window.</li>
-              ) : (
-                topProducts.items.map((item, index) => (
-                  <li key={item.product_id} className="flex items-center gap-3 py-2.5">
-                    <span className="w-5 text-caption text-muted-foreground tabular-nums">{index + 1}</span>
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-body font-medium text-foreground">{item.product_name}</p>
-                      <p className="text-caption text-muted-foreground">{item.quantity} sold</p>
-                    </div>
-                    <span className="text-label font-medium text-foreground tabular-nums">
-                      {formatMoney(item.revenue_cents, currency)}
-                    </span>
-                  </li>
-                ))
-              )}
-            </ul>
-          </CardContent>
-        </Card>
+          </div>
+          <ul className="divide-y divide-border border-y border-border">
+            {topProducts.items.length === 0 ? (
+              <li className="py-3 text-body text-muted-foreground">Nothing sold yet in this window.</li>
+            ) : (
+              topProducts.items.map((item, index) => (
+                <li key={item.product_id} className="flex items-center gap-3 py-2.5">
+                  <span className="w-5 text-caption text-muted-foreground tabular-nums">{index + 1}</span>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-body font-medium text-foreground">{item.product_name}</p>
+                    <p className="text-caption text-muted-foreground">{item.quantity} sold</p>
+                  </div>
+                  <span className="text-label font-medium text-foreground tabular-nums">
+                    {formatMoney(item.revenue_cents, currency)}
+                  </span>
+                </li>
+              ))
+            )}
+          </ul>
+        </section>
       </div>
 
       <Card>

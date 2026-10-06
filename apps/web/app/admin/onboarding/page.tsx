@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
+import { StoreIcon } from "lucide-react";
 
 import { authOriginFromHost, getSession } from "@/lib/session";
 import { getTenantSettings } from "@/lib/store-actions";
@@ -36,6 +37,7 @@ export default async function OnboardingPage() {
     <div className="mx-auto w-full max-w-3xl space-y-5">
       <PageHeader
         title="Let's set up your store"
+        icon={StoreIcon}
         description="You're signed in. Tell us how your shop should look and you're straight into the dashboard."
       />
 
