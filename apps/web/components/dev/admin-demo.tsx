@@ -3,10 +3,6 @@
 import { useMemo, useState } from "react"
 import { toast } from "sonner"
 import {
-  StoreIcon,
-  UsersIcon,
-  ShoppingCartIcon,
-  DollarSignIcon,
   PackagePlusIcon,
   ArchiveIcon,
   Trash2Icon,
@@ -118,7 +114,7 @@ export function AdminDemo() {
   )
 
   return (
-    <div className="grid gap-6 rounded-lg border border-border bg-card">
+    <div className="grid gap-6 rounded-lg border border-border bg-card p-6">
       <PageHeader
         crumbs={[{ label: "Products" }]}
         title="Products"
@@ -129,30 +125,26 @@ export function AdminDemo() {
           </Button>
         }
       />
-      <div className="grid gap-3 px-6 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-x-6 gap-y-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
           label="Revenue (30d)"
           value={formatCurrency(482900)}
           trend={{ direction: "up", label: "12%", tone: "success" }}
-          icon={DollarSignIcon}
         />
         <StatCard
           label="Orders (30d)"
           value="214"
           trend={{ direction: "up", label: "8%", tone: "success" }}
-          icon={ShoppingCartIcon}
         />
         <StatCard
           label="Customers"
           value="1,029"
           trend={{ direction: "up", label: "3.2%", tone: "success" }}
-          icon={UsersIcon}
         />
         <StatCard
           label="Low-stock items"
           value="6"
           trend={{ direction: "down", label: "2 resolved", tone: "success" }}
-          icon={StoreIcon}
         />
       </div>
       <FilterBar
@@ -167,7 +159,7 @@ export function AdminDemo() {
           </>
         }
       />
-      <div className="px-6 pb-6">
+      <div>
         <DataTable
           columns={columns}
           data={data}

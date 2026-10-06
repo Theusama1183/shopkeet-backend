@@ -5,9 +5,8 @@ import { useRouter } from "next/navigation";
 import { useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
-import { ArrowRightIcon, Loader2Icon, StoreIcon } from "lucide-react";
+import { ArrowRightIcon, Loader2Icon } from "lucide-react";
 
-import { cn } from "@/lib/utils";
 import { ROOT_DOMAIN } from "@/lib/domains";
 import type { TenantSettings } from "@/lib/admin-types";
 import { completeOnboardingAction, saveStoreProfileAction } from "@/lib/store-actions";
@@ -34,14 +33,14 @@ const CURRENCIES = [
 
 const TIMEZONES = [
   { value: "UTC", label: "UTC" },
-  { value: "Asia/Karachi", label: "Karachi Â· Islamabad Â· Lahore" },
-  { value: "Asia/Kolkata", label: "India Â· Delhi Â· Mumbai" },
-  { value: "Asia/Dubai", label: "Dubai Â· Gulf" },
+  { value: "Asia/Karachi", label: "Karachi · Islamabad · Lahore" },
+  { value: "Asia/Kolkata", label: "India · Delhi · Mumbai" },
+  { value: "Asia/Dubai", label: "Dubai · Gulf" },
   { value: "Europe/London", label: "London" },
-  { value: "Europe/Berlin", label: "Berlin Â· Central Europe" },
-  { value: "America/New_York", label: "New York Â· Eastern" },
-  { value: "America/Chicago", label: "Chicago Â· Central" },
-  { value: "America/Los_Angeles", label: "Los Angeles Â· Pacific" },
+  { value: "Europe/Berlin", label: "Berlin · Central Europe" },
+  { value: "America/New_York", label: "New York · Eastern" },
+  { value: "America/Chicago", label: "Chicago · Central" },
+  { value: "America/Los_Angeles", label: "Los Angeles · Pacific" },
 ];
 
 const profileSchema = z.object({
@@ -110,7 +109,7 @@ export function OnboardingWizard({ settings }: { settings: TenantSettings }) {
   const selectedTimezone = useWatch({ control, name: "timezone" });
 
   // Suggest the store link from the store name until the merchant edits it
-  // themselves â€” after that their choice wins, even if they rename the store.
+  // themselves — after that their choice wins, even if they rename the store.
   React.useEffect(() => {
     if (slugTouched) return;
     const suggestion = slugify(name);
@@ -161,18 +160,11 @@ export function OnboardingWizard({ settings }: { settings: TenantSettings }) {
 
       <Card className="overflow-hidden">
         <CardHeader className="border-b bg-muted/40 pb-6">
-          <div className="flex items-center gap-3">
-            <span className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
-              <StoreIcon className="size-5" aria-hidden="true" />
-            </span>
-            <div>
-              <CardTitle className="text-xl">Name your store</CardTitle>
-              <CardDescription className="mt-1 text-base">
-                This is how customers will find you. You can change any of it later in
-                Settings.
-              </CardDescription>
-            </div>
-          </div>
+          <CardTitle className="text-h2">Name your store</CardTitle>
+          <CardDescription className="mt-1">
+            This is how customers will find you. You can change any of it later in
+            Settings.
+          </CardDescription>
         </CardHeader>
 
         <CardContent className="grid gap-6 pt-6">
@@ -229,12 +221,10 @@ export function OnboardingWizard({ settings }: { settings: TenantSettings }) {
 
       <Card>
         <CardHeader className="border-b bg-muted/40 pb-6">
-          <div>
-            <CardTitle className="text-xl">How you sell</CardTitle>
-            <CardDescription className="mt-1 text-base">
-              Prices, tax and contact details for customer receipts and notifications.
-            </CardDescription>
-          </div>
+          <CardTitle className="text-h2">How you sell</CardTitle>
+          <CardDescription className="mt-1">
+            Prices, tax and contact details for customer receipts and notifications.
+          </CardDescription>
         </CardHeader>
 
         <CardContent className="grid gap-6 pt-6 sm:grid-cols-2">
@@ -326,13 +316,13 @@ export function OnboardingWizard({ settings }: { settings: TenantSettings }) {
       </Card>
 
       <div className="flex justify-end">
-        <Button type="submit" size="lg" disabled={pending} className={cn("h-11 px-8 text-base")}>
+        <Button type="submit" size="lg" disabled={pending} className="h-11 px-8">
           {pending ? (
             <Loader2Icon className="animate-spin" aria-hidden="true" />
           ) : (
             <ArrowRightIcon aria-hidden="true" />
           )}
-          {pending ? "Setting up your storeâ€¦" : "Finish setup"}
+          {pending ? "Setting up your store…" : "Finish setup"}
         </Button>
       </div>
     </form>

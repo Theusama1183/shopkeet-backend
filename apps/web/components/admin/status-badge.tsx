@@ -10,29 +10,21 @@ export interface StatusBadgeProps {
 }
 
 const TONE_CLASSES: Record<StatusTone, string> = {
-  neutral: "bg-secondary text-secondary-foreground",
-  success: "bg-success/10 text-success",
-  warning: "bg-warning/10 text-warning",
-  danger: "bg-destructive/10 text-destructive",
-  info: "bg-primary/10 text-primary",
-}
-
-const DOT_CLASSES: Record<StatusTone, string> = {
-  neutral: "bg-muted-foreground",
-  success: "bg-success",
-  warning: "bg-warning",
-  danger: "bg-destructive",
-  info: "bg-primary",
+  neutral: "border-transparent bg-secondary text-secondary-foreground",
+  success: "border-transparent bg-badge-success-bg text-badge-success-fg",
+  warning: "border-transparent bg-badge-warning-bg text-badge-warning-fg",
+  danger: "border-transparent bg-badge-danger-bg text-badge-danger-fg",
+  info: "border-transparent bg-primary/15 text-primary",
 }
 
 /**
- * Order/payment/affiliate status pill. One consistent tone mapping, defined
- * once, reused everywhere a status appears.
+ * Order/payment/affiliate status pill — solid Polaris-style tint pairs.
+ * One consistent tone mapping, defined once, reused everywhere a status
+ * appears; the text carries the meaning, so no decorative dot.
  */
 export function StatusBadge({ tone = "neutral", children, className }: StatusBadgeProps) {
   return (
-    <Badge variant="outline" className={cn("gap-1.5 font-medium", TONE_CLASSES[tone], className)}>
-      <span className={cn("size-1.5 rounded-full", DOT_CLASSES[tone])} aria-hidden="true" />
+    <Badge variant="outline" className={cn("font-medium", TONE_CLASSES[tone], className)}>
       {children}
     </Badge>
   )

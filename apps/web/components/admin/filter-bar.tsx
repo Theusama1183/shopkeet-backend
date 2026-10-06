@@ -30,7 +30,7 @@ export function FilterBar({
   actions,
 }: FilterBarProps) {
   return (
-    <div className="flex flex-wrap items-center gap-3 px-6 py-3">
+    <div className="flex flex-wrap items-center gap-3">
       {onSearchChange ? (
         <div className="relative min-w-52">
           <Input

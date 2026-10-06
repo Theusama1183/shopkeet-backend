@@ -7,7 +7,6 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { Loader2Icon, PlusIcon, Trash2Icon } from "lucide-react";
 
-import { cn } from "@/lib/utils";
 import { formatMoney } from "@/lib/format";
 import type { AdminProduct, ShippingRate } from "@/lib/admin-types";
 import { createDraftOrderAction } from "@/lib/order-actions";
@@ -260,10 +259,10 @@ export function NewDraftForm({
                         {variants.map((v) => {
                           const label = [v.sku, ...v.option_values.map((o) => `${o.option_name}: ${o.value}`)]
                             .filter(Boolean)
-                            .join(" · ");
+                            .join(", ");
                           return (
                             <SelectItem key={v.id} value={v.id}>
-                              {label} · {v.inventory_count} in stock
+                              {label}, {v.inventory_count} in stock
                             </SelectItem>
                           );
                         })}
@@ -337,7 +336,7 @@ export function NewDraftForm({
                   <SelectContent>
                     {rates.map((rate) => (
                       <SelectItem key={rate.id} value={rate.id}>
-                        {rate.name} — {formatMoney(rate.rate_cents)}
+                        {rate.name} ({formatMoney(rate.rate_cents)})
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -351,7 +350,7 @@ export function NewDraftForm({
         </CardContent>
       </Card>
 
-      <Button type="submit" className={cn("w-fit")} disabled={pending}>
+      <Button type="submit" className="w-fit" disabled={pending}>
         {pending ? <Loader2Icon className="animate-spin" aria-hidden="true" /> : null}
         {pending ? "Creating order…" : "Create draft order"}
       </Button>

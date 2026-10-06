@@ -27,8 +27,9 @@ function resolveView(raw: string | undefined): OrdersView {
 }
 
 export default async function OrdersPage({ searchParams }: OrdersPageProps) {
-  const { status, payment_status } = await searchParams;
-  const view = resolveView((await searchParams).view);
+  const params = await searchParams;
+  const view = resolveView(params.view);
+  const { status, payment_status } = params;
 
   if (view === "abandoned") {
     const data = await adminRequest<AbandonedCartsResponse>("/carts/abandoned");
@@ -36,7 +37,7 @@ export default async function OrdersPage({ searchParams }: OrdersPageProps) {
       <>
         <PageHeader
           title="Orders"
-          description="Abandoned checkouts — shoppers who entered an email but never completed payment."
+          description="Shoppers who entered an email but never completed payment."
           actions={<OrdersViews current={view} />}
         />
         <AbandonedTable carts={data.carts} />

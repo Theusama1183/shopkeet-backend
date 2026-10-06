@@ -4,6 +4,7 @@ import { redirect } from "next/navigation";
 
 import { authOriginFromHost, getSession } from "@/lib/session";
 import { getTenantSettings } from "@/lib/store-actions";
+import { PageHeader } from "@/components/admin/page-header";
 import { OnboardingWizard } from "@/components/admin/onboarding-wizard";
 
 export const metadata: Metadata = {
@@ -32,17 +33,11 @@ export default async function OnboardingPage() {
   if (settings.onboarding_completed) redirect("/admin");
 
   return (
-    <div className="mx-auto w-full max-w-3xl space-y-8">
-      <header className="space-y-3 text-center sm:text-left">
-        <p className="text-caption font-medium uppercase tracking-widest text-primary">
-          One last step
-        </p>
-        <h1 className="text-3xl font-semibold tracking-tight">Let&apos;s set up your store</h1>
-        <p className="text-lg text-muted-foreground">
-          You&apos;re signed in. Tell us how your shop should look and you&apos;re straight
-          into the dashboard.
-        </p>
-      </header>
+    <div className="mx-auto w-full max-w-3xl space-y-5">
+      <PageHeader
+        title="Let's set up your store"
+        description="You're signed in. Tell us how your shop should look and you're straight into the dashboard."
+      />
 
       <OnboardingWizard settings={settings} />
     </div>

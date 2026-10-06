@@ -7,7 +7,6 @@ import type { AdminOrder } from "@/lib/admin-types";
 import { formatMoney, formatDateTime } from "@/lib/format";
 import { paymentTone, label, PAYMENT_LABELS } from "@/lib/statuses";
 import { PageHeader } from "@/components/admin/page-header";
-import { Breadcrumbs } from "@/components/admin/breadcrumbs";
 import { OrderStatusEditor, OrderNoteEditor } from "@/components/admin/order-status-editor";
 import { StatusBadge } from "@/components/admin/status-badge";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -35,16 +34,14 @@ export default async function OrderDetailPage({
   const subtotal = order.items.reduce((sum, item) => sum + item.line_total_cents, 0);
   const shippingName = [order.shipping_method, order.tracking_number && `#${order.tracking_number}`]
     .filter(Boolean)
-    .join(" · ");
+    .join(", ");
 
   return (
     <>
-      <Breadcrumbs
-        items={[{ label: "Orders", href: "/admin/orders" }, { label: `#${order.id.slice(0, 8)}` }]}
-      />
       <PageHeader
+        crumbs={[{ label: "Orders", href: "/admin/orders" }, { label: `#${order.id.slice(0, 8)}` }]}
         title={`#${order.id.slice(0, 8)}`}
-        description={`Placed ${formatDateTime(order.created_at)} · ${lineCount} item${lineCount === 1 ? "" : "s"}`}
+        description={`Placed ${formatDateTime(order.created_at)} (${lineCount} item${lineCount === 1 ? "" : "s"})`}
         actions={
           <Button variant="outline" size="sm" asChild>
             <Link href={`/api/admin/orders/${order.id}/invoice.pdf`}>

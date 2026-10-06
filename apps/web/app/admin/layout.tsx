@@ -27,16 +27,18 @@ export default async function AdminLayout({ children }: { children: React.ReactN
   const claims = session?.claims;
 
   return (
-    <SidebarProvider>
-      <AdminSidebar />
-      <SidebarInset>
-        <AdminTopbar
-          user={claims?.user_id}
-          store={claims?.tenant_id.slice(0, 8)}
-          role={claims?.role}
-        />
-        <div className="flex-1 space-y-6 p-6">{children}</div>
-      </SidebarInset>
-    </SidebarProvider>
+    <div className="admin-surface [font-family:var(--font-inter)] min-h-full flex-1">
+      <SidebarProvider>
+        <AdminSidebar />
+        <SidebarInset>
+          <AdminTopbar
+            user={claims?.user_id}
+            store={claims?.tenant_id.slice(0, 8)}
+            role={claims?.role}
+          />
+          <div className="flex-1 space-y-5 p-5">{children}</div>
+        </SidebarInset>
+      </SidebarProvider>
+    </div>
   );
 }

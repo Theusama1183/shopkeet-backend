@@ -8,7 +8,7 @@ Shopkeet's frontend must read as the work of an experienced product design engin
 
 There are two distinct surfaces here, and they should not look like the same product wearing two skins:
 
-- **Merchant admin** — a serious business tool. The bar is Stripe Dashboard, Linear, Vercel's dashboard: dense but organized, fast, clear hierarchy, decoration earns its place or it's cut.
+- **Merchant admin** — a serious business tool. The bar is the Shopify admin / Polaris [design language](https://polaris.shopify.com): dense but organized, fast, clear hierarchy, decoration earns its place or it's cut. Boilerplate UI kits are fine to build on — re-skinned, not recognizable out of the box.
 - **Storefronts** — customer-facing, one per merchant, and they must not all look like the same template with a different logo slapped on. A merchant selling handmade pottery and a merchant selling phone accessories should not produce visually interchangeable stores. This is what the block-based page builder (`03-architecture.md` §6) needs to actually support — real variation in color, type, and layout per tenant, not just swapped copy.
 
 ## Specifically avoid these — the tells of AI-generated UI
@@ -36,6 +36,8 @@ None of these are permanently forbidden — they're defaults, and defaults appli
 
 ## Admin dashboard specifics
 
+- **Decide the hero before touching components.** Every page names one thing it is *for* — the metric, record, or action that earns the first glance — and that thing gets real visual weight (a bigger number, the wide column, the primary button). The remaining content is subordinate to it. A page shaped like "stat grid + chart card + list card, every section equal size" is the default arrangement of a template, not a hierarchy.
+- One admin visual language across every screen: shared tokens, shared header/crumb pattern, one card treatment. Navigation reads as one coherent product rather than twenty.
 - Information density over whitespace-for-its-own-sake — merchants are checking orders and inventory repeatedly, not being sold to.
 - Tables and lists are the primary UI, not cards, for anything list-like (orders, products). Cards are for a handful of summary numbers, not every piece of content.
 - Every destructive or payment-affecting action (cancel order, mark delivered, delete product) needs a clear confirmation and an undo path or an explicit warning — this is a business's real orders and money.

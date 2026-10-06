@@ -3,7 +3,6 @@ import Link from "next/link";
 import { adminRequest } from "@/lib/admin-api";
 import type { AdminProductsResponse, ShippingRatesResponse } from "@/lib/admin-types";
 import { PageHeader } from "@/components/admin/page-header";
-import { Breadcrumbs } from "@/components/admin/breadcrumbs";
 import { NewDraftForm } from "@/components/admin/new-draft-form";
 import { Button } from "@/components/ui/button";
 
@@ -20,10 +19,11 @@ export default async function NewDraftPage() {
   if (sellable.length === 0) {
     return (
       <>
-        <Breadcrumbs
-          items={[{ label: "Orders", href: "/admin/orders" }, { label: "New draft" }]}
+        <PageHeader
+          crumbs={[{ label: "Orders", href: "/admin/orders" }, { label: "New draft" }]}
+          title="New draft"
+          description="A phone or in-person sale, created by you."
         />
-        <PageHeader title="New draft" description="A phone or in-person sale, created by you." />
         <Button asChild>
           <Link href="/admin/products">Add products first</Link>
         </Button>
@@ -33,10 +33,11 @@ export default async function NewDraftPage() {
 
   return (
     <>
-      <Breadcrumbs
-        items={[{ label: "Orders", href: "/admin/orders" }, { label: "New draft" }]}
+      <PageHeader
+        crumbs={[{ label: "Orders", href: "/admin/orders" }, { label: "New draft" }]}
+        title="New draft"
+        description="A phone or in-person sale, created by you."
       />
-      <PageHeader title="New draft" description="A phone or in-person sale, created by you." />
       <NewDraftForm products={sellable} rates={ratesData.rates} stateRequired={ratesData.state_required} />
     </>
   );

@@ -1,13 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 
-import {
-  BanknoteIcon,
-  PackageIcon,
-  ShoppingCartIcon,
-  ShoppingBagIcon,
-} from "lucide-react";
-
 import { adminRequest } from "@/lib/admin-api";
 import { formatMoney, formatDate, formatPercent } from "@/lib/format";
 import type {
@@ -36,6 +29,13 @@ interface HomePageProps {
   searchParams: Promise<{ period?: string }>;
 }
 
+/**
+ * Home is hierarchy-first: one hero number (total sales for the period) sits
+ * directly on the canvas, secondary metrics cluster beside it at a fraction of
+ * its weight, and the chart is the only thing on the page worth a strong box.
+ * No row of identical stat cards — that shape is what makes dashboards read as
+ * generated rather than designed (docs/05).
+ */
 export default async function HomePage({ searchParams }: HomePageProps) {
   const { period = "30d" } = await searchParams;
 
@@ -50,6 +50,8 @@ export default async function HomePage({ searchParams }: HomePageProps) {
   const recent = orders.orders.slice(0, 5);
   const currency = sales.currency;
   const units = formatMoney(sales.totals.revenue_cents, currency);
+  const orderCount = sales.totals.order_count;
+  const top = topProducts.items[0];
 
   return (
     <>
@@ -59,36 +61,42 @@ export default async function HomePage({ searchParams }: HomePageProps) {
         actions={<PeriodSwitcher />}
       />
 
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard
-          label="Total sales"
-          value={units}
-          hint={`${sales.totals.order_count} order${sales.totals.order_count === 1 ? "" : "s"}`}
-          trend={{ direction: "up", label: period, tone: "success" }}
-          icon={BanknoteIcon}
-        />
-        <StatCard
-          label="Orders"
-          value={String(sales.totals.order_count)}
-          hint={`in the last ${period}`}
-          icon={ShoppingBagIcon}
-        />
-        <StatCard
-          label="Conversion"
-          value={formatPercent(conversion.conversion_rate)}
-          hint={`${conversion.orders_placed} of ${conversion.carts_created} carts`}
-          trend={{ direction: conversion.conversion_rate >= 0.1 ? "up" : "down", label: "carts → orders", tone: conversion.conversion_rate >= 0.1 ? "success" : "neutral" }}
-          icon={ShoppingCartIcon}
-        />
-        <StatCard
-          label="Top product"
-          value={topProducts.items[0]?.product_name ?? "—"}
-          hint={topProducts.items[0] ? `${topProducts.items[0].quantity} sold` : "no sales yet"}
-          icon={PackageIcon}
-        />
-      </div>
+      <section className="flex flex-col gap-5 lg:flex-row lg:items-stretch lg:gap-8">
+        <div className="min-w-0 shrink-0">
+          <p className="text-label font-medium text-muted-foreground">Total sales</p>
+          <p className="mt-1.5 text-display font-semibold tracking-tight tabular-nums text-foreground">
+            {units}
+          </p>
+          <p className="mt-1.5 text-label text-muted-foreground">
+            {orderCount} order{orderCount === 1 ? "" : "s"} in the last {period}
+          </p>
+        </div>
 
-      <div className="grid gap-4 lg:grid-cols-3">
+        <div className="hidden w-px bg-border lg:block" aria-hidden="true" />
+
+        <div className="grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3 lg:flex lg:flex-1 lg:items-center lg:gap-8">
+          <StatCard
+            label="Orders"
+            value={String(orderCount)}
+            hint={`last ${period}`}
+            className="lg:min-w-0 lg:flex-1"
+          />
+          <StatCard
+            label="Conversion"
+            value={formatPercent(conversion.conversion_rate)}
+            hint={`${conversion.orders_placed} of ${conversion.carts_created} carts`}
+            className="lg:min-w-0 lg:flex-1"
+          />
+          <StatCard
+            label="Top product"
+            value={top?.product_name ?? "—"}
+            hint={top ? `${top.quantity} sold` : "no sales yet"}
+            className="col-span-2 sm:col-span-1 lg:min-w-0 lg:flex-1"
+          />
+        </div>
+      </section>
+
+      <div className="grid gap-5 lg:grid-cols-3">
         <div className="lg:col-span-2">
           <SalesChart buckets={sales.buckets} currency={currency} conversionRate={conversion.conversion_rate} />
         </div>
@@ -138,7 +146,7 @@ export default async function HomePage({ searchParams }: HomePageProps) {
                 <li key={order.id}>
                   <Link
                     href={`/admin/orders/${order.id}`}
-                    className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3 transition-colors hover:bg-muted/40"
+                    className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3 transition-colors hover:bg-muted"
                   >
                     <div className="min-w-0 flex-1">
                       <p className="truncate text-body font-medium text-foreground">{order.customer_name}</p>

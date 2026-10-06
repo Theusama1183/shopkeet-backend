@@ -2,13 +2,13 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRightIcon, Loader2Icon, StoreIcon } from "lucide-react";
+import { ArrowRightIcon, Loader2Icon } from "lucide-react";
 
 import type { MerchantStore } from "@/lib/admin-types";
 import { apiErrorToast } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { StatusBadge } from "@/components/admin/status-badge";
 import { cn } from "@/lib/utils";
 
 /**
@@ -67,27 +67,20 @@ export function StoreList({ stores }: { stores: MerchantStore[] }) {
         return (
           <Card
             key={store.tenant_id}
-            className={cn(
-              "transition-shadow hover:shadow-md",
-              pending && "ring-2 ring-primary",
-            )}
+            className={cn(pending && "ring-2 ring-primary")}
           >
-            <CardContent className="flex items-center gap-4 p-5">
-              <span className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
-                <StoreIcon className="size-5" aria-hidden="true" />
-              </span>
-
+            <CardContent className="flex items-center gap-4">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
-                  <p className="truncate text-base font-medium">{store.name}</p>
+                  <p className="truncate text-body font-medium">{store.name}</p>
                   {store.role !== "owner" ? (
-                    <Badge variant="secondary" className="capitalize">
+                    <StatusBadge tone="neutral" className="capitalize">
                       {store.role}
-                    </Badge>
+                    </StatusBadge>
                   ) : null}
-                  {suspended ? <Badge variant="destructive">Suspended</Badge> : null}
+                  {suspended ? <StatusBadge tone="danger">Suspended</StatusBadge> : null}
                   {store.onboarding_completed ? null : (
-                    <Badge variant="outline">Setup incomplete</Badge>
+                    <StatusBadge tone="warning">Setup incomplete</StatusBadge>
                   )}
                 </div>
                 <p className="truncate text-caption text-muted-foreground">

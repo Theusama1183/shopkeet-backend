@@ -14,7 +14,6 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { SidebarTrigger } from "@/components/ui/sidebar";
-import { Separator } from "@/components/ui/separator";
 
 /**
  * Merchant identity comes from the session, so all three are optional: a browser
@@ -39,20 +38,19 @@ export function AdminTopbar({
     .toUpperCase() || "?";
 
   return (
-    <header className="sticky top-0 z-10 flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background/80 px-3 backdrop-blur">
+    <header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b border-border bg-card px-4">
       <SidebarTrigger className="-ml-1" />
-      <Separator orientation="vertical" className="mr-1 h-5" />
       <div className="flex flex-1 items-center gap-1" />
 
       {user && store && role ? (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="ghost" size="sm" className="gap-2 px-2">
-              <Avatar className="size-6">
+              <Avatar className="size-7">
                 <AvatarFallback className="text-caption">{initials}</AvatarFallback>
               </Avatar>
-              <span className="text-label font-medium">{store}</span>
-              <span className="hidden text-caption text-muted-foreground sm:inline">· {role}</span>
+              <span className="text-body font-medium">{store}</span>
+              <span className="hidden text-caption text-muted-foreground sm:inline">{role}</span>
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-56">

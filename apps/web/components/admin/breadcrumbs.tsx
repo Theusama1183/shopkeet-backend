@@ -18,7 +18,7 @@ export interface Crumb {
 export function Breadcrumbs({ items, className }: { items: Crumb[]; className?: string }) {
   return (
     <Breadcrumb className={className}>
-      <BreadcrumbList>
+      <BreadcrumbList className="text-label">
         {items.map((item, index) => {
           const isLast = index === items.length - 1
           return (

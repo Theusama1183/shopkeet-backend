@@ -119,14 +119,19 @@ export function DataTable<TData extends object>({
   const pageEnd = Math.min((pageIndex + 1) * pageSize, filteredData.length)
 
   return (
-    <div className={cn("overflow-hidden rounded-lg border border-border bg-card", className)}>
+    <div
+      className={cn(
+        "overflow-hidden rounded-xl border border-border bg-card shadow-[0_1px_0_0_rgba(0,0,0,0.04)]",
+        className
+      )}
+    >
       <div className="overflow-x-auto">
         <table
           className="w-full caption-bottom text-body"
           aria-label={ariaLabel}
           data-slot="data-table"
         >
-          <thead className="border-b border-border bg-muted/40">
+          <thead className="border-b border-border bg-card">
             {table.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id}>
                 {selectable ? (
@@ -193,7 +198,7 @@ export function DataTable<TData extends object>({
                   </tr>
                 ))
               : rows.map((row) => (
-                  <tr key={row.id} className="hover:bg-muted/40">
+                  <tr key={row.id} className="hover:bg-muted">
                     {selectable ? (
                       <td className="px-3 py-2 align-middle">
                         <Checkbox
