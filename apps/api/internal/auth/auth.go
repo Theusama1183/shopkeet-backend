@@ -301,7 +301,9 @@ type loginRequest struct {
 // configured that is only HALF the gate: a correct password issues the OTP and
 // returns {mode:"otp_required"} with no token — the session payload (shared
 // with OTP verify and reset via sessionPayload) comes back only after the
-// emailed code verifies. Without a mailer it returns the payload directly:
+// emailed code verifies. A browser already trusted (valid X-Otp-Bypass ticket
+// for this account, minted by a past verification) skips the code and gets the
+// payload straight away. Without a mailer it returns the payload directly:
 // one store → the tenant JWT; several → only a short-lived store_pick ticket,
 // so a store cannot be chosen without a membership row saying the account may
 // act on it.
@@ -333,17 +335,24 @@ func LoginHandler(pool *pgxpool.Pool, secret string, mailer Mailer) fiber.Handle
 		}
 
 		if mailer != nil {
-			// Password good, second factor pending. Same stance as signup: a
-			// send failure is logged, not surfaced — otp_required still goes
-			// back so the OTP page's Resend button owns the retry UX.
-			if code, err := issueCode(ctx, pool, accountID, req.Email, otpTTL); err != nil {
-				return httperr.ErrInternalServerError
-			} else if err := mailer.SendOTP(ctx, req.Email, code); err != nil {
-				log.Printf("[auth] otp send failed for login %s: %v", req.Email, err)
+			// Password good, second factor normally pending. A browser that
+			// proved the mailbox in the past carries a trusted-device ticket
+			// which the web app forwards as X-Otp-Bypass: with a valid one for
+			// THIS account, the interim code step is skipped. Any tamper,
+			// expiry, or password change falls through to the full gate.
+			if bypassAccount, ok := ParseOTPBypass(secret, hash, c.Get("X-Otp-Bypass")); !ok || bypassAccount != accountID {
+				// Same stance as signup: a send failure is logged, not
+				// surfaced — otp_required still goes back so the OTP page's
+				// Resend button owns the retry UX.
+				if code, err := issueCode(ctx, pool, accountID, req.Email, otpTTL); err != nil {
+					return httperr.ErrInternalServerError
+				} else if err := mailer.SendOTP(ctx, req.Email, code); err != nil {
+					log.Printf("[auth] otp send failed for login %s: %v", req.Email, err)
+				}
+				return c.JSON(fiber.Map{
+					"mode": "otp_required", "email": req.Email, "method": "email",
+				})
 			}
-			return c.JSON(fiber.Map{
-				"mode": "otp_required", "email": req.Email, "method": "email",
-			})
 		}
 
 		payload, err := sessionPayload(ctx, pool, secret, accountID, req.Email)

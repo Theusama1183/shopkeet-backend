@@ -294,3 +294,171 @@ func TestVerificationFlow(t *testing.T) {
 		t.Fatalf("guess cap must eventually lock with 429: last %d (%s)", code, raw)
 	}
 }
+
+// TestTrustedDeviceBypass is the acceptance test for "verify once": a browser
+// that verified a code becomes trusted, so later logins with the same password
+// skip the OTP step entirely — while an untrusted browser still gets the full
+// gate, garbage tickets are ignored, and changing the password revokes every
+// outstanding ticket (the ticket is signed under the account's password hash).
+func TestTrustedDeviceBypass(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("DATABASE_URL not set; skipping integration")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("pgxpool: %v", err)
+	}
+	defer pool.Close()
+
+	const secret = "test-secret"
+	sfx := randSuffix6()
+	mail := &fakeMail{}
+
+	app := fiber.New(fiber.Config{ErrorHandler: httperr.Handler})
+	v1 := app.Group("/api/v1")
+	RegisterRoutes(v1, pool, secret, ratelimit.New(nil), mail)
+
+	post := func(path, body string, headers map[string]string) (int, []byte) {
+		t.Helper()
+		req := httptest.NewRequest("POST", path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		res, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		return res.StatusCode, raw
+	}
+
+	type otpPhase struct {
+		Mode   string `json:"mode"`
+		Token  string `json:"token"`
+	}
+	type verifyResp struct {
+		Token       string `json:"token"`
+		DeviceToken string `json:"device_token"`
+	}
+
+	email := "bypass-" + sfx + "@example.com"
+	const pass = "hunter2hunter2"
+	verifiedAlso := func(raw []byte, label string) {
+		t.Helper()
+		var out verifyResp
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("%s: decode %v", label, err)
+		}
+		if out.Token == "" || out.DeviceToken == "" {
+			t.Fatalf("%s: expected session + device_token: %s", label, raw)
+		}
+	}
+
+	// --- signup gates on OTP, verify mints the bypass ticket ---------------
+	if code, raw := post("/api/v1/auth/signup",
+		`{"email":"`+email+`","password":"`+pass+`"}`, nil); code != fiber.StatusCreated {
+		t.Fatalf("signup -> %d (%s)", code, raw)
+	}
+	code, raw := post("/api/v1/auth/otp/verify",
+		`{"email":"`+email+`","code":"`+mail.lastCode+`"}`, nil)
+	if code != fiber.StatusOK {
+		t.Fatalf("verify -> %d (%s)", code, raw)
+	}
+	verifiedAlso(raw, "first verify")
+
+	// --- trusted login skips the code and does NOT mail a fresh one ---------
+	code, raw = post("/api/v1/auth/login",
+		`{"email":"`+email+`","password":"`+pass+`"}`, nil)
+	if code != fiber.StatusOK {
+		t.Fatalf("control login -> %d (%s)", code, raw)
+	}
+	var control otpPhase
+	if err := json.Unmarshal(raw, &control); err != nil {
+		t.Fatalf("control decode: %v", err)
+	}
+	if control.Mode != "otp_required" || control.Token != "" {
+		t.Fatalf("untrusted login must still gate on otp: %s", raw)
+	}
+
+	code, raw = post("/api/v1/auth/login",
+		`{"email":"`+email+`","password":"`+pass+`"}`,
+		map[string]string{"X-Otp-Bypass": "totally-forged"})
+	if code != fiber.StatusOK {
+		t.Fatalf("forged bypass login -> %d (%s)", code, raw)
+	}
+	var forged otpPhase
+	if err := json.Unmarshal(raw, &forged); err != nil {
+		t.Fatalf("forged decode: %v", err)
+	}
+	if forged.Mode != "otp_required" || forged.Token != "" {
+		t.Fatalf("forged bypass must fall through to otp: %s", raw)
+	}
+
+	// Mint a REAL bypass ticket to answer the server's own gate.
+	code, raw = post("/api/v1/auth/otp/verify",
+		`{"email":"`+email+`","code":"`+mail.lastCode+`"}`, nil)
+	if code != fiber.StatusOK {
+		t.Fatalf("re-verify for ticket -> %d (%s)", code, raw)
+	}
+	var withTicket verifyResp
+	if err := json.Unmarshal(raw, &withTicket); err != nil {
+		t.Fatalf("ticket decode: %v", err)
+	}
+	if withTicket.DeviceToken == "" {
+		t.Fatalf("verify must hand back a device_token: %s", raw)
+	}
+	before := mail.lastCode
+
+	hosted := map[string]string{"X-Otp-Bypass": withTicket.DeviceToken}
+	code, raw = post("/api/v1/auth/login",
+		`{"email":"`+email+`","password":"`+pass+`"}`, hosted)
+	if code != fiber.StatusOK {
+		t.Fatalf("trusted login -> %d (%s)", code, raw)
+	}
+	var trusted verifyResp
+	if err := json.Unmarshal(raw, &trusted); err != nil {
+		t.Fatalf("trusted login decode: %v", err)
+	}
+	// The point of the ticket is the session, straight from the password. A
+	// login never re-mints a device_token — the browser keeps the one it has.
+	if trusted.Token == "" {
+		t.Fatalf("trusted login must hand back a session: %s", raw)
+	}
+	if claims, err := Parse(secret, trusted.Token); err != nil ||
+		claims.Scope != "merchant" || claims.AccountID == "" {
+		t.Fatalf("trusted token bad: %+v (%v)", claims, err)
+	}
+	if mail.lastCode != before {
+		t.Fatalf("trusted login must not issue a fresh code")
+	}
+
+	// --- password change revokes the outstanding ticket --------------------
+	if code, raw := post("/api/v1/auth/forgot-password",
+		`{"email":"`+email+`"}`, nil); code != fiber.StatusOK {
+		t.Fatalf("forgot -> %d (%s)", code, raw)
+	}
+	resetToken := mail.lastToken
+	if resetToken == "" {
+		t.Fatalf("forgot must mail a reset token")
+	}
+	if code, raw := post("/api/v1/auth/reset-password",
+		`{"token":"`+resetToken+`","password":"brandnewpass1"}`, nil); code != fiber.StatusOK {
+		t.Fatalf("reset -> %d (%s)", code, raw)
+	}
+	code, raw = post("/api/v1/auth/login",
+		`{"email":"`+email+`","password":"brandnewpass1"}`, hosted)
+	if code != fiber.StatusOK {
+		t.Fatalf("login after reset -> %d (%s)", code, raw)
+	}
+	var revoked otpPhase
+	if err := json.Unmarshal(raw, &revoked); err != nil {
+		t.Fatalf("revoked decode: %v", err)
+	}
+	if revoked.Mode != "otp_required" || revoked.Token != "" {
+		t.Fatalf("bypass must not survive a password change: %s", raw)
+	}
+}

@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -21,6 +23,9 @@ import (
 //   - store_pick: scope="store_pick", account_id only. Minted after login when an
 //     account owns more than one store, so the browser can ask for the store list
 //     and exchange it for a tenant token without re-sending the password.
+//   - otp_bypass: scope="otp_bypass", account_id only. Minted after a successful
+//     OTP verification so the same browser can later log in with password alone.
+//     NOT signed with the plain secret — see SignOTPBypass.
 //
 // Middleware checks scope per route group so a customer token can never pass an
 // Admin check and an affiliate token can never pass a merchant- or
@@ -90,6 +95,58 @@ func SignStorePick(secret, accountID string, ttl time.Duration) (string, error) 
 		},
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+}
+
+// OTPBypassKey derives the per-account "trusted device" signing key from the
+// global JWT secret and the account's CURRENT password hash. Binding the ticket
+// to the hash means a password change (or reset) invalidates every outstanding
+// bypass — a reset can't leave unlocked browsers behind. Feeding two secrets
+// through HMAC-SHA256 leaks no structure about either.
+func OTPBypassKey(secret, passwordHash string) []byte {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte("otp-bypass:" + passwordHash))
+	return mac.Sum(nil)
+}
+
+// SignOTPBypass mints the long-lived "remember this browser" ticket a verified
+// OTP leaves behind: scope="otp_bypass", account_id only — no tenant, no role,
+// so it cannot act on a store. It exists solely to let a later password login
+// skip the emailed code when the same browser already proved the mailbox once.
+// It is signed under the account's current password hash (see OTPBypassKey),
+// which is why the hash has to be passed in — the caller has already fetched it.
+func SignOTPBypass(secret, accountID, passwordHash string, ttl time.Duration) (string, error) {
+	now := time.Now()
+	claims := Claims{
+		AccountID: accountID,
+		Scope:     "otp_bypass",
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
+			Issuer:    "shopkeet",
+		},
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(OTPBypassKey(secret, passwordHash))
+}
+
+// ParseOTPBypass verifies a trusted-device ticket against the account's current
+// password hash and returns the account id. Any deviation — bad signature,
+// expired, wrong scope, or a password change since minting — yields ("", false),
+// so callers fall back to the full OTP gate.
+func ParseOTPBypass(secret, passwordHash, token string) (string, bool) {
+	if token == "" || passwordHash == "" {
+		return "", false
+	}
+	claims := &Claims{}
+	_, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (any, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, jwt.ErrSignatureInvalid
+		}
+		return OTPBypassKey(secret, passwordHash), nil
+	})
+	if err != nil || claims.Scope != "otp_bypass" || claims.AccountID == "" {
+		return "", false
+	}
+	return claims.AccountID, true
 }
 
 // SignCustomer mints a customer-scoped JWT (Phase 11). It carries customer_id

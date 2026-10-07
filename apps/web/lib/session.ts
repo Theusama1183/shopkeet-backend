@@ -13,6 +13,16 @@ export const SESSION_COOKIE = "shopkeet_session"
  * The browser never sees it; the ticket carries no tenant, only the account.
  */
 export const STORE_PICK_COOKIE = "shopkeet_store_pick"
+/**
+ * "Trusted device" ticket handed back by a successful OTP verification. The web
+ * app stores it as its own httpOnly cookie and forwards it on login, so a
+ * browser that already proved the mailbox skips the code on later logins. The
+ * API binds the ticket to the account's current password hash, so a password
+ * change kills it regardless of expiry. Unlike the session cookie it is NOT
+ * cleared on logout — being a trusted device survives a logout, which is what
+ * makes repeat logins OTP-free.
+ */
+export const OTP_BYPASS_COOKIE = "otp_bypass"
 export const ROOT_DOMAIN = process.env.NEXT_PUBLIC_ROOT_DOMAIN ?? "shopkeet.com"
 
 const JWT_SECRET = process.env.JWT_SECRET ?? ""
@@ -47,6 +57,9 @@ export const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 // the API mints 24h merchan
 
 /** Matches the API's 10-minute store_pick ticket. */
 export const STORE_PICK_MAX_AGE_SECONDS = 10 * 60
+
+/** Matches the API's trusted-device ticket lifetime. */
+export const OTP_BYPASS_MAX_AGE_SECONDS = 90 * 24 * 60 * 60
 
 function b64urlDecode(input: string): string {
   return Buffer.from(input, "base64url").toString("utf8")
@@ -150,6 +163,19 @@ export function setSessionCookie(
   response.cookies.set(SESSION_COOKIE, token, {
     ...sessionCookieOptions(),
     maxAge,
+  })
+}
+
+/**
+ * Sets the trusted-device cookie on a response. Server-side only (API routes).
+ * Deliberately the same domain/options as the session cookie — the ticket has
+ * to be readable on both auth.* and admin.* so the login route (auth host) can
+ * forward it no matter where the browser wandered.
+ */
+export function setOTPBypassCookie(response: NextResponse, token: string): void {
+  response.cookies.set(OTP_BYPASS_COOKIE, token, {
+    ...sessionCookieOptions(),
+    maxAge: OTP_BYPASS_MAX_AGE_SECONDS,
   })
 }
 

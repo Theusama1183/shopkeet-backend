@@ -8,6 +8,7 @@ import {
   STORE_PICK_MAX_AGE_SECONDS,
   sessionCookieOptions,
   SESSION_MAX_AGE_SECONDS,
+  OTP_BYPASS_COOKIE,
 } from "@/lib/session"
 
 export interface AuthSuccess {
@@ -38,6 +39,11 @@ interface LoginBody {
  * {mode:"otp_required"} with neither cookie, because the emailed code is the
  * half of the login that actually proves the mailbox. The ticket carries no
  * tenant, so nothing is scoped until a store is actually chosen.
+ *
+ * A browser that already proved the mailbox carries an httpOnly otp_bypass
+ * cookie (left behind by a successful /auth/otp/verify); it is forwarded here
+ * as X-Otp-Bypass so the API can skip the code step for this account. Never
+ * read from the client — it is only ever forwarded server-side.
  */
 export async function POST(request: Request) {
   let input: LoginBody
@@ -47,9 +53,16 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: { code: "invalid_body", message: "Invalid request body." } }, { status: 400 })
   }
 
+  const jar = await cookies()
+  const bypassToken = jar.get(OTP_BYPASS_COOKIE)?.value
+
   let data: AuthSuccess
   try {
-    data = await apiRequest<AuthSuccess>("/auth/login", { method: "POST", body: input })
+    data = await apiRequest<AuthSuccess>("/auth/login", {
+      method: "POST",
+      body: input,
+      headers: bypassToken ? { "x-otp-bypass": bypassToken } : undefined,
+    })
   } catch (error) {
     if (error instanceof ApiError) {
       return NextResponse.json({ error: { code: error.code, message: error.message } }, { status: error.status })
@@ -57,7 +70,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: { code: "unknown", message: "Something went wrong." } }, { status: 500 })
   }
 
-  const jar = await cookies()
   const options = sessionCookieOptions()
 
   // Password checked out but the OTP is still owed: no token exists yet, so

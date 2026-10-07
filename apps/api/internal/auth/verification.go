@@ -52,6 +52,10 @@ const (
 	otpResendWindow  = 30 * time.Minute
 	otpMaxAttempts   = 5
 	otpHourlyCap     = 20
+	// otpBypassTTL is how long a verified browser stays "trusted": subsequent
+	// logins present the ticket and skip the code. It's also per-password —
+	// a password change invalidates all outstanding tickets regardless of TTL.
+	otpBypassTTL = 90 * 24 * time.Hour
 	passwordResetTTL = time.Hour // matches the email copy
 )
 
@@ -314,6 +318,21 @@ func OTPVerifyHandler(pool *pgxpool.Pool, secret string, mailer Mailer) fiber.Ha
 		payload, err := sessionPayload(ctx, pool, secret, row.AccountID, req.Email)
 		if err != nil {
 			return err
+		}
+		// A correct code is proof of the mailbox, so this browser becomes a
+		// trusted device: state it as a password-bound bypass ticket the web
+		// app keeps in its own cookie and presents at the next login. A mint
+		// failure is logged, never fatal — the session stands regardless.
+		// The ticket dies with the account's password (OTPBypassKey).
+		var hash string
+		if err := pool.QueryRow(ctx,
+			`SELECT password_hash FROM merchant_accounts WHERE id = $1`,
+			row.AccountID).Scan(&hash); err == nil {
+			if ticket, terr := SignOTPBypass(secret, row.AccountID, hash, otpBypassTTL); terr == nil {
+				payload["device_token"] = ticket
+			} else {
+				log.Printf("[auth] otp bypass mint failed for %s: %v", req.Email, terr)
+			}
 		}
 		return c.JSON(payload)
 	}

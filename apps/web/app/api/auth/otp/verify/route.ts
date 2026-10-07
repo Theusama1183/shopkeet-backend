@@ -7,6 +7,7 @@ import {
   STORE_PICK_MAX_AGE_SECONDS,
   sessionCookieOptions,
   setSessionCookie,
+  setOTPBypassCookie,
 } from "@/lib/session";
 
 interface VerifyPayload {
@@ -14,6 +15,12 @@ interface VerifyPayload {
   store_pick_token?: string;
   stores?: unknown[];
   onboarding_completed?: boolean;
+  /**
+   * "Remember this browser" ticket from a correct code: stored as its own
+   * httpOnly cookie so the next login (see /api/auth/login) can skip the OTP
+   * step for this account. Absent only when minting failed server-side.
+   */
+  device_token?: string;
   error?: { code?: string; message?: string };
 }
 
@@ -47,6 +54,7 @@ export async function POST(req: NextRequest) {
       setSessionCookie(response, data.token);
       // A completed verification replaces any half-finished store selection.
       response.cookies.set(STORE_PICK_COOKIE, "", { ...options, maxAge: 0 });
+      if (data.device_token) setOTPBypassCookie(response, data.device_token);
       return response;
     }
 
@@ -57,6 +65,7 @@ export async function POST(req: NextRequest) {
         maxAge: STORE_PICK_MAX_AGE_SECONDS,
       });
       response.cookies.set(SESSION_COOKIE, "", { ...options, maxAge: 0 });
+      if (data.device_token) setOTPBypassCookie(response, data.device_token);
       return response;
     }
 

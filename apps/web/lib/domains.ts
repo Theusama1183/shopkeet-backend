@@ -26,7 +26,11 @@ function originFor(subdomain: "auth" | "admin"): string {
     return `${protocol}//${subdomain}.${hostname}${suffix}`
   }
   if (hostname.endsWith(".localhost")) {
-    return `${protocol}//${subdomain}.${hostname.split(".").slice(-2).join(".")}${suffix}`
+    // Dev: the app runs on one port and proxies subdomains to the same app.
+    // Slice the FIRST label, not the last two — "auth.localhost" must bounce
+    // to "admin.localhost", never the nested "admin.auth.localhost".
+    const parent = hostname.slice(hostname.indexOf(".") + 1)
+    return `${protocol}//${subdomain}.${parent}${suffix}`
   }
   return `${protocol}//${subdomain}.${ROOT_DOMAIN}`
 }
