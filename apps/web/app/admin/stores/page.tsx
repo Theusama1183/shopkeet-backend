@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { StoreIcon } from "lucide-react";
 
 import { getMerchantStores } from "@/lib/store-actions";
 import { StoreList } from "@/components/admin/store-list";
@@ -26,7 +25,6 @@ export default async function StoresPage() {
     <div className="mx-auto w-full max-w-3xl space-y-5">
       <PageHeader
         title="Your stores"
-        icon={StoreIcon}
         description={
           list.length === 1
             ? "The store you have access to."

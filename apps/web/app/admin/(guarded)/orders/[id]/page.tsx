@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { DownloadIcon, ShoppingBagIcon } from "lucide-react";
+import { DownloadIcon } from "lucide-react";
 
 import { adminRequest } from "@/lib/admin-api";
 import type { AdminOrder } from "@/lib/admin-types";
@@ -41,7 +41,6 @@ export default async function OrderDetailPage({
       <PageHeader
         crumbs={[{ label: "Orders", href: "/admin/orders" }, { label: `#${order.id.slice(0, 8)}` }]}
         title={`#${order.id.slice(0, 8)}`}
-        icon={ShoppingBagIcon}
         description={`Placed ${formatDateTime(order.created_at)} (${lineCount} item${lineCount === 1 ? "" : "s"})`}
         actions={
           <Button variant="outline" size="sm" asChild>
